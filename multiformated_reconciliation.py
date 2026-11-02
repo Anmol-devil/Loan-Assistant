@@ -378,28 +378,21 @@ def run_math_checks(summary, transactions, issues, detailed_issues):
 
 
 def extract_summary_from_full_text(full_text: str) -> dict:
-    """
-    Extracts explicit Opening Balance, Total Credits/Deposits, Total Debits/Withdrawals,
-    and Closing Balance from statement headers or bottom summary blocks.
-    Preserves negative signs (e.g. '-8,152,664.07') and (Dr)/(Cr) suffixes.
-    """
     summary = {
         "opening_balance": [],
         "summary_credits": [],
         "summary_debits": [],
         "closing_balance": []
     }
-
     patterns = {
-        "opening_balance": r"opening\s*balance\s*(?:[:]\s*|\s+)([+-]?\s*[₹$]?\s*[\d,]+\.\d{2}\s*(?:\([CD]r\))?)",
-        "summary_debits": r"total\s*(?:withdrawal|debit)s?\s*(?:amount)?\s*(?:[:]\s*|\s+)([+-]?\s*[₹$]?\s*[\d,]+\.\d{2}\s*(?:\([CD]r\))?)",
-        "summary_credits": r"total\s*(?:deposit|credit)s?\s*(?:amount)?\s*(?:[:]\s*|\s+)([+-]?\s*[₹$]?\s*[\d,]+\.\d{2}\s*(?:\([CD]r\))?)",
-        "closing_balance": r"closing\s*balance\s*(?:[:]\s*|\s+)([+-]?\s*[₹$]?\s*[\d,]+\.\d{2}\s*(?:\([CD]r\))?)"
+        "opening_balance": r"(?:opening\s*bal(?:ance)?|balance\s+as\s+on\s+[0-9]{1,2}\s+[A-Za-z]{3,9}\s+[0-9]{4})\s*[:\-]\s*([+-]?\s*[₹$]?\s*[\d,]+\s*\.\s*\d{2}\s*(?:\([CD]r\))?)",
+        "summary_debits": r"(?:total\s*(?:withdrawal|debit)s?\s*(?:amount)?|withdrawa?ls)\s*[:\-]?\s*([+-]?\s*[₹$]?\s*[\d,]+\s*\.\s*\d{2}\s*(?:\([CD]r\))?)",
+        "summary_credits": r"(?:total\s*(?:deposit|credit)s?\s*(?:amount)?|deposits)\s*[:\-]?\s*([+-]?\s*[₹$]?\s*[\d,]+\s*\.\s*\d{2}\s*(?:\([CD]r\))?)",
+        "closing_balance": r"closing\s*bal(?:ance)?\s*[:\-]?\s*([+-]?\s*[₹$]?\s*[\d,]+\s*\.\s*\d{2}\s*(?:\([CD]r\))?)"
     }
-
     for key, pat in patterns.items():
         for m in re.finditer(pat, full_text, re.IGNORECASE):
-            raw_capture = m.group(1).strip()
+            raw_capture = re.sub(r"\s+", "", m.group(1).strip())
             is_neg = raw_capture.startswith("-")
             val, ind = parse_amount_with_sign(raw_capture)
             if val is not None:
@@ -407,7 +400,6 @@ def extract_summary_from_full_text(full_text: str) -> dict:
                     val = -abs(val)
                 if val not in summary[key]:
                     summary[key].append(val)
-
     return summary
 
 def clean_wrapped_cell_number(cell_text: str):
@@ -713,6 +705,8 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
                         header_map["date"] = s["cx"]
                     elif any(k in txt for k in ["desc", "particular", "narration", "detail", "remark"]):
                         header_map["description"] = s["cx"]
+                    elif "branch" in txt or "code" in txt:
+                        header_map["branch_code"] = s["cx"]
                     elif any(k in txt for k in ["chq", "ref", "cheque"]):
                         header_map["ref"] = s["cx"]
                     elif ("withdrawal" in txt and "deposit" in txt) or ("dr" in txt and "cr" in txt) or "withdrawal(dr)" in txt or "deposit(cr)" in txt:
@@ -768,7 +762,7 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
 
         date_x_max = max(header_map.get("date", 80), header_map.get("value_date", 145)) + 50
         bal_col_x = header_map.get("balance", 500)
-
+    
         def row_has_balance_span(r):
             for s in r:
                 txt = s["text"].strip()
@@ -784,11 +778,19 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
                 for s in r
             ) or DATE_RE.match(r[0]["text"].strip())
 
-        # Anchor strictly on rows that contain a Running Balance (or Date if single-line table).
-        # CRITICAL INVARIANT: Two rows that BOTH contain a Running Balance can NEVER be merged into the same block!
         anchor_indices = [r_i for r_i, r in enumerate(body_rows) if row_has_balance_span(r)]
         if not anchor_indices:
             anchor_indices = [r_i for r_i, r in enumerate(body_rows) if row_has_date_span(r)]
+            
+            page_uses_decimals = (
+                sum(
+                    1
+                    for b_r in body_rows
+                    for s_x in b_r
+                    if abs(s_x["cx"] - bal_col_x) <= 55.0
+                    and "." in s_x["text"]
+                ) >= max(1, len(anchor_indices) // 2)
+            )
 
         tx_blocks = [[] for _ in anchor_indices]
         if anchor_indices:
@@ -909,7 +911,7 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
                     else:
                         tx["description"].append(txt)
                 else:
-                    if closest_col not in ("value_date", "posted_date", "sl_no"):
+                    if closest_col not in ("value_date", "posted_date", "sl_no", "branch_code"):
                         tx["description"].append(txt)
 
             if len(cr_dr_amounts) >= 2:
@@ -1971,8 +1973,10 @@ if __name__ == "__main__":
 
 
 # ==============================================================================
+
+
+# ==============================================================================
 # AUTHORITATIVE PRIORITY 1 & 2 OVERRIDE: UNIVERSAL MULTI-BANK ENGINE
-# (Supports ICICI 10-col, YES BANK 7-col, Kotak Cr/Dr, IndusInd Integer & Decimal)
 # ==============================================================================
 DATE_RE = re.compile(
     r"^(?:(0?[1-9]|[12]\d|3[01])[-/\s]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|[A-Za-z]{3,9})[-/\s]*\d{2,4}"
@@ -1981,10 +1985,7 @@ DATE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Multi-dot amounts like '548.585.25', '242.229.43', '1.223.00'
 MALFORMED_MULTI_DOT_RE = re.compile(r"^[₹$\s]*([+-]?\d{1,3}(?:\.\d{2,3})+\.\d{1,2})$")
-
-# Single-dot with 3 decimal digits like '88.736', '2.000', '856.051', '23.400' (period typed instead of comma!)
 MALFORMED_THREE_DEC_RE = re.compile(r"^[₹$\s]*([+-]?\d{1,3})\.(\d{3})$")
 
 AMOUNT_CR_DR_RE = re.compile(
@@ -1994,17 +1995,10 @@ AMOUNT_CR_DR_RE = re.compile(
 
 
 def parse_amount_with_sign(text):
-    """
-    Universal Monetary Parser:
-    - Never parses Account Numbers ('259213978763'), Reference IDs ('S32223796'), or Dates.
-    - Detects & recovers multi-dot typos ('548.585.25') and 3-digit dot typos ('88.736', '2.000').
-    - Parses both decimal amounts ('171,782.25', '0.94', '106.1') and whole-rupee amounts ('100,000', '550', '1').
-    """
     if not text:
         return None, None
     s = str(text).strip()
 
-    # Reject strings containing letters (except Cr/Dr), colons, slashes, or '@' (e.g. 'Account No.: 259213978763', 'S32223796')
     s_no_crdr = re.sub(r"\((?:Cr|Dr)\)|\b(?:Cr|Dr)\b", "", s, flags=re.IGNORECASE).strip()
     s_no_curr = re.sub(r"[₹$]", "", s_no_crdr).strip()
     if re.search(r"[A-Za-z:@/]", s_no_curr):
@@ -2013,7 +2007,6 @@ def parse_amount_with_sign(text):
     if DATE_RE.match(s):
         return None, None
 
-    # Check multi-dot malformed amount ('548.585.25' or '242.229.43')
     m_mdot = MALFORMED_MULTI_DOT_RE.match(s_no_crdr)
     if m_mdot:
         raw_mal = m_mdot.group(1)
@@ -2024,7 +2017,6 @@ def parse_amount_with_sign(text):
         except ValueError:
             pass
 
-    # Check 3-decimal-digit dot typo ('88.736' -> 88736.0, '2.000' -> 2000.0, '856.051' -> 856051.0)
     m_3dec = MALFORMED_THREE_DEC_RE.match(s_no_crdr)
     if m_3dec:
         fixed_str = f"{m_3dec.group(1)}{m_3dec.group(2)}"
@@ -2033,11 +2025,9 @@ def parse_amount_with_sign(text):
         except ValueError:
             pass
 
-    # Reject unformatted 9+ digit integers (Account numbers like '259213978763', phone numbers, PINs)
     raw_digits = re.sub(r"[^\d]", "", s_no_curr)
     if len(raw_digits) >= 9 and "," not in s_no_curr and "." not in s_no_curr:
         return None, None
-    # Also reject if integer part before '.' has >= 10 uncomma'd digits
     int_part_digits = re.sub(r"[^\d]", "", s_no_curr.split(".")[0])
     if len(int_part_digits) >= 10 and "," not in s_no_curr.split(".")[0]:
         return None, None
@@ -2067,10 +2057,10 @@ def extract_summary_from_full_text(full_text: str) -> dict:
         "closing_balance": []
     }
     patterns = {
-        "opening_balance": r"opening\s*bal(?:ance)?\s*(?:[:]\s*|\s+)([+-]?\s*[₹$]?\s*[\d,]+(?:\s*\.\s*\d{1,2})?\s*(?:\([CD]r\))?)",
-        "summary_debits": r"(?:total\s*(?:withdrawal|debit)s?\s*(?:amount)?|withdrawa?ls)\s*(?:[:]\s*|\s+)([+-]?\s*[₹$]?\s*[\d,]+\s*\.\s*\d{1,2}\s*(?:\([CD]r\))?)",
-        "summary_credits": r"(?:total\s*(?:deposit|credit)s?\s*(?:amount)?|deposits)\s*(?:[:]\s*|\s+)([+-]?\s*[₹$]?\s*[\d,]+\s*\.\s*\d{1,2}\s*(?:\([CD]r\))?)",
-        "closing_balance": r"closing\s*bal(?:ance)?\s*(?:[:]\s*|\s+)([+-]?\s*[₹$]?\s*[\d,]+(?:\s*\.\s*\d{1,2})?\s*(?:\([CD]r\))?)"
+        "opening_balance": r"(?:opening\s*bal(?:ance)?|balance\s+as\s+on\s+[0-9]{1,2}\s+[A-Za-z]{3,9}\s+[0-9]{4})\s*[:\-]\s*([+-]?\s*[₹$]?\s*[\d,]+\s*\.\s*\d{2}\s*(?:\([CD]r\))?)",
+        "summary_debits": r"(?:total\s*(?:withdrawal|debit)s?\s*(?:amount)?|withdrawa?ls)\s*[:\-]?\s*([+-]?\s*[₹$]?\s*[\d,]+\s*\.\s*\d{2}\s*(?:\([CD]r\))?)",
+        "summary_credits": r"(?:total\s*(?:deposit|credit)s?\s*(?:amount)?|deposits)\s*[:\-]?\s*([+-]?\s*[₹$]?\s*[\d,]+\s*\.\s*\d{2}\s*(?:\([CD]r\))?)",
+        "closing_balance": r"closing\s*bal(?:ance)?\s*[:\-]?\s*([+-]?\s*[₹$]?\s*[\d,]+\s*\.\s*\d{2}\s*(?:\([CD]r\))?)"
     }
     for key, pat in patterns.items():
         for m in re.finditer(pat, full_text, re.IGNORECASE):
@@ -2086,10 +2076,6 @@ def extract_summary_from_full_text(full_text: str) -> dict:
 
 
 def Stitch_Vertical_Wrapped_Numbers(page_spans, numeric_col_xs, x_tol=42.0, y_tol=16.0):
-    """
-    Stitches 2-line wrapped numbers ('9,11,685.\n06', '10,83,763\n.00', '10,00,000\n94')
-    AND wrapped dates ('30-Dec-\n2024' or '2024\n30-Dec-').
-    """
     spans = [dict(s) for s in page_spans]
     spans.sort(key=lambda s: (s["cy"], s["cx"]))
     skip_indices = set()
@@ -2100,7 +2086,6 @@ def Stitch_Vertical_Wrapped_Numbers(page_spans, numeric_col_xs, x_tol=42.0, y_to
             continue
         t1 = s["text"].strip()
 
-        # 1. Stitch wrapped dates in the leftmost column (e.g. '30-Dec-' + '2024' or '2024' + '30-Dec-')
         if s["cx"] <= 140 and (re.match(r"^\d{1,2}[-/][A-Za-z]{3}[-/]?$", t1) or re.match(r"^\d{4}$", t1)):
             for j in range(i + 1, len(spans)):
                 if j in skip_indices:
@@ -2119,8 +2104,6 @@ def Stitch_Vertical_Wrapped_Numbers(page_spans, numeric_col_xs, x_tol=42.0, y_to
                         skip_indices.add(j)
                         break
 
-        # 2. Stitch vertically wrapped monetary numbers ONLY when t2 starts with '.' or t1 ends with '.'
-        # or t2 is 2 digits on a multi-column wrapped layout where t2 is NOT a standalone transaction amount!
         matching_cols = [col_x for col_x in numeric_col_xs if abs(s["cx"] - col_x) <= x_tol]
         if matching_cols and re.match(r"^[+-]?(?:\d{1,3}(?:,\d{2,3})+|\d{4,})\.?$", t1):
             col_x = min(matching_cols, key=lambda c: abs(s["cx"] - c))
@@ -2134,7 +2117,6 @@ def Stitch_Vertical_Wrapped_Numbers(page_spans, numeric_col_xs, x_tol=42.0, y_to
                 same_col = (abs(s2["cx"] - col_x) <= x_tol) and (abs(s2["bbox"][2] - s["bbox"][2]) <= 25.0 or abs(s2["cx"] - s["cx"]) <= 25.0)
                 if same_col and dy >= 2.0:
                     t2 = s2["text"].strip()
-                    # Stitch if t1 ends with '.', or t2 starts with '.', or t1 has Indian Lak/Crore commas ('10,00,000' + '94')
                     has_indian_lakhs = bool(re.match(r"^[+-]?\d{1,2},\d{2},\d{3}$", t1))
                     if (t1.endswith(".") and re.match(r"^\d{2}$", t2)) or re.match(r"^\.\d{2}$", t2) or (has_indian_lakhs and re.match(r"^\d{2}$", t2)):
                         paise = t2.lstrip(".")
@@ -2171,7 +2153,6 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
                 if v not in summary[k]:
                     summary[k].append(v)
 
-    has_explicit_text_summary = bool(summary["opening_balance"] or summary["closing_balance"])
     last_known_header_map = {}
     per_page_stats = []
 
@@ -2208,6 +2189,8 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
                         header_map["date"] = s["cx"]
                     elif any(k in txt for k in ["desc", "particular", "narration", "detail", "remark"]):
                         header_map["description"] = s["cx"]
+                    elif "branch" in txt or "code" in txt:
+                        header_map["branch_code"] = s["cx"]
                     elif any(k in txt for k in ["chq", "ref", "cheque"]):
                         header_map["ref"] = s["cx"]
                     elif ("withdrawal" in txt and "deposit" in txt) or ("dr" in txt and "cr" in txt) or "withdrawal(dr)" in txt or "deposit(cr)" in txt:
@@ -2245,7 +2228,6 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
                 continue
             row_joined_lower = " ".join(s["text"].lower() for s in row).strip()
 
-            # Skip repeated page-top headers & footers (e.g. IndusInd 'Statement of Account | Account No.: 259213978763', 'Page : 2 / 21')
             if re.search(r"\bpage\s*[:\-]?\s*\d+\s*(?:of|/)\s*\d+\b", row_joined_lower):
                 continue
             if any(skip_k in row_joined_lower for skip_k in [
@@ -2270,7 +2252,6 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
                 txt = s["text"].strip()
                 if abs(s["cx"] - bal_col_x) <= 55:
                     val, _ = parse_amount_with_sign(txt)
-                    # Accept either decimal amounts ('171,782.25', '0.94'), comma amounts ('100,000'), or valid numbers in balance col
                     if val is not None:
                         return True
             return False
@@ -2297,12 +2278,23 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
                     closest_pos = min(range(len(anchor_cys)), key=lambda idx: abs(row_cy - anchor_cys[idx]))
                     tx_blocks[closest_pos].extend(row)
 
+        # Properly define page_uses_decimals before iterating over tx_blocks
+        page_uses_decimals = (
+            sum(
+                1
+                for b_r in body_rows
+                for s_x in b_r
+                if abs(s_x["cx"] - bal_col_x) <= 55 and "." in s_x["text"]
+            )
+            >= max(1, len(anchor_indices) // 2)
+        )
         page_tx_count = 0
+
         for block in tx_blocks:
             block.sort(key=lambda s: (round(s["cy"], 1), s["cx"]))
             row_joined_lower = " ".join(s["text"].lower() for s in block)
 
-            if bool(__import__("re").search(r"\b(?:brought\s+forward|opening\s+balance|b/f)\b", row_joined_lower)) and "upi/" not in row_joined_lower:
+            if bool(re.search(r"\b(?:brought\s+forward|opening\s+balance|b/f)\b", row_joined_lower)) and "upi/" not in row_joined_lower:
                 for s in block:
                     val, ind = parse_amount_with_sign(s["text"])
                     if val is not None:
@@ -2310,7 +2302,7 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
                         if page_idx == 1 and signed_v not in summary["opening_balance"]:
                             summary["opening_balance"].append(signed_v)
 
-            if bool(__import__("re").search(r"\b(?:closing\s+balance|carried\s+forward|c/f)\b", row_joined_lower)) and "upi/" not in row_joined_lower:
+            if bool(re.search(r"\b(?:closing\s+balance|carried\s+forward|c/f)\b", row_joined_lower)) and "upi/" not in row_joined_lower:
                 for s in block:
                     val, ind = parse_amount_with_sign(s["text"])
                     if val is not None:
@@ -2383,7 +2375,7 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
 
                 if val is not None and ind in ("CR", "DR"):
                     cr_dr_amounts.append((s["cx"], val, ind, txt))
-                elif val is not None and is_monetary_col and dist_to_col <= 55.0:
+                elif val is not None and is_monetary_col and dist_to_col <= 55.0 and ("." in txt or "," in txt or not page_uses_decimals):
                     if closest_col == "balance":
                         tx["balance"] = -abs(val) if txt.startswith("-") else val
                     elif closest_col == "credit":
@@ -2402,7 +2394,7 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
                     else:
                         tx["description"].append(txt)
                 else:
-                    if closest_col not in ("value_date", "posted_date", "sl_no"):
+                    if closest_col not in ("value_date", "posted_date", "sl_no", "branch_code"):
                         tx["description"].append(txt)
 
             if len(cr_dr_amounts) >= 2:
@@ -2417,7 +2409,6 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
 
             tx["description"] = " ".join(tx["description"]).strip()
             if tx["balance"] is not None:
-                # Skip trailing blank balance-only summary line (e.g. Page 21 last line '07-Apr-2025 | | | | | 512,846.65')
                 if tx["credit"] == 0.0 and tx["debit"] == 0.0 and not tx["description"] and transactions and abs(tx["balance"] - transactions[-1]["balance"]) < 0.01:
                     continue
                 transactions.append(tx)
@@ -2450,12 +2441,6 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
 
 
 def run_math_checks(summary, transactions, issues, detailed_issues):
-    """
-    Priority 1 & 2 Validator:
-    1. Validates Transaction Row Completeness (Serial Number 1..N sequence & Transaction ID uniqueness).
-    2. Never reports incomplete extraction as PASSED.
-    3. Reconciles row-by-row running balances (including unsigned overdraft transitions) and summary totals.
-    """
     audit_coverage = {
         "row_completeness_verified": "NOT_RUN",
         "summary_cards_extracted": "NOT_RUN",
@@ -2484,16 +2469,14 @@ def run_math_checks(summary, transactions, issues, detailed_issues):
             "detailed_issues": detailed_issues
         }
 
-    # Check if Row 1 is an inline B/F row
     first_tx = transactions[0]
-    if any(k in first_tx["description"].lower() for k in ["b/f", "brought forward", "opening balance"]) and first_tx["credit"] == 0 and first_tx["debit"] == 0:
+    if bool(re.search(r"\b(?:b/f|brought\s+forward|opening\s+balance)\b", first_tx["description"].lower())) and first_tx["credit"] == 0 and first_tx["debit"] == 0:
         if first_tx["balance"] not in summary["opening_balance"]:
             summary["opening_balance"].insert(0, first_tx["balance"])
         active_txs = transactions[1:]
     else:
         active_txs = transactions
 
-    # Priority 1: Validate Serial Number (Sl No) sequence if present in document
     sl_nos = [t.get("sl_no") for t in active_txs if t.get("sl_no") is not None]
     if len(sl_nos) >= len(active_txs) * 0.5 and sl_nos:
         max_sl = max(sl_nos)
@@ -2522,15 +2505,11 @@ def run_math_checks(summary, transactions, issues, detailed_issues):
         actual_bal = round(tx["balance"], 2)
         expected_bal = round(running_bal + tx["credit"] - tx["debit"], 2)
 
-        # Handle unsigned overdraft balances on CC accounts (e.g. ICICI Rows 1-3 where -9,11,685.06 is printed as 9,11,685.06)
         if abs(expected_bal - actual_bal) > 1.0 and abs(expected_bal - (-actual_bal)) <= 1.5:
             actual_bal = -actual_bal
             tx["balance"] = actual_bal
 
-        # If Debit & Credit were accidentally swapped or embedded in wrapped text, check if exact delta matches
         if abs(expected_bal - actual_bal) > 1.0:
-            delta = round(actual_bal - running_bal, 2)
-            # Check if credit and debit were swapped
             if tx["credit"] > 0 and tx["debit"] == 0 and abs((running_bal - tx["credit"]) - actual_bal) <= 1.0:
                 tx["debit"], tx["credit"] = tx["credit"], 0.0
                 expected_bal = round(running_bal - tx["debit"], 2)
