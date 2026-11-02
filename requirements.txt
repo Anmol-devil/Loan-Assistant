@@ -1,0 +1,8 @@
+# Dependencies reflected by the imports in the shared Module 1 code
+streamlit
+pandas
+numpy
+PyMuPDF
+Pillow
+python-docx
+rapidocr-onnxruntime
