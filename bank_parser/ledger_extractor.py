@@ -1,0 +1,442 @@
+import re
+from typing import Dict, Any, List, Optional, Tuple
+from .structural_scanner import DATE_TOKEN_RE
+
+INLINE_DEC_RE = re.compile(
+    r"(?<![A-Za-z0-9\./\-])([+-]?(?:\d{1,3}(?:,\d{2,3})+|\d{1,9})[\.,:\-]\d{2}(?:\s*\(?[CD]r\)?)?)(?![A-Za-z0-9\./\-])",
+    re.I,
+)
+
+TIME_TOKEN_RE = re.compile(r"^\d{2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?$", re.I)
+
+NON_TX_ROW_MARKERS = (
+    "page total",
+    "total :",
+    "total:",
+    "grand total",
+    "cumulative total",
+    "transaction total",
+    "statement summary",
+    "closing balance",
+    "carried forward",
+    "c/f",
+    "charge breakup",
+    "end of statement",
+    "++++ end",
+    "uncleared amount",
+    "mandatory disclaimer",
+)
+
+
+def _clean_ocr_number(raw_str: str) -> str:
+    s = (raw_str or "").strip()
+    if DATE_TOKEN_RE.match(s) or TIME_TOKEN_RE.match(s):
+        return s
+    s = re.sub(r"^([+-]?[\d,]+)[:\-](\d{2})$", r"\1.\2", s)
+    s = re.sub(r"^([+-]?[\d,]+),(\d{2})$", r"\1.\2", s)
+    m_dots = re.match(r"^([+-]?\d{1,3}(?:\.\d{3})+)\.(\d{2})$", s)
+    if m_dots:
+        s = m_dots.group(1).replace(".", ",") + "." + m_dots.group(2)
+    return s
+
+
+def _parse_monetary_token(text: str) -> Tuple[Optional[float], Optional[str]]:
+    if not text:
+        return None, None
+    s = _clean_ocr_number(text)
+    if (DATE_TOKEN_RE.match(s) and len(s) <= 12) or TIME_TOKEN_RE.match(s):
+        return None, None
+    s_clean = re.sub(r"(?:INR|Rs\.?|₹|\$|\s)", "", s, flags=re.I)
+    m = re.match(r"^([+-]?(?:\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d{1,2})?|\.\d{2})(?:\(?([CD]r)\)?)?([+-])?$", s_clean, re.I)
+    if not m:
+        return None, None
+    num_part = m.group(1).replace(",", "")
+    if num_part.startswith("."):
+        num_part = "0" + num_part
+    ind = m.group(2).upper() if m.group(2) else ("DR" if m.group(3) == "-" else None)
+    try:
+        return round(float(num_part), 2), ind
+    except ValueError:
+        return None, None
+
+
+def _is_left_date_span(sp: Dict[str, Any]) -> bool:
+    if not isinstance(sp, dict):
+        return False
+    return (sp.get("cx_norm", 1.0) <= 0.38 or (sp.get("bbox_norm") or [1.0])[0] <= 0.28) and bool(
+        DATE_TOKEN_RE.match((sp.get("text") or "").strip())
+    )
+
+
+def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Dict[str, Any]) -> Dict[str, Any]:
+    scan_data = scan_data or {}
+    blueprint = blueprint or {}
+    tb = blueprint.get("table_structure_blueprint")
+    if not isinstance(tb, dict):
+        tb = {}
+    cols = tb.get("columns")
+    if not isinstance(cols, dict):
+        cols = {}
+
+    table_start_y = float(tb.get("table_start_y_points") or 0.0)
+
+    bal_col = cols.get("balance") if isinstance(cols.get("balance"), dict) else {}
+    deb_col = cols.get("debit") if isinstance(cols.get("debit"), dict) else {}
+    cred_col = cols.get("credit") if isinstance(cols.get("credit"), dict) else {}
+
+    pages_list = scan_data.get("pages") or []
+    p1_clusters = (pages_list[0].get("numeric_x_clusters") or []) if pages_list and isinstance(pages_list[0], dict) else []
+    default_bal_x1 = p1_clusters[-1]["x1_normalized"] if p1_clusters else 0.92
+    default_bal_cx = p1_clusters[-1]["cx_normalized"] if p1_clusters else 0.85
+
+    bal_x_range = bal_col.get("x_range_normalized")
+    if isinstance(bal_x_range, list) and len(bal_x_range) >= 2 and bal_x_range[1] is not None:
+        bal_x1_norm = float(bal_x_range[1])
+    else:
+        bal_x1_norm = float(default_bal_x1)
+
+    bal_cx_norm = float(bal_col.get("cx_normalized") if bal_col.get("cx_normalized") is not None else default_bal_cx)
+    deb_cx_norm = float(deb_col["cx_normalized"]) if deb_col.get("cx_normalized") is not None else (
+        p1_clusters[-3]["cx_normalized"] if len(p1_clusters) >= 3 else 0.62
+    )
+    cred_cx_norm = float(cred_col["cx_normalized"]) if cred_col.get("cx_normalized") is not None else (
+        p1_clusters[-2]["cx_normalized"] if len(p1_clusters) >= 3 else 0.74
+    )
+
+    stated_sum_dict = blueprint.get("stated_summary")
+    if not isinstance(stated_sum_dict, dict):
+        stated_sum_dict = {}
+        blueprint["stated_summary"] = stated_sum_dict
+
+    transactions: List[Dict[str, Any]] = []
+    per_page_stats: List[Dict[str, int]] = []
+    aligned_numeric_hits = 0
+    total_numeric_spans = 0
+    stop_all = False
+
+    for page_obj in pages_list:
+        if not isinstance(page_obj, dict):
+            continue
+        p_num = page_obj.get("page") or 1
+        if stop_all:
+            per_page_stats.append({"page": p_num, "transactions_extracted": 0})
+            continue
+
+        lines = page_obj.get("lines") or []
+        h_idx = page_obj.get("header_line_idx")
+
+        first_dated_idx = None
+        for idx_l, ln in enumerate(lines):
+            if any(_is_left_date_span(sp) for sp in ln):
+                ln_low = " ".join((s.get("text") or "").lower() for s in ln)
+                if any(hdr_k in ln_low for hdr_k in ("from:", "to:", "from date", "to date", "open date", "a/c open", "generated on", "period:")):
+                    continue
+                first_dated_idx = idx_l
+                break
+
+        if h_idx is not None and (first_dated_idx is None or h_idx < first_dated_idx):
+            start_line = h_idx + 1
+        elif first_dated_idx is not None:
+            start_line = first_dated_idx
+        else:
+            start_line = 0
+
+        body_lines: List[List[Dict[str, Any]]] = []
+        for ln in lines[start_line:]:
+            if not ln:
+                continue
+            if p_num == 1 and table_start_y > 0 and first_dated_idx is None and max(s["bbox_points"][1] for s in ln) < table_start_y - 2.0:
+                continue
+            joined_low = " ".join((s.get("text") or "").lower() for s in ln).strip()
+
+            if any(sm in joined_low for sm in (
+                "page total", "total :", "total:", "grand total", "transaction total",
+                "statement summary", "charge breakup", "end of statement", "++++ end",
+                "opening balance:", "total withdrawals:", "total deposits:"
+            )):
+                if body_lines and not any(_is_left_date_span(s) for s in body_lines[-1]):
+                    # Check if Opening Balance / Total Withdrawals / Total Deposits are stated here (e.g., Yes Bank Page 43)
+                    m_ob = re.search(r"opening\s+balance\s*[:\-]?\s*([+-]?[\d,]+\.\d{2})", joined_low)
+                    if m_ob and stated_sum_dict.get("opening_balance") is None:
+                        stated_sum_dict["opening_balance"] = _parse_monetary_token(m_ob.group(1))[0]
+                if any(end_k in joined_low for end_k in (
+                    "transaction total", "statement summary", "charge breakup",
+                    "end of statement", "++++ end", "total withdrawals:", "mandatory disclaimer"
+                )):
+                    stop_all = True
+                break
+
+            if any(ign in joined_low for ign in [
+                "page no.:", "we understand your world", "closing balance includes funds",
+                "contents of this statement", "registered office address:", "state account branch gstn",
+                "statement of account", "computer generated", "system generated", "printed by",
+                "od limit", "account branch", "cust id", "a/c open date", "yes touch phonebanking",
+                "cin l65190", "email us at", "sms \"help\""
+            ]):
+                continue
+            # Skip wrapped table header fragment lines on continuation pages
+            if not any(re.search(r"\d+\.\d{2}", s.get("text", "")) for s in ln):
+                if any(h_w in joined_low for h_w in (
+                    "transactio", "n date", "value date", "transaction remarks", "withdrawl",
+                    "amt (inr)", "balance (in", "cheque no/reference"
+                )) and not any(_is_left_date_span(s) for s in ln):
+                    continue
+            body_lines.append(ln)
+
+        def line_has_balance_span(ln_spans: List[Dict[str, Any]]) -> bool:
+            joined_l = " ".join((s.get("text") or "").lower() for s in ln_spans)
+            if any(sm in joined_l for sm in NON_TX_ROW_MARKERS):
+                return False
+            for sp in ln_spans:
+                txt_sp = sp.get("text") or ""
+                val, _ = _parse_monetary_token(txt_sp)
+                if val is not None and ("." in _clean_ocr_number(txt_sp) or "," in txt_sp):
+                    if abs(sp["cx_norm"] - bal_cx_norm) <= 0.12 or abs(sp["bbox_norm"][2] - bal_x1_norm) <= 0.12 or sp["bbox_norm"][2] >= 0.82:
+                        return True
+                elif INLINE_DEC_RE.search(txt_sp) and sp["bbox_norm"][2] >= 0.80:
+                    return True
+            return False
+
+        def line_is_bf_or_dated_anchor(ln_spans: List[Dict[str, Any]]) -> bool:
+            joined_l = " ".join((s.get("text") or "").lower() for s in ln_spans)
+            if any(sm in joined_l for sm in NON_TX_ROW_MARKERS):
+                return False
+            if any(k in joined_l for k in ["opening balance", "brought forward", "b/f"]):
+                return True
+            if line_has_balance_span(ln_spans):
+                return True
+            has_left_date = any(_is_left_date_span(sp) for sp in ln_spans)
+            has_dec = any(
+                (_parse_monetary_token(sp.get("text") or "")[0] is not None and "." in _clean_ocr_number(sp.get("text") or ""))
+                or bool(INLINE_DEC_RE.search(sp.get("text") or ""))
+                for sp in ln_spans
+            )
+            return has_left_date and has_dec
+
+        # Primary anchors: lines with a Balance span (or B/F row)
+        anchor_idxs = [i for i, ln in enumerate(body_lines) if line_is_bf_or_dated_anchor(ln)]
+        if not anchor_idxs:
+            per_page_stats.append({"page": p_num, "transactions_extracted": 0})
+            continue
+
+        # Group every non-anchor body_line into its closest Balance/Transaction anchor by Y-coordinate!
+        anchor_cys = [
+            sum(s["cy_points"] for s in body_lines[a_i]) / len(body_lines[a_i])
+            for a_i in anchor_idxs
+        ]
+        grouped_blocks: List[List[Dict[str, Any]]] = [[] for _ in anchor_idxs]
+        for l_i, ln in enumerate(body_lines):
+            if l_i in anchor_idxs:
+                pos = anchor_idxs.index(l_i)
+                grouped_blocks[pos].extend(ln)
+            else:
+                ln_cy = sum(s["cy_points"] for s in ln) / len(ln)
+                best_pos = min(range(len(anchor_cys)), key=lambda k: abs(ln_cy - anchor_cys[k]))
+                # Only attach if within 28 points vertically of the anchor
+                if abs(ln_cy - anchor_cys[best_pos]) <= 28.0:
+                    grouped_blocks[best_pos].extend(ln)
+
+        page_tx_count = 0
+
+        for block_spans in grouped_blocks:
+            block_spans.sort(key=lambda s: (round(s["cy_points"], 1), s["cx_points"]))
+            row_joined = " ".join((s.get("text") or "").lower() for s in block_spans)
+
+            if any(sm in row_joined for sm in NON_TX_ROW_MARKERS) and not any(
+                u in row_joined for u in ["upi", "neft", "rtgs", "imps", "chq"]
+            ):
+                continue
+
+            if any(k in row_joined for k in ["opening balance", "brought forward", "b/f"]) and not any(
+                u in row_joined for u in ["upi", "neft", "rtgs", "imps", "chq"]
+            ):
+                for sp in block_spans:
+                    txt_sp = sp.get("text") or ""
+                    v_ob, i_ob = _parse_monetary_token(txt_sp)
+                    if v_ob is not None and ("." in _clean_ocr_number(txt_sp) or "," in txt_sp):
+                        signed_ob = -abs(v_ob) if (i_ob == "DR" or txt_sp.strip().startswith("-")) else v_ob
+                        stated_sum_dict["opening_balance"] = signed_ob
+                continue
+
+            date_str = None
+            desc_parts: List[str] = []
+            row_monetary_tokens: List[Tuple[float, float, float, Optional[str], str]] = []
+            dr_cr_ind = None
+
+            for sp in block_spans:
+                txt = (sp.get("text") or "").strip()
+                if not txt or TIME_TOKEN_RE.match(txt):
+                    continue
+
+                m_dt = DATE_TOKEN_RE.match(txt)
+                if m_dt and (sp["cx_norm"] <= 0.38 or sp["bbox_norm"][0] <= 0.28):
+                    if not date_str:
+                        date_str = m_dt.group(0)
+                    txt = txt[m_dt.end():].strip()
+                    if not txt or TIME_TOKEN_RE.match(txt):
+                        continue
+
+                if re.match(r"^\(?([CD]r)\)?$", txt, re.I):
+                    dr_cr_ind = "DR" if "D" in txt.upper() else "CR"
+                    continue
+
+                val, ind = _parse_monetary_token(txt)
+                if val is not None and ("." in _clean_ocr_number(txt) or "," in txt):
+                    total_numeric_spans += 1
+                    row_monetary_tokens.append((sp["cx_norm"], sp["bbox_norm"][2], val, ind, txt))
+                elif " " in txt and INLINE_DEC_RE.search(txt):
+                    x0_n, _, x1_n, _ = sp["bbox_norm"]
+                    w_n = max(0.02, x1_n - x0_n)
+                    t_len = max(1, len(txt))
+                    last_end = 0
+                    for m_in in INLINE_DEC_RE.finditer(txt):
+                        prefix_txt = txt[last_end:m_in.start(1)].strip()
+                        if prefix_txt and not TIME_TOKEN_RE.match(prefix_txt):
+                            desc_parts.append(prefix_txt)
+                        sub_t = m_in.group(1)
+                        sub_v, sub_i = _parse_monetary_token(sub_t)
+                        if sub_v is not None:
+                            total_numeric_spans += 1
+                            sub_cx = round(x0_n + ((m_in.start(1) + m_in.end(1)) / (2.0 * t_len)) * w_n, 4)
+                            sub_x1 = round(x0_n + (m_in.end(1) / t_len) * w_n, 4)
+                            row_monetary_tokens.append((sub_cx, sub_x1, sub_v, sub_i, sub_t))
+                        last_end = m_in.end(1)
+                    suffix_txt = txt[last_end:].strip()
+                    if suffix_txt and not TIME_TOKEN_RE.match(suffix_txt):
+                        desc_parts.append(suffix_txt)
+                else:
+                    desc_parts.append(txt)
+
+            if not row_monetary_tokens:
+                continue
+
+            desc_clean = " ".join(desc_parts).strip()
+            if any(sm in desc_clean.lower() for sm in NON_TX_ROW_MARKERS):
+                continue
+
+            if not date_str:
+                date_str = transactions[-1]["date"] if transactions else f"Page-{p_num}"
+
+            row_monetary_tokens.sort(key=lambda item: item[0])
+            b_cx, b_x1, b_v, b_ind, b_txt = row_monetary_tokens[-1]
+            bal_val = -abs(b_v) if (b_ind == "DR" or b_txt.startswith("-")) else b_v
+            aligned_numeric_hits += 1
+
+            debit_val = 0.0
+            credit_val = 0.0
+            non_bal_tokens = row_monetary_tokens[:-1]
+            non_zero_cands = [t for t in non_bal_tokens if abs(t[2]) > 0.001]
+            active_cands = non_zero_cands if non_zero_cands else non_bal_tokens
+
+            prev_b = (
+                transactions[-1]["balance"]
+                if transactions
+                else stated_sum_dict.get("opening_balance")
+            )
+
+            if active_cands:
+                aligned_numeric_hits += 1
+                chosen_cand = active_cands[-1]
+                if prev_b is not None and len(active_cands) >= 2:
+                    expected_delta = round(bal_val - prev_b, 2)
+                    for cand in active_cands:
+                        if abs(abs(cand[2]) - abs(expected_delta)) <= 1.0:
+                            chosen_cand = cand
+                            break
+
+                a_cx, a_x1, a_v, a_ind, a_txt = chosen_cand
+                is_neg_token = a_txt.strip().startswith("-") or (a_v < 0)
+
+                if is_neg_token and (prev_b is not None and abs((prev_b + abs(a_v)) - bal_val) <= 1.0):
+                    debit_val = -abs(a_v)
+                    credit_val = 0.0
+                elif "reversal ft-dr" in desc_clean.lower() and (prev_b is not None and abs((prev_b + abs(a_v)) - bal_val) <= 1.0):
+                    debit_val = -abs(a_v)
+                    credit_val = 0.0
+                elif a_ind == "DR" or dr_cr_ind == "DR":
+                    debit_val = abs(a_v)
+                elif a_ind == "CR" or dr_cr_ind == "CR":
+                    credit_val = abs(a_v)
+                elif prev_b is not None and abs((prev_b - abs(a_v)) - bal_val) <= 1.0:
+                    debit_val = abs(a_v)
+                elif prev_b is not None and abs((prev_b + abs(a_v)) - bal_val) <= 1.0:
+                    credit_val = abs(a_v)
+                elif deb_cx_norm is not None and cred_cx_norm is not None and abs(deb_cx_norm - cred_cx_norm) > 0.025:
+                    d_dist = abs(a_cx - deb_cx_norm)
+                    c_dist = abs(a_cx - cred_cx_norm)
+                    if d_dist <= c_dist:
+                        debit_val = -abs(a_v) if is_neg_token else abs(a_v)
+                    else:
+                        credit_val = -abs(a_v) if is_neg_token else abs(a_v)
+                else:
+                    if prev_b is not None and bal_val < prev_b:
+                        debit_val = abs(a_v)
+                    else:
+                        credit_val = abs(a_v)
+
+            rx0 = min(s["bbox_points"][0] for s in block_spans)
+            ry0 = min(s["bbox_points"][1] for s in block_spans)
+            rx1 = max(s["bbox_points"][2] for s in block_spans)
+            ry1 = max(s["bbox_points"][3] for s in block_spans)
+
+            transactions.append({
+                "page": p_num,
+                "bbox": [round(rx0, 2), round(ry0, 2), round(rx1, 2), round(ry1, 2)],
+                "date": date_str,
+                "description": desc_clean,
+                "credit": round(credit_val, 2),
+                "debit": round(debit_val, 2),
+                "balance": round(bal_val, 2),
+            })
+            page_tx_count += 1
+
+        per_page_stats.append({"page": p_num, "transactions_extracted": page_tx_count})
+
+    if len(transactions) >= 3:
+        fwd_hits = sum(
+            1 for i in range(len(transactions) - 1)
+            if abs((transactions[i]["balance"] + transactions[i + 1]["credit"] - transactions[i + 1]["debit"]) - transactions[i + 1]["balance"]) <= 1.0
+        )
+        rev_hits = sum(
+            1 for i in range(len(transactions) - 1)
+            if abs((transactions[i + 1]["balance"] + transactions[i]["credit"] - transactions[i]["debit"]) - transactions[i]["balance"]) <= 1.0
+        )
+        if rev_hits > fwd_hits and rev_hits >= (len(transactions) - 1) * 0.5:
+            transactions.reverse()
+            tb["chronological_order"] = "REVERSE_CHRONOLOGICAL"
+
+    for i in range(1, len(transactions) - 1):
+        prev_b = transactions[i - 1]["balance"]
+        curr_t = transactions[i]
+        next_t = transactions[i + 1]
+        if curr_t["debit"] < 0 or curr_t["credit"] < 0 or next_t["debit"] < 0 or next_t["credit"] < 0:
+            continue
+        amt1 = max(abs(curr_t["debit"]), abs(curr_t["credit"]))
+        amt2 = max(abs(next_t["debit"]), abs(next_t["credit"]))
+        if amt1 > 0 and amt2 > 0:
+            curr_ok = abs((prev_b + curr_t["credit"] - curr_t["debit"]) - curr_t["balance"]) <= 1.0
+            if not curr_ok:
+                for s1 in (-1, 1):
+                    for s2 in (-1, 1):
+                        if abs((prev_b + s1 * amt1 + s2 * amt2) - next_t["balance"]) <= 1.5:
+                            if s1 < 0:
+                                curr_t["debit"], curr_t["credit"] = amt1, 0.0
+                            else:
+                                curr_t["credit"], curr_t["debit"] = amt1, 0.0
+                            if s2 < 0:
+                                next_t["debit"], next_t["credit"] = amt2, 0.0
+                            else:
+                                next_t["credit"], next_t["debit"] = amt2, 0.0
+                            break
+
+    if transactions and stated_sum_dict.get("opening_balance") is None:
+        first_tx = transactions[0]
+        stated_sum_dict["opening_balance"] = round(first_tx["balance"] - first_tx["credit"] + first_tx["debit"], 2)
+
+    alignment_ratio = min(1.0, (aligned_numeric_hits / max(1, total_numeric_spans))) if total_numeric_spans > 0 else 0.0
+    return {
+        "transactions": transactions,
+        "per_page_summary": per_page_stats,
+        "numeric_alignment_ratio": round(alignment_ratio, 3),
+        "valid_anchor_rows_found": len(transactions),
+    }

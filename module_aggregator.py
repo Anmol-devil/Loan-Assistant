@@ -10,14 +10,15 @@ from corporate_kyc_engines import classify_financial_document
 
 ocr_reader = RapidOCR()
 
-
+# ==============================================================================
 # AUTHORITATIVE ENUMS & CONSTANTS (Section 4.3 Schema)
+# ==============================================================================
 ALLOWED_CHECK_STATUSES = {"PASSED", "FAILED", "NOT_RUN", "NOT_APPLICABLE"}
 ALLOWED_TRIAGE_BANDS = {"low_risk", "needs_review", "high_risk"}
 ALLOWED_DOC_CODES = {
     "BANK_STATEMENT", "SALARY_SLIP", "PAN_CARD",
     "GST_CERTIFICATE", "UDYAM_CERTIFICATE", "ITR_DOCUMENT",
-    "BALANCE_SHEET", "UNKNOWN_DOCUMENT"
+    "BALANCE_SHEET", "TAX_AUDIT_REPORT", "UNKNOWN_DOCUMENT"
 }
 ALLOWED_FINDING_CODES = {
     "ARITHMETIC_MISMATCH",
@@ -56,8 +57,27 @@ TENANT_CONFIGS = {
     }
 }
 
+UNIVERSAL_IFSC_BANK_MAP = {
+    "SBIN": "State Bank of India", "HDFC": "HDFC Bank", "ICIC": "ICICI Bank",
+    "UTIB": "Axis Bank", "KKBK": "Kotak Mahindra Bank", "YESB": "Yes Bank",
+    "PUNB": "Punjab National Bank", "BARB": "Bank of Baroda", "CNRB": "Canara Bank",
+    "UBIN": "Union Bank of India", "IDIB": "Indian Bank", "BKID": "Bank of India",
+    "CBIN": "Central Bank of India", "IOBA": "Indian Overseas Bank", "UCBA": "UCO Bank",
+    "MAHB": "Bank of Maharashtra", "PSIB": "Punjab & Sind Bank", "IDFB": "IDFC First Bank",
+    "INDB": "IndusInd Bank", "FDRL": "Federal Bank", "BDBL": "Bandhan Bank",
+    "IBKL": "IDBI Bank", "RATN": "RBL Bank", "KARB": "Karnataka Bank",
+    "KVBL": "Karur Vysya Bank", "SIBL": "South Indian Bank", "TMBL": "Tamilnad Mercantile Bank",
+    "CIUB": "City Union Bank", "JSBL": "Jana Small Finance Bank", "AUBL": "AU Small Finance Bank",
+    "ESFB": "Equitas Small Finance Bank", "UJVN": "Ujjivan Small Finance Bank",
+    "SCBL": "Standard Chartered Bank", "CITI": "Citibank", "HSBC": "HSBC Bank",
+    "DBSS": "DBS Bank", "DEUT": "Deutsche Bank", "AIRP": "Airtel Payments Bank",
+    "PYTM": "Paytm Payments Bank", "SURY": "Suryoday Small Finance Bank"
+}
 
-# 1. HONEST RISK SCORING & OPTIONAL EMPIRICAL CALIBRATOR 
+
+# ==============================================================================
+# 1. HONEST RISK SCORING & OPTIONAL EMPIRICAL CALIBRATOR
+# ==============================================================================
 class RiskScoreCalibrator:
     def __init__(self, external_labeled_json_path: str = None):
         self.is_empirically_validated = False
@@ -111,16 +131,15 @@ class RiskScoreCalibrator:
 
 SCORER = RiskScoreCalibrator()
 
-# 2. MULTI-PAGE TEXT EXTRACTOR & INDEPENDENT ENTITY EXTRACTOR 
-PAN_EXTRACT_RE = re.compile(r"\b([A-Z]{5}[0-9]{4}[A-Z])\b")
 
-
+# 2. UNIVERSAL PAGE-1 PRE-TABLE ENTITY & BANK EXTRACTOR
 def clean_ocr_person_name(raw_name: str) -> tuple[str, float]:
     if not raw_name:
         return "Unknown Holder", 0.0
     orig = raw_name.strip()
-    cleaned = re.sub(r"\s+[Il1\|]+$", "", orig).strip()
-    cleaned = re.sub(r"[^A-Za-z0-9\s\.\&/]", "", cleaned).strip()
+    cleaned = re.sub(r"^(?:Mr\.?|Mrs\.?|Ms\.?|Shri|Smt\.?)\s+", "", orig, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+[Il1\|]+$", "", cleaned).strip()
+    cleaned = re.sub(r"[^A-Za-z0-9\s\.\&/\-\(\)]", "", cleaned).strip(" :-|.,")
     cleaned = re.sub(r"\s{2,}", " ", cleaned).title()
     if not cleaned or len(cleaned) < 3:
         return "Unknown Holder", 0.0
@@ -160,431 +179,301 @@ def extract_raw_text_from_file(file_path: str) -> str:
     return ""
 
 
-def extract_tax_audit_identity(text: str, raw_report: dict = None) -> dict:
-    """
-    Extract identity information from Form 3CB / Form 3CD.
-
-    Important:
-    - Assessee is the document holder.
-    - Auditor is kept as a separate entity.
-    - Proprietor is kept separately from business name.
-    - PAN is extracted from the assessee section where possible.
-    """
-
-    fin_rec = {}
-
-    if isinstance(raw_report, dict):
-        fin_rec = raw_report.get("financial_reconciliation") or {}
-
-    if not isinstance(fin_rec, dict):
-        fin_rec = {}
-
-    assessee = fin_rec.get("assessee_business_name")
-    proprietor = fin_rec.get("proprietor_name")
-    auditor = fin_rec.get("auditor_name")
-    signatory = fin_rec.get("signatory_name")
-    assessee_pan = fin_rec.get("assessee_pan_number")
-
-    assessee_match = None
-    
-    if not assessee:
-        assessee_match = re.search(
-            r"attached\s+herewith\s*,?\s*of\s*"
-            r"[:\-]?\s*([^\r\n]+)",
-            text,
-            re.IGNORECASE
-        )
-
-        if assessee_match:
-            assessee = assessee_match.group(1).strip()
-
-    if not assessee:
-        assessee_match = re.search(
-            r"(?im)^\s*01\s+Name\s+of\s+the\s+assessee\s+"
-            r"(.+?)\s*$",
-            text
-        )
-
-        if assessee_match:
-            assessee = assessee_match.group(1).strip()
-
-    if assessee and not proprietor:
-        proprietor_match = re.search(
-            r"\(\s*Proprietor\s*:\s*([^)]+)\)",
-            assessee,
-            re.IGNORECASE
-        )
-
-        if proprietor_match:
-            proprietor = proprietor_match.group(1).strip()
-
-    # Remove proprietor information from business display name.
-    if assessee:
-        assessee = re.split(
-            r"\s*\(\s*Proprietor\s*:",
-            assessee,
-            maxsplit=1,
-            flags=re.IGNORECASE
-        )[0].strip()
-
-    if not auditor:
-        auditor_match = re.search(
-            r"(?im)^\s*For\s+([^\r\n]+)\s*\r?\n"
-            r"\s*Chartered\s+Accountant\b",
-            text
-        )
-
-        if auditor_match:
-            auditor = auditor_match.group(1).strip()
-
-    if not signatory:
-        signatory_match = re.search(
-            r"\(\s*([A-Z][A-Za-z.' ]{2,60})\s*\)"
-            r"\s*\r?\n\s*Proprietor\b",
-            text,
-            re.IGNORECASE
-        )
-
-        if signatory_match:
-            signatory = signatory_match.group(1).strip()
-
-    if not assessee_pan:
-        # Prefer PAN close to the Form 3CB assessee section.
-        if assessee_match:
-            start = assessee_match.start()
-            pan_window = text[start:start + 1000]
-        else:
-            pan_window = text[:1500]
-
-        pan_match = re.search(
-            r"\bPAN\s*[:\-]?\s*([A-Z]{5}\d{4}[A-Z])\b",
-            pan_window,
-            re.IGNORECASE
-        )
-
-        if pan_match:
-            assessee_pan = pan_match.group(1).upper()
-
-    return {
-        "assessee_business_name": assessee,
-        "proprietor_name": proprietor,
-        "auditor_name": auditor,
-        "signatory_name": signatory,
-        "assessee_pan_number": assessee_pan
-    }
+def _slice_page1_pre_table(full_text: str) -> str:
+    patterns = [
+        r"\b(?:sl\s*no|si\s*no|sr\s*no)\b[\s\S]{0,140}?\b(?:tran\s*id|value\s*date|transaction\s*date|balance)\b",
+        r"\b(?:transaction\s*date|value\s*date|tran\s*date|txn\s*date|date)\b[\s\S]{0,180}?\b(?:narration|description|particulars|transaction\s*particulars|remarks|withdrawal|deposit|debit|credit)\b",
+    ]
+    cut = min(len(full_text), 1800)
+    for pat in patterns:
+        m = re.search(pat, full_text[:3500], re.IGNORECASE)
+        if m and m.start() > 25:
+            cut = min(cut, m.start())
+    return full_text[:cut]
 
 
-def identify_document_and_entity(
-    file_path: str,
-    raw_report: dict = None
-) -> dict:
+def _extract_holder_strictly_from_header(file_path: str, pre_table_text: str) -> str | None:
+    bad_words = [
+        "statement of", "account statement", "detailed statement", "salary slip",
+        "icici bank", "hdfc bank", "yes bank", "kotak mahindra", "state bank",
+        "axis bank", "indusind bank", "standard chartered", "jammu", "rajasthan",
+        "branch", "ifsc", "currency", "nominee", "period", "search", "customer id",
+        "cust id", "scheme", "ckyc", "micr", "sanction", "drawing power", "interest rate",
+        "opening balance", "closing balance", "page", "date of", "generated",
+        "address", "city", "state", "phone", "email", "od limit", "account no",
+        "a/c open", "account status", "regular", "product code", "joint holder", "nomination",
+        "road", "street", "marg", "lane", "gali", "nagar", "mumbai", "meerut", "delhi", "plaza", "society"
+    ]
+
+    def _valid(c: str) -> bool:
+        c = re.sub(r"\s+", " ", c).strip(" :-|.,")
+        if len(c) < 3 or len(c) > 55:
+            return False
+        c_low = c.lower()
+        if any(b in c_low for b in bad_words):
+            return False
+        if re.match(r"^[\d\W]+$", c) or re.match(r"^\d{1,2}[\-/][A-Za-z0-9]{2,9}[\-/]\d{2,4}$", c):
+            return False
+        # Must contain at least 3 alphabetic characters
+        if sum(1 for ch in c if ch.isalpha()) < 3:
+            return False
+        return True
+
+    # Stage 1: 2D Coordinate right-of-label lookup on Page 1
+    if file_path and file_path.lower().endswith(".pdf") and os.path.exists(file_path):
+        try:
+            with pymupdf.open(file_path) as doc:
+                if len(doc) > 0:
+                    page = doc[0]
+                    spans = []
+                    for b in page.get_text("dict").get("blocks", []):
+                        for l in b.get("lines", []):
+                            line_txt = " ".join(s.get("text", "").strip() for s in l.get("spans", []) if s.get("text", "").strip())
+                            if line_txt:
+                                bbox = l["bbox"]
+                                spans.append({"text": line_txt, "x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3]})
+
+                    label_re = re.compile(
+                        r"^(?:account\s*holder(?:\s*name)?|account\s*name|customer\s*name|applicant\s*name|employee\s*name|legal\s*name|name\s*of\s*enterprise|name\s*of\s*customer|name)\s*[:\-]?$",
+                        re.IGNORECASE
+                    )
+                    for s in spans:
+                        if s["y0"] > 380:
+                            continue
+                        if label_re.match(s["text"].strip()):
+                            right_matches = [
+                                other for other in spans
+                                if other["x0"] > s["x1"] - 6.0 and abs(other["y0"] - s["y0"]) <= 12.0
+                                and _valid(other["text"].lstrip(":- "))
+                            ]
+                            if right_matches:
+                                right_matches.sort(key=lambda item: item["x0"])
+                                return right_matches[0]["text"].lstrip(":- ").strip()
+        except Exception:
+            pass
+
+    lines = [ln.strip() for ln in pre_table_text.splitlines() if ln.strip()]
+
+    # Stage 2: Stacked Columnar Label Block ('Name:\nAddress:\nA/C No:\nJt. Holder:\n<VALUE>')
+    for i, ln in enumerate(lines):
+        if re.match(r"^(?:account\s*name|customer\s*name|holder\s*name|name)\s*[:\-]?$", ln, re.IGNORECASE):
+            j = i + 1
+            while j < min(len(lines), i + 8) and (
+                lines[j].endswith(":")
+                or re.match(r"^(?:address|a/c|account|jt\.?\s*holder|joint\s*holder|cust(?:omer)?\s*id|ifsc|micr|branch)\b", lines[j], re.IGNORECASE)
+            ):
+                j += 1
+            if j < len(lines) and _valid(lines[j]):
+                return lines[j].lstrip(":- ").strip()
+
+    # Stage 3: Inline Key-Value or Business/Person Name Anchor
+    pats = [
+        r"(?:^|\n)([A-Za-z0-9\.\&\/\ \t]{3,50}?)\s*\(\s*(?:Account\s*Name|Company\s*Name)\s*\)",
+        r"(?<!nominee\s)(?<!nominee)(?<!branch\s)(?:account\s*holder(?:\s*name)?|account\s*name|customer\s*name|applicant\s*name|employee\s*name|legal\s*name|name)\s*[:\-]\s*([A-Za-z][A-Za-z0-9\ \t\.\&/\-]{2,50}?)(?=\s*\||$|\n|pan|period|statement|branch|address|joint|jt\.|cust)",
+        r"(?:^|\n)((?:M/S\.?\s+)?[A-Z][A-Z0-9\ \t\.\&]{2,48}?)\n\s*(?:joint\s*holder|jt\.?\s*holder|address|plot\s+no|flat\s+no|h\.?\s*no|house\s+no|kh\s+no|shop\s+no|ward|sector|phase|floor|near|opp|behind|village|dist|new\s+\d+|\d+[\-/A-Z0-9]+\s+[A-Z])",
+        r"(?:^|\n)([A-Z][A-Z0-9\.\&/\ \t]{2,45}\s+(?:ENTERPRISES|TRADERS|ASSOCIATES|INDUSTRIES|PRIVATE\s+LIMITED|PVT\.?\s*LTD\.?|LIMITED|LLP|SOLUTIONS|INFRA|COLLECTION|AGENCY|CORP|CORPORATION|TECH|TECHNOLOGY|ENGINEERING|SERVICES|EXPORTS|IMPORTS))\b",
+    ]
+    for pat in pats:
+        for m in re.finditer(pat, pre_table_text, re.IGNORECASE):
+            cand = m.group(1).strip()
+            if _valid(cand):
+                return cand
+
+    # Stage 4: Top-of-page Unlabeled Customer Name (Axis Bank & IndusInd Bank often place the Customer Name on Line 1 or 2 of Page 1!)
+    for ln in lines[:6]:
+        cleaned_ln = re.sub(r"^(?:Mr\.?|Mrs\.?|Ms\.?|M/s\.?)\s+", "", ln, flags=re.IGNORECASE).strip()
+        if (
+            _valid(cleaned_ln)
+            and cleaned_ln.upper() == cleaned_ln
+            and ":" not in cleaned_ln
+            and not any(k in cleaned_ln.lower() for k in ["bank", "statement", "account", "branch", "address", "india", "page", "limit", "inr", "date", "from", "to"])
+        ):
+            return cleaned_ln
+
+    return None
+
+
+def _extract_bank_strictly_from_header(pre_table_text: str, full_text: str, file_path: str = "") -> str | None:
+    # 1. Authoritative IFSC Code in Page 1 Header
+    for m_ifsc in re.finditer(r"\b([A-Z]{4})0[A-Z0-9]{6}\b", pre_table_text.upper()):
+        pref = m_ifsc.group(1)
+        if pref in UNIVERSAL_IFSC_BANK_MAP:
+            return UNIVERSAL_IFSC_BANK_MAP[pref]
+
+    # 2. Earliest-appearing bank name in Page 1 Pre-Table Header
+    bank_re = re.compile(
+        r"\b(ICICI\s+Bank|HDFC\s+Bank|Yes\s+Bank|Kotak\s+Mahindra\s+Bank|Axis\s+Bank|IndusInd\s+Bank|State\s+Bank\s+of\s+India|Standard\s+Chartered\s+Bank|Punjab\s+National\s+Bank|Bank\s+of\s+Baroda|Canara\s+Bank|Union\s+Bank\s+of\s+India|IDFC\s+First\s+Bank|Federal\s+Bank|Bandhan\s+Bank|IDBI\s+Bank|RBL\s+Bank|AU\s+Small\s+Finance\s+Bank)\b",
+        re.IGNORECASE
+    )
+    found = [(m.start(), m.group(1)) for m in bank_re.finditer(pre_table_text)]
+    if found:
+        found.sort(key=lambda x: x[0])
+        b_raw = re.sub(r"\s+", " ", found[0][1]).strip()
+        low_b = b_raw.lower()
+        if "icici" in low_b:
+            return "ICICI Bank"
+        if "hdfc" in low_b:
+            return "HDFC Bank"
+        if "indusind" in low_b:
+            return "IndusInd Bank"
+        if "idfc" in low_b:
+            return "IDFC First Bank"
+        if "idbi" in low_b:
+            return "IDBI Bank"
+        return b_raw.title()
+
+    # 3. Check IFSC anywhere in document
+    for m_ifsc in re.finditer(r"\b([A-Z]{4})0[A-Z0-9]{6}\b", full_text.upper()):
+        pref = m_ifsc.group(1)
+        if pref in UNIVERSAL_IFSC_BANK_MAP:
+            return UNIVERSAL_IFSC_BANK_MAP[pref]
+
+    # 4. Check full text or filename if the PDF bank logo was rendered as vector curves
+    combined_fallback = f"{os.path.basename(file_path or '')} {full_text[:1000]} {full_text[-1500:]}"
+    m_fb = bank_re.search(combined_fallback)
+    if m_fb:
+        b_raw = re.sub(r"\s+", " ", m_fb.group(1)).strip()
+        if "indusind" in b_raw.lower():
+            return "IndusInd Bank"
+        if "icici" in b_raw.lower():
+            return "ICICI Bank"
+        if "hdfc" in b_raw.lower():
+            return "HDFC Bank"
+        return b_raw.title()
+
+    return None
+
+
+def identify_document_and_entity(file_path: str, raw_report: dict = None) -> dict:
     text = extract_raw_text_from_file(file_path)
-
     if not text:
         return {
-            "doc_category": "Unknown Document",
-            "doc_code": "UNKNOWN_DOCUMENT",
-            "classification_confidence": 0.0,
-            "holder_name": "Unknown Holder",
-            "person_name": "Unknown Holder",
-            "raw_extracted_name": "Unknown Holder",
-            "name_confidence": 0.0,
-            "pan_number": None,
-            "issuing_bank": None,
-            "employer_name": None,
-            "business_name": None,
-            "proprietor_name": None,
-            "auditor_name": None,
-            "signatory_name": None,
+            "doc_category": "Unknown Document", "doc_code": "UNKNOWN_DOCUMENT",
+            "classification_confidence": 0.0, "holder_name": "Unknown Holder",
+            "person_name": "Unknown Holder", "raw_extracted_name": "Unknown Holder",
+            "name_confidence": 0.0, "pan_number": None, "issuing_bank": None,
+            "employer_name": None, "business_name": None, "proprietor_name": None,
+            "auditor_name": None, "signatory_name": None,
             "identity_badge": "Unknown Document of Unknown Holder"
         }
 
     cls_info = classify_financial_document(text)
+    doc_code = cls_info.get("doc_code", "UNKNOWN_DOCUMENT")
+    doc_category = cls_info.get("doc_category", "Unknown Document")
+    cls_conf = cls_info.get("classification_confidence", 0.0)
 
-    doc_code = cls_info.get(
-        "doc_code",
-        "UNKNOWN_DOCUMENT"
-    )
+    fin_r_type = ((raw_report or {}).get("financial_reconciliation") or {}).get("document_type")
+    if fin_r_type and fin_r_type in ALLOWED_DOC_CODES and fin_r_type != "UNKNOWN_DOCUMENT":
+        doc_code = fin_r_type
+        doc_category_map = {
+            "BANK_STATEMENT": "Bank Statement",
+            "PAN_CARD": "PAN Card",
+            "SALARY_SLIP": "Salary Slip",
+            "GST_CERTIFICATE": "GST Certificate",
+            "UDYAM_CERTIFICATE": "Udyam MSME Certificate",
+            "ITR_DOCUMENT": "ITR Return",
+            "BALANCE_SHEET": "Balance Sheet",
+            "TAX_AUDIT_REPORT": "Tax Audit Report (Form 3CB/3CD)",
+        }
+        doc_category = doc_category_map.get(doc_code, doc_category)
+        cls_conf = max(cls_conf, 0.95)
 
-    doc_category = cls_info.get(
-        "doc_category",
-        "Unknown Document"
-    )
-
-    cls_conf = cls_info.get(
-        "classification_confidence",
-        0.0
-    )
-    
-    normalized_text = re.sub(
-        r"\s+",
-        " ",
-        text.upper()
-    )
-
-    has_form_3cb = bool(
-        re.search(r"\bFORM\s+NO\.?\s*3CB\b", normalized_text)
-    )
-
-    has_form_3cd = bool(
-        re.search(r"\bFORM\s+NO\.?\s*3CD\b", normalized_text)
-    )
-
-    has_section_44ab = (
-        "SECTION 44AB" in normalized_text
-    )
-
-    if (
-        has_section_44ab
-        and (has_form_3cb or has_form_3cd)
-    ):
+    norm_up = re.sub(r"\s+", " ", text.upper())
+    if "SECTION 44AB" in norm_up and re.search(r"\bFORM\s+NO\.?\s*3C[BD]\b", norm_up):
         doc_code = "TAX_AUDIT_REPORT"
         doc_category = "Tax Audit Report (Form 3CB/3CD)"
-
-        # Rule-based classification confidence, not a
-        # statistically calibrated probability.
         cls_conf = 0.95
-
+    
+    fin_r_type = ((raw_report or {}).get("financial_reconciliation") or {}).get("document_type")
+    if doc_code == "UNKNOWN_DOCUMENT" and fin_r_type and fin_r_type != "UNKNOWN_DOCUMENT":
+        doc_code = fin_r_type
+        doc_category_map = {
+            "PAN_CARD": "PAN Card",
+            "BANK_STATEMENT": "Bank Statement",
+            "SALARY_SLIP": "Salary Slip",
+            "GST_CERTIFICATE": "GST Registration Certificate",
+            "UDYAM_CERTIFICATE": "Udyam MSME Certificate",
+            "ITR_DOCUMENT": "Income Tax Return (ITR)",
+            "BALANCE_SHEET": "Balance Sheet",
+            "TAX_AUDIT_REPORT": "Tax Audit Report (Form 3CB/3CD)",
+        }
+        doc_category = doc_category_map.get(doc_code, "Financial Document")
+        cls_conf = 0.92
+    
     if doc_code == "UNKNOWN_DOCUMENT":
         return {
-            "doc_category": "Unknown Document",
-            "doc_code": "UNKNOWN_DOCUMENT",
-            "classification_confidence": 0.0,
-            "holder_name": "Unknown Holder",
-            "person_name": "Unknown Holder",
-            "raw_extracted_name": "Unknown Holder",
-            "name_confidence": 0.0,
-            "pan_number": None,
-            "issuing_bank": None,
-            "employer_name": None,
-            "business_name": None,
-            "proprietor_name": None,
-            "auditor_name": None,
-            "signatory_name": None,
+            "doc_category": "Unknown Document", "doc_code": "UNKNOWN_DOCUMENT",
+            "classification_confidence": 0.0, "holder_name": "Unknown Holder",
+            "person_name": "Unknown Holder", "raw_extracted_name": "Unknown Holder",
+            "name_confidence": 0.0, "pan_number": None, "issuing_bank": None,
+            "employer_name": None, "business_name": None, "proprietor_name": None,
+            "auditor_name": None, "signatory_name": None,
             "identity_badge": "Unknown Document of Unknown Holder"
         }
 
-    extracted_pan = None
-    raw_extracted_name = None
+    pre_table_header = _slice_page1_pre_table(text)
     person_name = "Unknown Holder"
+    raw_extracted_name = None
     name_confidence = 0.0
+    extracted_pan = None
+    issuing_bank = None
+    employer_name = None
     business_name = None
     proprietor_name = None
     auditor_name = None
     signatory_name = None
-    issuing_bank = None
-    employer_name = None
+
     if doc_code == "TAX_AUDIT_REPORT":
-
-        tax_identity = extract_tax_audit_identity(
-            text,
-            raw_report
-        )
-
-        business_name = tax_identity.get(
-            "assessee_business_name"
-        )
-
-        proprietor_name = tax_identity.get(
-            "proprietor_name"
-        )
-
-        auditor_name = tax_identity.get(
-            "auditor_name"
-        )
-
-        signatory_name = tax_identity.get(
-            "signatory_name"
-        )
-
-        extracted_pan = tax_identity.get(
-            "assessee_pan_number"
-        )
-
+        fin_r = (raw_report or {}).get("financial_reconciliation", {})
+        business_name = fin_r.get("assessee_business_name")
+        proprietor_name = fin_r.get("proprietor_name")
+        auditor_name = fin_r.get("auditor_firm_name")
+        signatory_name = fin_r.get("auditor_signatory")
+        extracted_pan = fin_r.get("pan_number")
         if business_name:
             person_name = business_name
             raw_extracted_name = business_name
-            name_confidence = 0.90
-
-        else:
-            person_name = "Assessee Not Extracted"
-            raw_extracted_name = None
-            name_confidence = 0.0
-
+            name_confidence = 0.95
     else:
-        pan_match = re.search(
-            r"\b([A-Z]{5}\d{4}[A-Z])\b",
-            text.upper()
-        )
+        pan_m = re.search(r"\b([A-Z]{5}\d{4}[A-Z])\b", pre_table_header.upper()) or re.search(r"\b([A-Z]{5}\d{4}[A-Z])\b", text.upper())
+        extracted_pan = pan_m.group(1) if pan_m else None
 
-        extracted_pan = (
-            pan_match.group(1)
-            if pan_match
-            else None
-        )
-        name_patterns = [
+        # Use specialized KYC entity names first if already extracted by GST / Udyam engines
+        fin_r = (raw_report or {}).get("financial_reconciliation", {})
+        extracted_pan = extracted_pan or fin_r.get("pan_number")
+        kyc_name = fin_r.get("legal_name") or fin_r.get("trade_name") or fin_r.get("enterprise_name")
+        if kyc_name:
+            raw_extracted_name = kyc_name
+            person_name, name_confidence = clean_ocr_person_name(kyc_name)
+        else:
+            cand = _extract_holder_strictly_from_header(file_path, pre_table_header)
+            if cand:
+                raw_extracted_name = cand
+                person_name, name_confidence = clean_ocr_person_name(cand)
 
-            # Explicit labelled identity fields.
-            r"(?im)^\s*(?:account\s+holder|account\s+name|"
-            r"customer\s+name|employee\s+name|applicant\s+name|"
-            r"card\s+holder|legal\s+name|name\s+of\s+enterprise)"
-            r"\s*[:\-]\s*([A-Za-z][A-Za-z0-9.'&/ \t-]{2,60})",
-
-            # M/s business names.
-            r"(?im)^\s*(M/s\.?\s+[A-Z][A-Za-z0-9.'&/ \t-]{2,60})",
-
-            # Business names with common legal suffixes.
-            r"(?im)^\s*([A-Z][A-Z0-9.'&/ \t-]{2,50}\s+"
-            r"(?:ENTERPRISES|ASSOCIATES|TRADERS|"
-            r"PRIVATE\s+LIMITED|PVT\.?\s*LTD\.?|"
-            r"LIMITED|LLP|INFRA|SOLUTIONS|CORPORATION))\s*$"
-        ]
-
-        excluded_terms = [
-            "statement of",
-            "salary slip",
-            "standard chartered",
-            "kotak mahindra",
-            "department",
-            "nominee",
-            "chartered accountant",
-            "firm regn",
-            "naveen goel & associates"
-        ]
-
-        for pattern in name_patterns:
-
-            match = re.search(
-                pattern,
-                text,
-                re.IGNORECASE
-            )
-
-            if not match:
-                continue
-
-            candidate = match.group(1).strip()
-
-            if len(candidate) < 3:
-                continue
-
-            if any(
-                term in candidate.casefold()
-                for term in excluded_terms
-            ):
-                continue
-
-            raw_extracted_name = candidate
-
-            person_name, name_confidence = (
-                clean_ocr_person_name(candidate)
-            )
-
-            break
-        
-        issuing_bank = None
-
-    bank_patterns = {
-        "Yes Bank": r"\bYes\s+Bank\b",
-        "Standard Chartered Bank": r"\bStandard\s+Chartered\s+Bank\b",
-        "HDFC Bank": r"\bHDFC\s+Bank\b",
-        "ICICI Bank": r"\bICICI\s+Bank\b",
-        "State Bank of India": r"\bState\s+Bank\s+of\s+India\b",
-        "Axis Bank": r"\bAxis\s+Bank\b",
-        "Kotak Mahindra Bank": r"\bKotak\s+Mahindra\s+Bank\b",
-        "Bank of Baroda": r"\bBank\s+of\s+Baroda\b",
-        "IndusInd Bank": r"\bIndusInd\s+Bank\b",
-        "IDFC First Bank": r"\bIDFC\s+First\s+Bank\b"
-    }
-
-    bank_identity_text = text[:3000]
-    for canonical_name, pattern in bank_patterns.items():
-        if re.search(pattern, bank_identity_text, re.IGNORECASE):
-            issuing_bank = canonical_name
-            break
-
-    # IFSC-based fallback
-    if not issuing_bank:
-        if re.search(r"\bYESB0[A-Z0-9]{7,}\b", text, re.IGNORECASE):
-            issuing_bank = "Yes Bank"
-
-        elif re.search(r"\bKKBK0[A-Z0-9]{7,}\b", text, re.IGNORECASE):
-            issuing_bank = "Kotak Mahindra Bank"
-
-    employer_name = None
+    if doc_code == "BANK_STATEMENT":
+        issuing_bank = _extract_bank_strictly_from_header(pre_table_header, text, file_path=file_path)
 
     if doc_code == "SALARY_SLIP":
-
-        employer_match = re.search(
-            r"(?im)^\s*(?:employer|company\s+name|organization)"
-            r"\s*[:\-]\s*([A-Za-z0-9][A-Za-z0-9.,&'()/ \-]{2,69})\s*$",
-            text
-        )
-
-        if employer_match:
-            employer_name = employer_match.group(1).strip()
-
-    if isinstance(raw_report, dict):
-
-        placeholder_pattern = re.compile(
-            r"\[(?:company\s+name|account\s+name|address)\]"
-            r"|(?:enter|insert|type)\s+"
-            r"(?:company\s+name|account\s+name|address)"
-            r"|(?:company\s+name|account\s+name)\s+here"
-            r"|\{\{\s*(?:company_name|account_name|address)\s*\}\}",
-            re.IGNORECASE
-        )
-
-        placeholder_matches = placeholder_pattern.findall(text)
-
-        if placeholder_matches:
-
-            forensic_flags = raw_report.setdefault(
-                "forensic_flags",
-                []
-            )
-
-            if not isinstance(forensic_flags, list):
-                forensic_flags = []
-                raw_report["forensic_flags"] = forensic_flags
-
-            flag_msg = (
-                "Template Placeholder Warning: "
-                "Explicit unfilled placeholder text detected: "
-                f"{placeholder_matches}. Manual review required."
-            )
-
-            if flag_msg not in forensic_flags:
-                forensic_flags.append(flag_msg)
+        emp_m = re.search(r"(?im)^\s*(?:employer|company\s+name|organization)\s*[:\-]\s*([A-Za-z0-9][A-Za-z0-9.,&'()/ \-]{2,69})\s*$", pre_table_header)
+        if emp_m:
+            employer_name = emp_m.group(1).strip()
 
     return {
-        "doc_category": doc_category,
-        "doc_code": doc_code,
-        "classification_confidence": cls_conf,
-
-        "holder_name": person_name,
-        "person_name": person_name,
-        "raw_extracted_name": raw_extracted_name,
-        "name_confidence": name_confidence,
-
-        "pan_number": extracted_pan,
-
-        "issuing_bank": issuing_bank,
-        "employer_name": employer_name,
-
-        "business_name": business_name,
-        "proprietor_name": proprietor_name,
-        "auditor_name": auditor_name,
-        "signatory_name": signatory_name,
-
-        "identity_badge": (
-            f"{doc_category} of {person_name}"
-        )
+        "doc_category": doc_category, "doc_code": doc_code,
+        "classification_confidence": cls_conf, "holder_name": person_name,
+        "person_name": person_name, "raw_extracted_name": raw_extracted_name or person_name,
+        "name_confidence": name_confidence, "pan_number": extracted_pan,
+        "issuing_bank": issuing_bank, "employer_name": employer_name,
+        "business_name": business_name, "proprietor_name": proprietor_name,
+        "auditor_name": auditor_name, "signatory_name": signatory_name,
+        "identity_badge": f"{doc_category} of {person_name}"
     }
 
 
-# 3. STRUCTURED FINDINGS BUILDER 
-
+# ==============================================================================
+# 3. STRUCTURED FINDINGS BUILDER & SECTION 4.3 VALIDATOR
+# ==============================================================================
 def extract_page_from_text(text: str, default_page: int = 1) -> int:
     m = re.search(r"\bPage\s+(\d+)\b", str(text), re.IGNORECASE)
     return int(m.group(1)) if m else default_page
@@ -659,9 +548,18 @@ def build_structured_findings(doc_id, doc_label, doc_code, raw_report, family_d_
         elif "Monotonicity" in issue_txt:
             code = "DATE_ORDER_ANOMALY"
             raw_s = 0.75
+        elif "Summary" in issue_txt and "does not match" in issue_txt:
+            code = "ARITHMETIC_MISMATCH"
+            raw_s = 0.52  # Summary-only discrepancy when running balance passes
+        elif "Statement invariant mismatch" in issue_txt:
+            code = "ARITHMETIC_MISMATCH"
+            raw_s = 0.78  # Ledger total invariant failure
         else:
             code = "ARITHMETIC_MISMATCH"
-            raw_s = 0.85
+            total_tx_cnt = max(1, len(fin_rec.get("transactions", [])))
+            rb_fail_cnt = sum(1 for x in detailed_issues if "Running balance mismatch" in x.get("text", ""))
+            fail_ratio = min(1.0, rb_fail_cnt / max(1.0, total_tx_cnt * 0.4))
+            raw_s = round(0.58 + 0.30 * fail_ratio, 2)  # Scales smoothly from 0.58 to 0.88 based on how many rows failed!
 
         finding_conf = raw_s if is_intake_check else SCORER.transform(raw_s)
 
@@ -685,15 +583,10 @@ def build_structured_findings(doc_id, doc_label, doc_code, raw_report, family_d_
         low_f = flag.lower()
 
         if any(k in low_f for k in ["ela", "pixel", "compression"]):
-            if re.search(r"\b(?:ela|pixel|compression)\b", low_f):
-                det_id = "FAM_C_IMAGE_FORENSICS"
-                code = "PIXEL_ELA_ANOMALY"
-                raw_s = 0.78
-                pointer = "visual_pixel_region"
-                det_id = "FAM_C_IMAGE_FORENSICS"
-                code = "PIXEL_ELA_ANOMALY"
-                raw_s = 0.78
-                pointer = "visual_pixel_region"
+            det_id = "FAM_C_IMAGE_FORENSICS"
+            code = "PIXEL_ELA_ANOMALY"
+            raw_s = 0.78
+            pointer = "visual_pixel_region"
         elif "copy-move" in low_f or "duplicated keypoint" in low_f:
             det_id = "FAM_C_IMAGE_FORENSICS"
             code = "COPY_MOVE_CLONE"
@@ -724,9 +617,6 @@ def build_structured_findings(doc_id, doc_label, doc_code, raw_report, family_d_
             code = "METADATA_TOOLCHAIN_TRACE"
             raw_s = 0.65
             pointer = "document_metadata"
-        elif "Filename vs. Document Period Discrepancy" in issue_txt:
-            code = "FILENAME_PERIOD_DISCREPANCY"
-            raw_s = 0.45
         else:
             det_id = "FAM_B_STRUCTURE_FORENSICS"
             code = "UNCLASSIFIED_ANOMALY"
@@ -767,7 +657,6 @@ def build_structured_findings(doc_id, doc_label, doc_code, raw_report, family_d_
     return structured
 
 
-# 4. STANDARDIZED STATUS HELPER & PLAIN-LANGUAGE COMPOSER 
 def standardize_audit_coverage(raw_cov: dict) -> dict:
     standardized = {}
     for k, v in (raw_cov or {}).items():
@@ -819,11 +708,13 @@ def compose_founder_summary(doc_label, structured_findings):
         clauses.append("the uploaded filename indicates FY 2024-25 whereas the report states Previous Year 2023-24 (Assessment Year 2024-25)")
     if "FILENAME_DOCUMENT_TYPE_DISCREPANCY" in codes:
         clauses.append("the uploaded filename suggests a Balance Sheet whereas the document content is a Tax Audit Report (Form 3CB/3CD)")
+
     unique_clauses = []
     for c in clauses:
         if c not in unique_clauses:
             unique_clauses.append(c)
     clauses = unique_clauses
+
     has_math = "ARITHMETIC_MISMATCH" in codes
     if has_math and clauses:
         return f"{doc_label}, {page_str}: {'; '.join(clauses)}, and the running balance or summary equation FAILED reconciliation. Send for manual review."
@@ -836,7 +727,6 @@ def compose_founder_summary(doc_label, structured_findings):
     return f"{doc_label}, {page_str}: anomalies detected ({', '.join(sorted(codes))}). Send for manual review."
 
 
-# 5. AUTHORITATIVE SECTION 4.3 SCHEMA VALIDATOR 
 def validate_section_4_3_contract(payload: dict) -> tuple[bool, list[str]]:
     errors = []
     required_types = {
@@ -915,530 +805,37 @@ def validate_section_4_3_contract(payload: dict) -> tuple[bool, list[str]]:
     return (len(errors) == 0), errors
 
 
-# 6. MAIN MODULE 1 AGGREGATOR (Integrates Families A, B, C, and D)
-
-
-# ==============================================================================
-# UNIVERSAL ZERO-SHOT IDENTITY & BANK EXTRACTOR (STRICT PRE-TABLE ISOLATION)
-# ==============================================================================
-UNIVERSAL_IFSC_BANK_MAP = {
-    "SBIN": "State Bank of India", "HDFC": "HDFC Bank", "ICIC": "ICICI Bank",
-    "UTIB": "Axis Bank", "KKBK": "Kotak Mahindra Bank", "YESB": "Yes Bank",
-    "PUNB": "Punjab National Bank", "BARB": "Bank of Baroda", "CNRB": "Canara Bank",
-    "UBIN": "Union Bank of India", "IDIB": "Indian Bank", "BKID": "Bank of India",
-    "CBIN": "Central Bank of India", "IOBA": "Indian Overseas Bank", "UCBA": "UCO Bank",
-    "MAHB": "Bank of Maharashtra", "PSIB": "Punjab & Sind Bank", "IDFB": "IDFC First Bank",
-    "INDB": "IndusInd Bank", "FDRL": "Federal Bank", "BDBL": "Bandhan Bank",
-    "IBKL": "IDBI Bank", "RATN": "RBL Bank", "KARB": "Karnataka Bank",
-    "KVBL": "Karur Vysya Bank", "SIBL": "South Indian Bank", "TMBL": "Tamilnad Mercantile Bank",
-    "CIUB": "City Union Bank", "JSBL": "Jana Small Finance Bank", "AUBL": "AU Small Finance Bank",
-    "ESFB": "Equitas Small Finance Bank", "UJVN": "Ujjivan Small Finance Bank",
-    "SCBL": "Standard Chartered Bank", "CITI": "Citibank", "HSBC": "HSBC Bank",
-    "DBSS": "DBS Bank", "DEUT": "Deutsche Bank", "AIRP": "Airtel Payments Bank",
-    "PYTM": "Paytm Payments Bank", "SURY": "Suryoday Small Finance Bank"
-}
-
-
-def slice_strictly_above_table_header(full_text: str) -> str:
-    """
-    Finds the exact start of the transaction table on Page 1 and slices the text
-    strictly ABOVE it. Counterparty names/banks inside transaction rows are 100% excluded.
-    """
-    # Check common multi-column table header anchors
-    table_header_patterns = [
-        r"\b(?:sl\s*no|si\s*no|sr\s*no)\b[\s\S]{0,120}?\b(?:tran\s*id|value\s*date|transaction\s*date|balance)\b",
-        r"\b(?:transaction\s*date|value\s*date|txn\s*date|date)\b[\s\S]{0,140}?\b(?:narration|description|particulars|remarks|withdrawal|deposit|debit|credit)\b[\s\S]{0,80}?\bbalance\b",
-    ]
-    best_cut = min(len(full_text), 1800)
-    for pat in table_header_patterns:
-        m = re.search(pat, full_text[:3500], re.IGNORECASE)
-        if m and m.start() > 40:
-            best_cut = min(best_cut, m.start())
-    return full_text[:best_cut]
-
-
-def extract_holder_universal(file_path: str, pre_table_text: str) -> str | None:
-    """
-    Universal 3-Stage Holder Name Extractor (Strictly within Page 1 Pre-Table Header):
-    1. 2D Coordinate right-of-label lookup on Page 1 (top-left Y alignment).
-    2. Stacked label-list pairing (e.g. 'Name:\nAddress:\nA/C No:\nJt. Holder:\n<VALUE>').
-    3. Inline 'Name : <VALUE>' or Unlabeled Customer Address-Block Anchor.
-    """
-    bad_phrases = [
-        "statement of", "detailed statement", "account statement", "salary slip",
-        "icici bank", "hdfc bank", "yes bank", "kotak mahindra", "state bank",
-        "axis bank", "standard chartered", "branch", "ifsc", "currency", "inr",
-        "nominee", "address", "a/c", "account", "cust id", "period", "advanced search",
-        "transaction", "karol bagh", "medical square", "galaxy towers", "guruwara road"
-    ]
-
-    def is_clean_holder_candidate(cand: str) -> bool:
-        c = re.sub(r"\s+", " ", cand).strip(" :-|.,")
-        if len(c) < 3 or len(c) > 50:
-            return False
-        c_low = c.lower()
-        if any(bp in c_low for bp in bad_phrases):
-            return False
-        if re.match(r"^[\d\W]+$", c):
-            return False
-        if DATE_RE_SIMPLE.match(c):
-            return False
-        return True
-
-    DATE_RE_SIMPLE = re.compile(r"^\d{1,2}[\-/\s\.](?:\d{1,2}|[a-z]{3,9})[\-/\s\.]\d{2,4}$", re.IGNORECASE)
-
-    # Stage 1: 2D PDF Coordinate Pairing on Page 1 (matches top-edge y0 within 12pt)
-    if file_path and file_path.lower().endswith(".pdf") and os.path.exists(file_path):
-        try:
-            with pymupdf.open(file_path) as doc:
-                if len(doc) > 0:
-                    page = doc[0]
-                    spans = []
-                    for b in page.get_text("dict").get("blocks", []):
-                        for l in b.get("lines", []):
-                            line_txt = " ".join(s.get("text", "").strip() for s in l.get("spans", []) if s.get("text", "").strip())
-                            if line_txt:
-                                bbox = l["bbox"]
-                                spans.append({"text": line_txt, "x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3]})
-
-                    label_re = re.compile(
-                        r"^(?:account\s*holder(?:\s*name)?|account\s*name|customer\s*name|applicant\s*name|employee\s*name|legal\s*name|name\s*of\s*enterprise|name)\s*[:\-]?$",
-                        re.IGNORECASE
-                    )
-                    for s in spans:
-                        if s["y0"] > 350:
-                            continue
-                        if label_re.match(s["text"].strip()):
-                            # Check same line to the right using top-edge y0 (handles multi-line blocks!)
-                            right_matches = [
-                                other for other in spans
-                                if other["x0"] > s["x1"] - 4.0 and abs(other["y0"] - s["y0"]) <= 12.0
-                                and is_clean_holder_candidate(other["text"].lstrip(":- "))
-                            ]
-                            if right_matches:
-                                right_matches.sort(key=lambda item: item["x0"])
-                                return right_matches[0]["text"].lstrip(":- ").strip()
-        except Exception:
-            pass
-
-    # Stage 2: Stacked Columnar Label Block (e.g. 'Name:\nAddress:\nA/C No:\nJt. Holder:\nTHE COLLECTION')
-    lines = [ln.strip() for ln in pre_table_text.splitlines() if ln.strip()]
-    for i, ln in enumerate(lines):
-        if re.match(r"^(?:account\s*name|customer\s*name|holder\s*name|name)\s*[:\-]?$", ln, re.IGNORECASE):
-            # Walk forward past consecutive short colon labels ('Address:', 'A/C No:', 'Jt. Holder:')
-            j = i + 1
-            while j < min(len(lines), i + 7) and (lines[j].endswith(":") or re.match(r"^(?:address|a/c\s*no|account\s*no|jt\.?\s*holder|cust\s*id)\s*[:\-]?", lines[j], re.IGNORECASE)):
-                j += 1
-            if j < len(lines) and is_clean_holder_candidate(lines[j]):
-                return lines[j].lstrip(":- ").strip()
-
-    # Stage 3: Inline Key-Value or Unlabeled Address-Block Anchor inside pre_table_text ONLY
-    inline_patterns = [
-        r"(?:^|\n)([A-Za-z0-9\.\&\/\ \t]{3,45}?)\s*\(\s*(?:Account\s*Name|Company\s*Name)\s*\)",
-        r"(?<!nominee\s)(?<!nominee)(?<!father\s)(?<!branch\s)(?:account\s*holder|account\s*name|customer\s*name|employee\s*name|applicant\s*name|card\s*holder|legal\s*name|name\s*of\s*enterprise|name)\s*[:\-]\s*([A-Za-z][A-Za-z0-9\ \t\.\&/]{2,45}?)(?=\s*\||$|\n|pan|month|period|statement|father|dob|branch|address)",
-        r"(?:^|\n)([A-Z][A-Z0-9\ \t\.\&]{2,45})\n\s*(?:PLOT\s+NO|FLAT\s+NO|H\.?\s*NO|HOUSE\s+NO|KH\s+NO|\u039a\u0397\s+\u039d\u039f|SHOP\s+NO|SURVEY\s+NO|DOOR\s+NO|NEW\s+\d+|\d+[\-/A-Z0-9]+\s+[A-Z])",
-    ]
-    for pat in inline_patterns:
-        for m in re.finditer(pat, pre_table_text, re.IGNORECASE):
-            cand = m.group(1).strip()
-            if is_clean_holder_candidate(cand):
-                return cand
-
-    return None
-
-
-def extract_universal_issuing_bank(pre_table_text: str, full_text: str) -> str | None:
-    # 1. Check authoritative IFSC code in the pre-table header first
-    for m_ifsc in re.finditer(r"\b([A-Z]{4})0[A-Z0-9]{6}\b", pre_table_text.upper()):
-        pref = m_ifsc.group(1)
-        if pref in UNIVERSAL_IFSC_BANK_MAP:
-            return UNIVERSAL_IFSC_BANK_MAP[pref]
-
-    # 2. Check earliest-appearing bank name in pre_table_text (by character position, NEVER dict order!)
-    generic_bank_re = re.compile(
-        r"\b((?:State\s+Bank\s+of\s+India|Bank\s+of\s+(?:Baroda|India|Maharashtra)|Central\s+Bank\s+of\s+India|Union\s+Bank\s+of\s+India|Indian\s+(?:Overseas\s+)?Bank|Punjab\s+(?:National|&\s*Sind)\s+Bank|(?:ICICI|HDFC|YES|Axis|Kotak\s+Mahindra|IndusInd|IDFC\s+First|IDBI|Federal|Bandhan|Canara|RBL|Karnataka|Karur\s+Vysya|South\s+Indian|City\s+Union|Standard\s+Chartered|HSBC|DBS|AU\s+Small\s+Finance|Equitas\s+Small\s+Finance|Ujjivan\s+Small\s+Finance)\s+Bank))\b",
-        re.IGNORECASE
-    )
-    matches = [(m.start(), m.group(1)) for m in generic_bank_re.finditer(pre_table_text)]
-    if matches:
-        matches.sort(key=lambda x: x[0])
-        raw_b = re.sub(r"\s+", " ", matches[0][1]).strip()
-        words = []
-        for w in raw_b.split():
-            if w.upper() in {"ICICI", "HDFC", "IDFC", "IDBI", "HSBC", "DBS", "UCO", "RBL", "SBI", "PNB", "AU"}:
-                words.append(w.upper())
-            elif w.lower() in {"of", "and", "&"}:
-                words.append(w.lower())
-            else:
-                words.append(w.capitalize())
-        return " ".join(words)
-
-    # 3. Check footer disclaimer ('brought to the notice of <Bank> Ltd') or IFSC anywhere in document
-    footer_m = re.search(r"notice\s+of\s+([A-Za-z\s]+?Bank)(?:\s+Ltd|\s+Limited|\.)", full_text[-1500:], re.IGNORECASE)
-    if footer_m:
-        return re.sub(r"\s+", " ", footer_m.group(1)).strip().title()
-
-    for m_ifsc in re.finditer(r"\b([A-Z]{4})0[A-Z0-9]{6}\b", full_text.upper()):
-        pref = m_ifsc.group(1)
-        if pref in UNIVERSAL_IFSC_BANK_MAP:
-            return UNIVERSAL_IFSC_BANK_MAP[pref]
-
-    return None
-
-
-def identify_document_and_entity(file_path: str, raw_report: dict = None) -> dict:
-    text = extract_raw_text_from_file(file_path)
-    if not text:
-        return {
-            "doc_category": "Unknown Document", "doc_code": "UNKNOWN_DOCUMENT",
-            "classification_confidence": 0.0, "holder_name": "Unknown Holder",
-            "person_name": "Unknown Holder", "raw_extracted_name": "Unknown Holder",
-            "name_confidence": 0.0, "pan_number": None, "issuing_bank": None,
-            "employer_name": None, "business_name": None, "proprietor_name": None,
-            "auditor_name": None, "signatory_name": None,
-            "identity_badge": "Unknown Document of Unknown Holder"
-        }
-
-    cls_info = classify_financial_document(text)
-    doc_code = cls_info.get("doc_code", "UNKNOWN_DOCUMENT")
-    doc_category = cls_info.get("doc_category", "Unknown Document")
-    cls_conf = cls_info.get("classification_confidence", 0.0)
-
-    normalized_text = re.sub(r"\s+", " ", text.upper())
-    if "SECTION 44AB" in normalized_text and (re.search(r"\bFORM\s+NO\.?\s*3C[BD]\b", normalized_text)):
-        doc_code = "TAX_AUDIT_REPORT"
-        doc_category = "Tax Audit Report (Form 3CB/3CD)"
-        cls_conf = 0.95
-
-    if doc_code == "UNKNOWN_DOCUMENT":
-        return {
-            "doc_category": "Unknown Document", "doc_code": "UNKNOWN_DOCUMENT",
-            "classification_confidence": 0.0, "holder_name": "Unknown Holder",
-            "person_name": "Unknown Holder", "raw_extracted_name": "Unknown Holder",
-            "name_confidence": 0.0, "pan_number": None, "issuing_bank": None,
-            "employer_name": None, "business_name": None, "proprietor_name": None,
-            "auditor_name": None, "signatory_name": None,
-            "identity_badge": "Unknown Document of Unknown Holder"
-        }
-
-    pre_table_header = slice_strictly_above_table_header(text)
-    extracted_pan = None
-    raw_extracted_name = None
-    person_name = "Unknown Holder"
-    name_confidence = 0.0
-    business_name = None
-    proprietor_name = None
-    auditor_name = None
-    signatory_name = None
-    issuing_bank = None
-    employer_name = None
-
-    if doc_code == "TAX_AUDIT_REPORT":
-        fin_r = (raw_report or {}).get("financial_reconciliation", {})
-        business_name = fin_r.get("assessee_business_name")
-        proprietor_name = fin_r.get("proprietor_name")
-        auditor_name = fin_r.get("auditor_firm_name")
-        signatory_name = fin_r.get("auditor_signatory")
-        extracted_pan = fin_r.get("pan_number")
-        if business_name:
-            person_name = business_name
-            raw_extracted_name = business_name
-            name_confidence = 0.95
-    else:
-        pan_m = re.search(r"\b([A-Z]{5}\d{4}[A-Z])\b", pre_table_header.upper()) or re.search(r"\b([A-Z]{5}\d{4}[A-Z])\b", text.upper())
-        extracted_pan = pan_m.group(1) if pan_m else None
-
-        holder_cand = extract_holder_universal(file_path, pre_table_header)
-        if holder_cand:
-            raw_extracted_name = holder_cand
-            person_name, name_confidence = clean_ocr_person_name(holder_cand)
-
-    if doc_code == "BANK_STATEMENT":
-        issuing_bank = extract_universal_issuing_bank(pre_table_header, text)
-
-    if doc_code == "SALARY_SLIP":
-        emp_m = re.search(r"(?im)^\s*(?:employer|company\s+name|organization)\s*[:\-]\s*([A-Za-z0-9][A-Za-z0-9.,&'()/ \-]{2,69})\s*$", pre_table_header)
-        if emp_m:
-            employer_name = emp_m.group(1).strip()
-
-    return {
-        "doc_category": doc_category, "doc_code": doc_code,
-        "classification_confidence": cls_conf, "holder_name": person_name,
-        "person_name": person_name, "raw_extracted_name": raw_extracted_name or person_name,
-        "name_confidence": name_confidence, "pan_number": extracted_pan,
-        "issuing_bank": issuing_bank, "employer_name": employer_name,
-        "business_name": business_name, "proprietor_name": proprietor_name,
-        "auditor_name": auditor_name, "signatory_name": signatory_name,
-        "identity_badge": f"{doc_category} of {person_name}"
-    }
-
-
-
-
-# ==============================================================================
-# UNIVERSAL ZERO-SHOT IDENTITY & BANK EXTRACTOR (STRICT PRE-TABLE ISOLATION)
-# ==============================================================================
-UNIVERSAL_IFSC_BANK_MAP = {
-    "SBIN": "State Bank of India", "HDFC": "HDFC Bank", "ICIC": "ICICI Bank",
-    "UTIB": "Axis Bank", "KKBK": "Kotak Mahindra Bank", "YESB": "Yes Bank",
-    "PUNB": "Punjab National Bank", "BARB": "Bank of Baroda", "CNRB": "Canara Bank",
-    "UBIN": "Union Bank of India", "IDIB": "Indian Bank", "BKID": "Bank of India",
-    "CBIN": "Central Bank of India", "IOBA": "Indian Overseas Bank", "UCBA": "UCO Bank",
-    "MAHB": "Bank of Maharashtra", "PSIB": "Punjab & Sind Bank", "IDFB": "IDFC First Bank",
-    "INDB": "IndusInd Bank", "FDRL": "Federal Bank", "BDBL": "Bandhan Bank",
-    "IBKL": "IDBI Bank", "RATN": "RBL Bank", "KARB": "Karnataka Bank",
-    "KVBL": "Karur Vysya Bank", "SIBL": "South Indian Bank", "TMBL": "Tamilnad Mercantile Bank",
-    "CIUB": "City Union Bank", "JSBL": "Jana Small Finance Bank", "AUBL": "AU Small Finance Bank",
-    "ESFB": "Equitas Small Finance Bank", "UJVN": "Ujjivan Small Finance Bank",
-    "SCBL": "Standard Chartered Bank", "CITI": "Citibank", "HSBC": "HSBC Bank",
-    "DBSS": "DBS Bank", "DEUT": "Deutsche Bank", "AIRP": "Airtel Payments Bank",
-    "PYTM": "Paytm Payments Bank", "SURY": "Suryoday Small Finance Bank"
-}
-
-
-def slice_strictly_above_table_header(full_text: str) -> str:
-    """
-    Finds the exact start of the transaction table on Page 1 and slices the text
-    strictly ABOVE it. Counterparty names/banks inside transaction rows are 100% excluded.
-    """
-    # Check common multi-column table header anchors
-    table_header_patterns = [
-        r"\b(?:sl\s*no|si\s*no|sr\s*no)\b[\s\S]{0,120}?\b(?:tran\s*id|value\s*date|transaction\s*date|balance)\b",
-        r"\b(?:transaction\s*date|value\s*date|txn\s*date|date)\b[\s\S]{0,140}?\b(?:narration|description|particulars|remarks|withdrawal|deposit|debit|credit)\b[\s\S]{0,80}?\bbalance\b",
-    ]
-    best_cut = min(len(full_text), 1800)
-    for pat in table_header_patterns:
-        m = re.search(pat, full_text[:3500], re.IGNORECASE)
-        if m and m.start() > 40:
-            best_cut = min(best_cut, m.start())
-    return full_text[:best_cut]
-
-
-def extract_holder_universal(file_path: str, pre_table_text: str) -> str | None:
-    """
-    Universal 3-Stage Holder Name Extractor (Strictly within Page 1 Pre-Table Header):
-    1. 2D Coordinate right-of-label lookup on Page 1 (top-left Y alignment).
-    2. Stacked label-list pairing (e.g. 'Name:\nAddress:\nA/C No:\nJt. Holder:\n<VALUE>').
-    3. Inline 'Name : <VALUE>' or Unlabeled Customer Address-Block Anchor.
-    """
-    bad_phrases = [
-        "statement of", "detailed statement", "account statement", "salary slip",
-        "icici bank", "hdfc bank", "yes bank", "kotak mahindra", "state bank",
-        "axis bank", "standard chartered", "branch", "ifsc", "currency", "inr",
-        "nominee", "address", "a/c", "account", "cust id", "period", "advanced search",
-        "transaction", "karol bagh", "medical square", "galaxy towers", "guruwara road"
-    ]
-
-    def is_clean_holder_candidate(cand: str) -> bool:
-        c = re.sub(r"\s+", " ", cand).strip(" :-|.,")
-        if len(c) < 3 or len(c) > 50:
-            return False
-        c_low = c.lower()
-        if any(bp in c_low for bp in bad_phrases):
-            return False
-        if re.match(r"^[\d\W]+$", c):
-            return False
-        if DATE_RE_SIMPLE.match(c):
-            return False
-        return True
-
-    DATE_RE_SIMPLE = re.compile(r"^\d{1,2}[\-/\s\.](?:\d{1,2}|[a-z]{3,9})[\-/\s\.]\d{2,4}$", re.IGNORECASE)
-
-    # Stage 1: 2D PDF Coordinate Pairing on Page 1 (matches top-edge y0 within 12pt)
-    if file_path and file_path.lower().endswith(".pdf") and os.path.exists(file_path):
-        try:
-            with pymupdf.open(file_path) as doc:
-                if len(doc) > 0:
-                    page = doc[0]
-                    spans = []
-                    for b in page.get_text("dict").get("blocks", []):
-                        for l in b.get("lines", []):
-                            line_txt = " ".join(s.get("text", "").strip() for s in l.get("spans", []) if s.get("text", "").strip())
-                            if line_txt:
-                                bbox = l["bbox"]
-                                spans.append({"text": line_txt, "x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3]})
-
-                    label_re = re.compile(
-                        r"^(?:account\s*holder(?:\s*name)?|account\s*name|customer\s*name|applicant\s*name|employee\s*name|legal\s*name|name\s*of\s*enterprise|name)\s*[:\-]?$",
-                        re.IGNORECASE
-                    )
-                    for s in spans:
-                        if s["y0"] > 350:
-                            continue
-                        if label_re.match(s["text"].strip()):
-                            # Check same line to the right using top-edge y0 (handles multi-line blocks!)
-                            right_matches = [
-                                other for other in spans
-                                if other["x0"] > s["x1"] - 4.0 and abs(other["y0"] - s["y0"]) <= 12.0
-                                and is_clean_holder_candidate(other["text"].lstrip(":- "))
-                            ]
-                            if right_matches:
-                                right_matches.sort(key=lambda item: item["x0"])
-                                return right_matches[0]["text"].lstrip(":- ").strip()
-        except Exception:
-            pass
-
-    # Stage 2: Stacked Columnar Label Block (e.g. 'Name:\nAddress:\nA/C No:\nJt. Holder:\nTHE COLLECTION')
-    lines = [ln.strip() for ln in pre_table_text.splitlines() if ln.strip()]
-    for i, ln in enumerate(lines):
-        if re.match(r"^(?:account\s*name|customer\s*name|holder\s*name|name)\s*[:\-]?$", ln, re.IGNORECASE):
-            # Walk forward past consecutive short colon labels ('Address:', 'A/C No:', 'Jt. Holder:')
-            j = i + 1
-            while j < min(len(lines), i + 7) and (lines[j].endswith(":") or re.match(r"^(?:address|a/c\s*no|account\s*no|jt\.?\s*holder|cust\s*id)\s*[:\-]?", lines[j], re.IGNORECASE)):
-                j += 1
-            if j < len(lines) and is_clean_holder_candidate(lines[j]):
-                return lines[j].lstrip(":- ").strip()
-
-    # Stage 3: Inline Key-Value or Unlabeled Address-Block Anchor inside pre_table_text ONLY
-    inline_patterns = [
-        r"(?:^|\n)([A-Za-z0-9\.\&\/\ \t]{3,45}?)\s*\(\s*(?:Account\s*Name|Company\s*Name)\s*\)",
-        r"(?<!nominee\s)(?<!nominee)(?<!father\s)(?<!branch\s)(?:account\s*holder|account\s*name|customer\s*name|employee\s*name|applicant\s*name|card\s*holder|legal\s*name|name\s*of\s*enterprise|name)\s*[:\-]\s*([A-Za-z][A-Za-z0-9\ \t\.\&/]{2,45}?)(?=\s*\||$|\n|pan|month|period|statement|father|dob|branch|address)",
-        r"(?:^|\n)([A-Z][A-Z0-9\ \t\.\&]{2,45})\n\s*(?:PLOT\s+NO|FLAT\s+NO|H\.?\s*NO|HOUSE\s+NO|KH\s+NO|\u039a\u0397\s+\u039d\u039f|SHOP\s+NO|SURVEY\s+NO|DOOR\s+NO|NEW\s+\d+|\d+[\-/A-Z0-9]+\s+[A-Z])",
-    ]
-    for pat in inline_patterns:
-        for m in re.finditer(pat, pre_table_text, re.IGNORECASE):
-            cand = m.group(1).strip()
-            if is_clean_holder_candidate(cand):
-                return cand
-
-    return None
-
-
-def extract_universal_issuing_bank(pre_table_text: str, full_text: str) -> str | None:
-    # 1. Check authoritative IFSC code in the pre-table header first
-    for m_ifsc in re.finditer(r"\b([A-Z]{4})0[A-Z0-9]{6}\b", pre_table_text.upper()):
-        pref = m_ifsc.group(1)
-        if pref in UNIVERSAL_IFSC_BANK_MAP:
-            return UNIVERSAL_IFSC_BANK_MAP[pref]
-
-    # 2. Check earliest-appearing bank name in pre_table_text (by character position, NEVER dict order!)
-    generic_bank_re = re.compile(
-        r"\b((?:State\s+Bank\s+of\s+India|Bank\s+of\s+(?:Baroda|India|Maharashtra)|Central\s+Bank\s+of\s+India|Union\s+Bank\s+of\s+India|Indian\s+(?:Overseas\s+)?Bank|Punjab\s+(?:National|&\s*Sind)\s+Bank|(?:ICICI|HDFC|YES|Axis|Kotak\s+Mahindra|IndusInd|IDFC\s+First|IDBI|Federal|Bandhan|Canara|RBL|Karnataka|Karur\s+Vysya|South\s+Indian|City\s+Union|Standard\s+Chartered|HSBC|DBS|AU\s+Small\s+Finance|Equitas\s+Small\s+Finance|Ujjivan\s+Small\s+Finance)\s+Bank))\b",
-        re.IGNORECASE
-    )
-    matches = [(m.start(), m.group(1)) for m in generic_bank_re.finditer(pre_table_text)]
-    if matches:
-        matches.sort(key=lambda x: x[0])
-        raw_b = re.sub(r"\s+", " ", matches[0][1]).strip()
-        words = []
-        for w in raw_b.split():
-            if w.upper() in {"ICICI", "HDFC", "IDFC", "IDBI", "HSBC", "DBS", "UCO", "RBL", "SBI", "PNB", "AU"}:
-                words.append(w.upper())
-            elif w.lower() in {"of", "and", "&"}:
-                words.append(w.lower())
-            else:
-                words.append(w.capitalize())
-        return " ".join(words)
-
-    # 3. Check footer disclaimer ('brought to the notice of <Bank> Ltd') or IFSC anywhere in document
-    footer_m = re.search(r"notice\s+of\s+([A-Za-z\s]+?Bank)(?:\s+Ltd|\s+Limited|\.)", full_text[-1500:], re.IGNORECASE)
-    if footer_m:
-        return re.sub(r"\s+", " ", footer_m.group(1)).strip().title()
-
-    for m_ifsc in re.finditer(r"\b([A-Z]{4})0[A-Z0-9]{6}\b", full_text.upper()):
-        pref = m_ifsc.group(1)
-        if pref in UNIVERSAL_IFSC_BANK_MAP:
-            return UNIVERSAL_IFSC_BANK_MAP[pref]
-
-    return None
-
-
-def identify_document_and_entity(file_path: str, raw_report: dict = None) -> dict:
-    text = extract_raw_text_from_file(file_path)
-    if not text:
-        return {
-            "doc_category": "Unknown Document", "doc_code": "UNKNOWN_DOCUMENT",
-            "classification_confidence": 0.0, "holder_name": "Unknown Holder",
-            "person_name": "Unknown Holder", "raw_extracted_name": "Unknown Holder",
-            "name_confidence": 0.0, "pan_number": None, "issuing_bank": None,
-            "employer_name": None, "business_name": None, "proprietor_name": None,
-            "auditor_name": None, "signatory_name": None,
-            "identity_badge": "Unknown Document of Unknown Holder"
-        }
-
-    cls_info = classify_financial_document(text)
-    doc_code = cls_info.get("doc_code", "UNKNOWN_DOCUMENT")
-    doc_category = cls_info.get("doc_category", "Unknown Document")
-    cls_conf = cls_info.get("classification_confidence", 0.0)
-
-    normalized_text = re.sub(r"\s+", " ", text.upper())
-    if "SECTION 44AB" in normalized_text and (re.search(r"\bFORM\s+NO\.?\s*3C[BD]\b", normalized_text)):
-        doc_code = "TAX_AUDIT_REPORT"
-        doc_category = "Tax Audit Report (Form 3CB/3CD)"
-        cls_conf = 0.95
-
-    if doc_code == "UNKNOWN_DOCUMENT":
-        return {
-            "doc_category": "Unknown Document", "doc_code": "UNKNOWN_DOCUMENT",
-            "classification_confidence": 0.0, "holder_name": "Unknown Holder",
-            "person_name": "Unknown Holder", "raw_extracted_name": "Unknown Holder",
-            "name_confidence": 0.0, "pan_number": None, "issuing_bank": None,
-            "employer_name": None, "business_name": None, "proprietor_name": None,
-            "auditor_name": None, "signatory_name": None,
-            "identity_badge": "Unknown Document of Unknown Holder"
-        }
-
-    pre_table_header = slice_strictly_above_table_header(text)
-    extracted_pan = None
-    raw_extracted_name = None
-    person_name = "Unknown Holder"
-    name_confidence = 0.0
-    business_name = None
-    proprietor_name = None
-    auditor_name = None
-    signatory_name = None
-    issuing_bank = None
-    employer_name = None
-
-    if doc_code == "TAX_AUDIT_REPORT":
-        fin_r = (raw_report or {}).get("financial_reconciliation", {})
-        business_name = fin_r.get("assessee_business_name")
-        proprietor_name = fin_r.get("proprietor_name")
-        auditor_name = fin_r.get("auditor_firm_name")
-        signatory_name = fin_r.get("auditor_signatory")
-        extracted_pan = fin_r.get("pan_number")
-        if business_name:
-            person_name = business_name
-            raw_extracted_name = business_name
-            name_confidence = 0.95
-    else:
-        pan_m = re.search(r"\b([A-Z]{5}\d{4}[A-Z])\b", pre_table_header.upper()) or re.search(r"\b([A-Z]{5}\d{4}[A-Z])\b", text.upper())
-        extracted_pan = pan_m.group(1) if pan_m else None
-
-        holder_cand = extract_holder_universal(file_path, pre_table_header)
-        if holder_cand:
-            raw_extracted_name = holder_cand
-            person_name, name_confidence = clean_ocr_person_name(holder_cand)
-
-    if doc_code == "BANK_STATEMENT":
-        issuing_bank = extract_universal_issuing_bank(pre_table_header, text)
-
-    if doc_code == "SALARY_SLIP":
-        emp_m = re.search(r"(?im)^\s*(?:employer|company\s+name|organization)\s*[:\-]\s*([A-Za-z0-9][A-Za-z0-9.,&'()/ \-]{2,69})\s*$", pre_table_header)
-        if emp_m:
-            employer_name = emp_m.group(1).strip()
-
-    return {
-        "doc_category": doc_category, "doc_code": doc_code,
-        "classification_confidence": cls_conf, "holder_name": person_name,
-        "person_name": person_name, "raw_extracted_name": raw_extracted_name or person_name,
-        "name_confidence": name_confidence, "pan_number": extracted_pan,
-        "issuing_bank": issuing_bank, "employer_name": employer_name,
-        "business_name": business_name, "proprietor_name": proprietor_name,
-        "auditor_name": auditor_name, "signatory_name": signatory_name,
-        "identity_badge": f"{doc_category} of {person_name}"
-    }
-
-
 def build_module1_output(file_path, raw_report, tenant_id="default_lender", doc_id=None, family_d_report=None):
     doc_id = doc_id or f"DOC-{uuid.uuid4().hex[:8].upper()}"
     tenant_cfg = TENANT_CONFIGS.get(tenant_id, TENANT_CONFIGS["default_lender"])
     weights = dict(tenant_cfg["family_weights"])
-
+    file_fmt = str(raw_report.get("file_format") or "UNKNOWN").upper()
     identity_info = identify_document_and_entity(file_path, raw_report)
-    doc_label = identity_info["doc_category"]
-    doc_code = identity_info["doc_code"]
-    file_fmt = raw_report.get("file_format", "UNKNOWN")
+    doc_code = identity_info.get("doc_code", "UNKNOWN_DOCUMENT")
+    doc_label = identity_info.get("doc_category", "Unknown Document")
+    bp_meta = raw_report.get("financial_reconciliation", {}).get("blueprint_metadata") or {}
+    bp_holder = (bp_meta.get("holder_name") or "").strip()
+    invalid_holders = {
+        "", "unknown holder", "address", "name", "account", "branch", "city",
+        "state", "phone", "email", "regular", "status", "currency", "inr",
+        "india and rajasthan bank ltd"
+    }
+    if bp_holder and bp_holder.lower() not in invalid_holders:
+        identity_info["holder_name"] = bp_holder
+        identity_info["person_name"] = bp_holder
+        identity_info["identity_badge"] = f"{identity_info['doc_category']} of {bp_holder}"
+    elif (identity_info.get("holder_name") or "").strip().lower() in invalid_holders:
+        identity_info["holder_name"] = "Unknown Holder"
+        identity_info["person_name"] = "Unknown Holder"
+        identity_info["identity_badge"] = f"{identity_info['doc_category']} of Unknown Holder"
+
+    bp_bank = (bp_meta.get("issuing_bank") or "").strip()
+    if (
+        bp_bank
+        and not bp_bank.lower().startswith("tmp")
+        and not bp_bank.lower().endswith((".pdf", ".docx", ".png", ".jpg", ".jpeg"))
+    ):
+        identity_info["issuing_bank"] = bp_bank
 
     fin_rec = dict(raw_report.get("financial_reconciliation", {}))
     if doc_code == "UNKNOWN_DOCUMENT":
@@ -1545,18 +942,18 @@ def build_module1_output(file_path, raw_report, tenant_id="default_lender", doc_
     )
 
     if active_flagged >= 2:
-        raw_fused = round(min(1.0, weighted_sum * 1.35), 3)
-        fusion_rule_applied = "multi_family_consensus_boost (1.35x)"
-
+        finding_density_boost = min(1.30, 1.12 + 0.04 * len(structured_findings))
+        raw_fused = round(min(1.0, weighted_sum * finding_density_boost), 3)
+        fusion_rule_applied = f"multi_family_consensus_boost ({finding_density_boost:.2f}x)"
     elif active_flagged == 1:
-        raw_fused = round(max(weighted_sum, 0.45), 3)
-        fusion_rule_applied = "single_family_alert_floor (min 0.45 raw fused score)"
-        
+        # Scale smoothly with the active family's score instead of clamping to a flat 0.54
+        max_single = max(score_a, score_b, score_c, score_d)
+        raw_fused = round(0.55 * weighted_sum + 0.45 * max_single, 3)
+        fusion_rule_applied = "single_family_proportional_blend"
     elif score_intake is not None and score_intake > 0:
         raw_fused = round(min(1.0, score_intake), 3)
         overall_doc_score = round(raw_fused, 2)
         fusion_rule_applied = "intake_metadata_discrepancy_review"
-
     else:
         raw_fused = 0.0
         overall_doc_score = 0.02
@@ -1623,158 +1020,3 @@ def build_module1_output(file_path, raw_report, tenant_id="default_lender", doc_
     is_valid, schema_errors = validate_section_4_3_contract(payload)
     payload["contract_validation"] = {"valid": is_valid, "errors": schema_errors}
     return payload
-
-
-# ==============================================================================
-# AUTHORITATIVE PRIORITY 3 OVERRIDE: STRICT PAGE-1 PRE-TABLE IDENTITY ENGINE
-# ==============================================================================
-UNIVERSAL_IFSC_BANK_MAP = {
-    "SBIN": "State Bank of India", "HDFC": "HDFC Bank", "ICIC": "ICICI Bank",
-    "UTIB": "Axis Bank", "KKBK": "Kotak Mahindra Bank", "YESB": "Yes Bank",
-    "PUNB": "Punjab National Bank", "BARB": "Bank of Baroda", "CNRB": "Canara Bank",
-    "UBIN": "Union Bank of India", "IDIB": "Indian Bank", "BKID": "Bank of India",
-    "CBIN": "Central Bank of India", "IOBA": "Indian Overseas Bank", "UCBA": "UCO Bank",
-    "MAHB": "Bank of Maharashtra", "PSIB": "Punjab & Sind Bank", "IDFB": "IDFC First Bank",
-    "INDB": "IndusInd Bank", "FDRL": "Federal Bank", "BDBL": "Bandhan Bank",
-    "IBKL": "IDBI Bank", "RATN": "RBL Bank", "KARB": "Karnataka Bank",
-    "KVBL": "Karur Vysya Bank", "SIBL": "South Indian Bank", "SCBL": "Standard Chartered Bank"
-}
-
-
-def _slice_page1_pre_table(full_text: str) -> str:
-    patterns = [
-        r"\b(?:sl\s*no|si\s*no|sr\s*no)\b[\s\S]{0,120}?\b(?:tran\s*id|value\s*date|transaction\s*date|balance)\b",
-        r"\b(?:transaction\s*date|value\s*date|txn\s*date|date)\b[\s\S]{0,140}?\b(?:narration|description|particulars|remarks|withdrawal|deposit|debit|credit)\b",
-    ]
-    cut = min(len(full_text), 1500)
-    for pat in patterns:
-        m = re.search(pat, full_text[:3000], re.IGNORECASE)
-        if m and m.start() > 30:
-            cut = min(cut, m.start())
-    return full_text[:cut]
-
-
-def _extract_holder_strictly_from_header(file_path: str, pre_table_text: str) -> str | None:
-    bad_words = [
-        "statement", "salary slip", "icici bank", "hdfc bank", "yes bank", "kotak",
-        "state bank", "axis bank", "standard chartered", "branch", "ifsc", "currency",
-        "nominee", "address", "a/c", "account", "cust", "period", "search", "karol bagh",
-        "medical square", "galaxy", "gurudwara", "road", "delhi", "nagpur", "bangalore"
-    ]
-    def _valid(c: str) -> bool:
-        c = re.sub(r"\s+", " ", c).strip(" :-|.,")
-        if len(c) < 3 or len(c) > 45:
-            return False
-        if any(b in c.lower() for b in bad_words):
-            return False
-        if re.match(r"^[\d\W]+$", c) or re.match(r"^\d{1,2}[\-/][A-Za-z0-9]{2,9}[\-/]\d{2,4}$", c):
-            return False
-        return True
-
-    # 1. Stacked Columnar Label Block (e.g. 'Name:\nAddress:\nA/C No:\nJt. Holder:\nTHE COLLECTION')
-    lines = [ln.strip() for ln in pre_table_text.splitlines() if ln.strip()]
-    for i, ln in enumerate(lines):
-        if re.match(r"^(?:account\s*name|customer\s*name|holder\s*name|name)\s*[:\-]?$", ln, re.IGNORECASE):
-            j = i + 1
-            while j < min(len(lines), i + 7) and (lines[j].endswith(":") or re.match(r"^(?:address|a/c|account|jt\.?\s*holder|cust)\b", lines[j], re.IGNORECASE)):
-                j += 1
-            if j < len(lines) and _valid(lines[j]):
-                return lines[j].lstrip(":- ").strip()
-
-    # 2. Inline Key-Value or Unlabeled Address-Block Anchor inside pre_table_text ONLY
-    pats = [
-        r"statement\s+of\s+account\s*\n+\s*([A-Z][A-Za-z0-9\ \t\.\&]{2,45}?)(?=\n|$)",
-        r"(?:^|\n)([A-Z][A-Z0-9\ \t\.\&]{2,45})\n\s*(?:PLOT\s+NO|FLAT\s+NO|H\.?\s*NO|KH\s+NO|\u039a\u0397\s+\u039d\u039f|SHOP\s+NO|NEW\s+\d+|S\s+\d+/\d+|NEAR\s+|OPP\s+|GALI\s+NO)",
-        r"(?:^|\n)([A-Za-z0-9\.\&\/\ \t]{3,45}?)\s*\(\s*(?:Account\s*Name|Company\s*Name)\s*\)",
-        r"(?<!nominee\s)(?<!nominee)(?<!branch\s)(?:account\s*holder|account\s*name|customer\s*name|applicant\s*name|employee\s*name|legal\s*name|name)\s*[:\-]\s*([A-Za-z][A-Za-z0-9\ \t\.\&/]{2,45}?)(?=\s*\||$|\n|pan|period|statement|branch|address)",
-        r"(?:^|\n)([A-Z][A-Z0-9\ \t\.\&]{2,45})\n\s*(?:PLOT\s+NO|FLAT\s+NO|H\.?\s*NO|KH\s+NO|\u039a\u0397\s+\u039d\u039f|SHOP\s+NO|NEW\s+\d+)",
-    ]
-    for pat in pats:
-        for m in re.finditer(pat, pre_table_text, re.IGNORECASE):
-            if _valid(m.group(1)):
-                return m.group(1).strip()
-    return None
-
-
-def _extract_bank_strictly_from_header(pre_table_text: str, full_text: str) -> str | None:
-    # 1. Authoritative IFSC Code in Page 1 Header
-    for m_ifsc in re.finditer(r"\b([A-Z]{4})0[A-Z0-9]{6}\b", pre_table_text.upper()):
-        pref = m_ifsc.group(1)
-        if pref in UNIVERSAL_IFSC_BANK_MAP:
-            return UNIVERSAL_IFSC_BANK_MAP[pref]
-
-    # 2. Earliest-appearing bank name in Page 1 Pre-Table Header (by character index!)
-    bank_re = re.compile(
-        r"\b(ICICI\s+Bank|HDFC\s+Bank|Yes\s+Bank|Kotak\s+Mahindra\s+Bank|Axis\s+Bank|State\s+Bank\s+of\s+India|Standard\s+Chartered\s+Bank|Punjab\s+National\s+Bank|Bank\s+of\s+Baroda|Canara\s+Bank|Union\s+Bank\s+of\s+India|IndusInd\s+Bank|IDFC\s+First\s+Bank)\b",
-        re.IGNORECASE
-    )
-    found = [(m.start(), m.group(1)) for m in bank_re.finditer(pre_table_text)]
-    if found:
-        found.sort(key=lambda x: x[0])
-        b_raw = re.sub(r"\s+", " ", found[0][1]).strip()
-        return "ICICI Bank" if "icici" in b_raw.lower() else ("HDFC Bank" if "hdfc" in b_raw.lower() else b_raw.title())
-
-    for m_ifsc in re.finditer(r"\b([A-Z]{4})0[A-Z0-9]{6}\b", full_text.upper()):
-        pref = m_ifsc.group(1)
-        if pref in UNIVERSAL_IFSC_BANK_MAP:
-            return UNIVERSAL_IFSC_BANK_MAP[pref]
-    return None
-
-
-def identify_document_and_entity(file_path: str, raw_report: dict = None) -> dict:
-    text = extract_raw_text_from_file(file_path)
-    if not text:
-        return {
-            "doc_category": "Unknown Document", "doc_code": "UNKNOWN_DOCUMENT",
-            "classification_confidence": 0.0, "holder_name": "Unknown Holder",
-            "person_name": "Unknown Holder", "raw_extracted_name": "Unknown Holder",
-            "name_confidence": 0.0, "pan_number": None, "issuing_bank": None,
-            "employer_name": None, "identity_badge": "Unknown Document of Unknown Holder"
-        }
-
-    cls_info = classify_financial_document(text)
-    doc_code = cls_info.get("doc_code", "UNKNOWN_DOCUMENT")
-    doc_category = cls_info.get("doc_category", "Unknown Document")
-    cls_conf = cls_info.get("classification_confidence", 0.0)
-
-    norm_up = re.sub(r"\s+", " ", text.upper())
-    if "SECTION 44AB" in norm_up and re.search(r"\bFORM\s+NO\.?\s*3C[BD]\b", norm_up):
-        doc_code = "TAX_AUDIT_REPORT"
-        doc_category = "Tax Audit Report (Form 3CB/3CD)"
-        cls_conf = 0.95
-
-    pre_table_header = _slice_page1_pre_table(text)
-    person_name = "Unknown Holder"
-    raw_extracted_name = None
-    name_confidence = 0.0
-    extracted_pan = None
-    issuing_bank = None
-    employer_name = None
-
-    if doc_code == "TAX_AUDIT_REPORT":
-        fin_r = (raw_report or {}).get("financial_reconciliation", {})
-        ass_name = fin_r.get("assessee_business_name")
-        extracted_pan = fin_r.get("pan_number")
-        if ass_name:
-            person_name = ass_name
-            raw_extracted_name = ass_name
-            name_confidence = 0.95
-    else:
-        pan_m = re.search(r"\b([A-Z]{5}\d{4}[A-Z])\b", pre_table_header.upper()) or re.search(r"\b([A-Z]{5}\d{4}[A-Z])\b", text.upper())
-        extracted_pan = pan_m.group(1) if pan_m else None
-        cand = _extract_holder_strictly_from_header(file_path, pre_table_header)
-        if cand:
-            raw_extracted_name = cand
-            person_name, name_confidence = clean_ocr_person_name(cand)
-
-    if doc_code == "BANK_STATEMENT":
-        issuing_bank = _extract_bank_strictly_from_header(text[:800], text)
-
-    return {
-        "doc_category": doc_category, "doc_code": doc_code,
-        "classification_confidence": cls_conf, "holder_name": person_name,
-        "person_name": person_name, "raw_extracted_name": raw_extracted_name or person_name,
-        "name_confidence": name_confidence, "pan_number": extracted_pan,
-        "issuing_bank": issuing_bank, "employer_name": employer_name,
-        "identity_badge": f"{doc_category} of {person_name}"
-    }
