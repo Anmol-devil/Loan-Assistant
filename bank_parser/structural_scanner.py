@@ -1,6 +1,6 @@
 import os
 import re
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple
 import numpy as np
 import pymupdf
 import docx
@@ -37,6 +37,33 @@ def _normalize_font_name(font_name: str) -> str:
     if "+" in font_name:
         return font_name.split("+", 1)[1]
     return font_name
+
+
+def _transform_rotated_bbox(
+    rx0: float, ry0: float, rx1: float, ry1: float,
+    raw_w: float, raw_h: float, line_dir: Tuple[float, float]
+) -> Tuple[float, float, float, float, float, float]:
+    """
+    Normalizes PDF span coordinates when a PDF creator writes landscape tables using a
+    90-degree or 270-degree CTM (line['dir'] == (0, -1) or (0, 1)), such as RBL Bank PDFs.
+    Returns (vis_x0, vis_y0, vis_x1, vis_y1, vis_page_w, vis_page_h).
+    """
+    d_cos, d_sin = float(line_dir[0]), float(line_dir[1])
+    if abs(d_cos) < 0.5 and d_sin < -0.5:
+        # 90-deg counter-clockwise baseline: visual X is (raw_h - y), visual Y is x
+        vx0 = max(0.0, raw_h - ry1)
+        vx1 = max(vx0 + 1.0, raw_h - ry0)
+        vy0 = rx0
+        vy1 = rx1
+        return vx0, vy0, vx1, vy1, raw_h, raw_w
+    elif abs(d_cos) < 0.5 and d_sin > 0.5:
+        # 90-deg clockwise baseline: visual X is y, visual Y is (raw_w - x)
+        vx0 = ry0
+        vx1 = ry1
+        vy0 = max(0.0, raw_w - rx1)
+        vy1 = max(vy0 + 1.0, raw_w - rx0)
+        return vx0, vy0, vx1, vy1, raw_h, raw_w
+    return rx0, ry0, rx1, ry1, raw_w, raw_h
 
 
 def _group_spans_into_lines(spans: List[Dict[str, Any]], y_tol_norm: float = 0.0055) -> List[List[Dict[str, Any]]]:
@@ -184,6 +211,7 @@ def _scan_docx_structure(file_path: str) -> Dict[str, Any]:
                 header_line_idx = l_idx
 
     numeric_clusters = _compute_numeric_x_clusters(page_spans, date_row_count=date_row_count)
+    cand_bal_cnt = numeric_clusters[-1]["count"] if numeric_clusters else date_row_count
 
     return {
         "file_path": file_path,
@@ -191,6 +219,7 @@ def _scan_docx_structure(file_path: str) -> Dict[str, Any]:
         "total_pages": 1,
         "digital_pages": 1,
         "scanned_pages": 0,
+        "total_candidate_balances": cand_bal_cnt,
         "pages": [{
             "page": 1,
             "width_points": page_w,
@@ -200,6 +229,7 @@ def _scan_docx_structure(file_path: str) -> Dict[str, Any]:
             "lines": lines,
             "header_line_idx": header_line_idx,
             "date_row_count": date_row_count,
+            "candidate_balance_count": cand_bal_cnt,
             "numeric_x_clusters": numeric_clusters,
             "has_summary_keywords": len(summary_lines) > 0,
             "summary_lines": summary_lines,
@@ -216,13 +246,15 @@ def scan_pdf_structure(file_path: str, ocr_engine=None) -> Dict[str, Any]:
     pages_data: List[Dict[str, Any]] = []
     scanned_page_count = 0
     digital_page_count = 0
+    doc_candidate_balances = 0
 
     with pymupdf.open(file_path) as doc:
         for p_idx, page in enumerate(doc):
             page_num = p_idx + 1
             rect = page.rect
-            page_w = max(1.0, float(rect.width))
-            page_h = max(1.0, float(rect.height))
+            raw_w = max(1.0, float(rect.width))
+            raw_h = max(1.0, float(rect.height))
+            eff_page_w, eff_page_h = raw_w, raw_h
             rotation = int(page.rotation)
 
             page_spans: List[Dict[str, Any]] = []
@@ -232,11 +264,15 @@ def scan_pdf_structure(file_path: str, ocr_engine=None) -> Dict[str, Any]:
                 digital_page_count += 1
                 for block in page.get_text("dict").get("blocks", []):
                     for line in block.get("lines", []):
+                        line_dir = line.get("dir", (1.0, 0.0))
                         for span in line.get("spans", []):
                             raw_txt = span.get("text", "").strip()
                             if not raw_txt:
                                 continue
-                            bx0, by0, bx1, by1 = [float(v) for v in span["bbox"]]
+                            rx0, ry0, rx1, ry1 = [float(v) for v in span["bbox"]]
+                            bx0, by0, bx1, by1, eff_page_w, eff_page_h = _transform_rotated_bbox(
+                                rx0, ry0, rx1, ry1, raw_w, raw_h, line_dir
+                            )
                             sub_lines = [s_ln.strip() for s_ln in raw_txt.splitlines() if s_ln.strip()]
                             if not sub_lines:
                                 continue
@@ -253,15 +289,15 @@ def scan_pdf_structure(file_path: str, ocr_engine=None) -> Dict[str, Any]:
                                     "text": txt,
                                     "bbox_points": [x0, y0, x1, y1],
                                     "bbox_norm": [
-                                        round(x0 / page_w, 4),
-                                        round(y0 / page_h, 4),
-                                        round(x1 / page_w, 4),
-                                        round(y1 / page_h, 4),
+                                        round(x0 / eff_page_w, 4),
+                                        round(y0 / eff_page_h, 4),
+                                        round(x1 / eff_page_w, 4),
+                                        round(y1 / eff_page_h, 4),
                                     ],
                                     "cx_points": cx,
                                     "cy_points": cy,
-                                    "cx_norm": round(cx / page_w, 4),
-                                    "cy_norm": round(cy / page_h, 4),
+                                    "cx_norm": round(cx / eff_page_w, 4),
+                                    "cy_norm": round(cy / eff_page_h, 4),
                                     "font": _normalize_font_name(span.get("font", "")),
                                     "size": round(float(span.get("size", 0.0)), 1),
                                     "color": span.get("color", 0),
@@ -284,8 +320,8 @@ def scan_pdf_structure(file_path: str, ocr_engine=None) -> Dict[str, Any]:
                             ys = [pt[1] for pt in box]
                             nx0, ny0 = min(xs) / img_w, min(ys) / img_h
                             nx1, ny1 = max(xs) / img_w, max(ys) / img_h
-                            x0, y0 = round(nx0 * page_w, 2), round(ny0 * page_h, 2)
-                            x1, y1 = round(nx1 * page_w, 2), round(ny1 * page_h, 2)
+                            x0, y0 = round(nx0 * eff_page_w, 2), round(ny0 * eff_page_h, 2)
+                            x1, y1 = round(nx1 * eff_page_w, 2), round(ny1 * eff_page_h, 2)
                             cx, cy = round((x0 + x1) / 2.0, 2), round((y0 + y1) / 2.0, 2)
 
                             page_spans.append({
@@ -325,10 +361,9 @@ def scan_pdf_structure(file_path: str, ocr_engine=None) -> Dict[str, Any]:
                 ):
                     date_row_count += 1
 
-                # Check up to 4 vertically wrapped header lines (e.g., RBL Bank's 4-line header)
                 if header_line_idx is None and date_row_count == 0:
                     win_spans = list(ln)
-                    for k_off in range(1, 4):
+                    for k_off in range(1, 5):
                         if l_idx + k_off < len(lines):
                             nxt = lines[l_idx + k_off]
                             if any(DATE_TOKEN_RE.match(s["text"]) or DECIMAL_NUMBER_RE.match(s["text"]) for s in nxt):
@@ -339,16 +374,20 @@ def scan_pdf_structure(file_path: str, ocr_engine=None) -> Dict[str, Any]:
                         header_line_idx = l_idx
 
             numeric_clusters = _compute_numeric_x_clusters(page_spans, date_row_count=date_row_count)
+            # Independent count of rightmost balance-column entries on this page
+            page_cand_balances = numeric_clusters[-1]["count"] if numeric_clusters else 0
+            doc_candidate_balances += page_cand_balances
 
             pages_data.append({
                 "page": page_num,
-                "width_points": round(page_w, 2),
-                "height_points": round(page_h, 2),
+                "width_points": round(eff_page_w, 2),
+                "height_points": round(eff_page_h, 2),
                 "rotation": rotation,
                 "spans": page_spans,
                 "lines": lines,
                 "header_line_idx": header_line_idx,
                 "date_row_count": date_row_count,
+                "candidate_balance_count": page_cand_balances,
                 "numeric_x_clusters": numeric_clusters,
                 "has_summary_keywords": len(summary_lines) > 0,
                 "summary_lines": summary_lines,
@@ -365,5 +404,6 @@ def scan_pdf_structure(file_path: str, ocr_engine=None) -> Dict[str, Any]:
         "total_pages": len(pages_data),
         "digital_pages": digital_page_count,
         "scanned_pages": scanned_page_count,
+        "total_candidate_balances": doc_candidate_balances,
         "pages": pages_data,
     }

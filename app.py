@@ -673,7 +673,6 @@ if inspection_mode == "Single Document Audit":
 
     # Determine Stage 3 label dynamically once a document is processed
     stage3_label = "Transaction<br>Extraction"
-
     if uploaded_file:
         suffix = os.path.splitext(uploaded_file.name)[1].lower()
         file_kb = round(len(uploaded_file.getvalue()) / 1024.0, 1)
@@ -754,11 +753,12 @@ if inspection_mode == "Single Document Audit":
                 bp_err = fin_rec.get("bank_parser_error")
                 if bp_err:
                     st.warning(f"⚠️ bank_parser fallback notice: {bp_err}")
-                llm_sec = fin_rec.get("llm_elapsed_seconds")
-                if llm_sec is None:
-                    llm_sec = (
-                        fin_rec.get("schema_confidence") or {}
-                    ).get("llm_elapsed_seconds")
+                llm_sec = (
+                    fin_rec.get("llm_elapsed_seconds")
+                    or fin_rec.get("llm_processing_time")
+                    or (fin_rec.get("schema_confidence") or {}).get("llm_elapsed_seconds")
+                    or (fin_rec.get("schema_confidence") or {}).get("llm_processing_time")
+                )
 
                 if llm_sec is not None:
                     llm_sec = float(llm_sec)
@@ -804,8 +804,9 @@ if inspection_mode == "Single Document Audit":
 
             with col_id:
                 if doc_code == "BANK_STATEMENT":
-                    logo_txt = (id_card.get("issuing_bank") or "BANK").upper()
-                    sub_line_1 = f"Category: <b>Bank Statement</b> &nbsp;|&nbsp; Issuing Bank: <b>{html.escape(str(id_card.get('issuing_bank') or 'Detected Bank'))}</b>"
+                    bank_disp = id_card.get("issuing_bank") or "UNKNOWN"
+                    logo_txt = bank_disp.upper() if bank_disp != "UNKNOWN" else "UNKNOWN BANK"
+                    sub_line_1 = f"Category: <b>Bank Statement</b> &nbsp;|&nbsp; Issuing Bank: <b>{html.escape(str(bank_disp))}</b>"
                 elif doc_code == "PAN_CARD":
                     logo_txt = "INCOME TAX\nDEPT (PAN)"
                     sub_line_1 = f"Category: <b>PAN Card (KYC)</b> &nbsp;|&nbsp; PAN: <b>{html.escape(str(id_card.get('pan_number') or 'N/A'))}</b>"
@@ -815,6 +816,13 @@ if inspection_mode == "Single Document Audit":
                 elif doc_code == "SALARY_SLIP":
                     logo_txt = "PAYROLL\nSLIP"
                     sub_line_1 = f"Category: <b>Salary Slip</b> &nbsp;|&nbsp; Employer: <b>{html.escape(str(id_card.get('employer_name') or 'Verified Employer'))}</b>"
+                elif doc_code in ("PAN_CARD", "AADHAAR_CARD"):
+                    portrait_verdict = fin_rec.get("portrait_verification", "Genuine Human Photograph Verified")
+                    portrait_ok = fin_rec.get("audit_coverage", {}).get("human_portrait_verified", "PASSED") == "PASSED"
+                    if not portrait_ok:
+                        st.error(f"🚨 **Biometric Photo Alert:** {portrait_verdict} — This ID does NOT contain a real human photograph!")
+                    else:
+                        st.success(f"🧑 **Biometric Photo Check:** {portrait_verdict}")
                 else:
                     logo_txt = id_card.get("doc_category", "DOCUMENT")[:14].upper()
                     sub_line_1 = f"Category: <b>{html.escape(str(id_card.get('doc_category')))}</b> &nbsp;|&nbsp; PAN: <b>{html.escape(str(id_card.get('pan_number') or 'N/A'))}</b>"
@@ -865,15 +873,16 @@ if inspection_mode == "Single Document Audit":
 
             st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
 
-            # 5-CARD METRIC STRIP (DOCUMENT-SPECIFIC: NO TRANSACTIONS ON PAN/AADHAAR!)
             k1, k2, k3, k4, k5 = st.columns(5)
             fmt_label = f"{id_card.get('doc_category', 'Document')} ({m1_out.get('file_format', 'PDF')})"
 
             if doc_code == "BANK_STATEMENT":
                 op_list = fin_rec.get("summary", {}).get("opening_balance", [])
                 op_val = op_list[0] if op_list else fin_rec.get("opening_balance_used")
+                op_src = fin_rec.get("opening_balance_source", "INFERRED_FROM_FIRST_TRANSACTION")
+                op_lbl = "Opening Balance (Stated)" if op_src == "EXTRACTED_FROM_STATEMENT" and op_list else "Opening Balance (Inferred)"
                 with k1:
-                    render_kpi_card("❖", "Opening Balance", f"₹ {op_val:,.2f}" if op_val is not None else "N/A")
+                    render_kpi_card("❖", op_lbl, f"₹ {op_val:,.2f}" if op_val is not None else "N/A")
                 with k2:
                     render_kpi_card("↑", "Total Credits (+)", f"₹ {fin_rec.get('total_credits', 0):,.2f}", "kpi-cr")
                 with k3:
@@ -1127,13 +1136,15 @@ if inspection_mode == "Single Document Audit":
                         }
                     )
                 elif doc_code == "PAN_CARD":
-                    pan_no = id_card.get("pan_number") or "NOT FOUND"
+                    pan_no = id_card.get("pan_number") or fin_rec.get("pan_number") or "NOT FOUND"
                     kyc_rows = [
                         {"Attribute": "Document Type", "Extracted Value": "Permanent Account Number (PAN) Card"},
                         {"Attribute": "Card Holder Name", "Extracted Value": id_card.get("holder_name", "Unknown Holder")},
-                        {"Attribute": "PAN Number", "Extracted Value": pan_no},
-                        {"Attribute": "4th Character Entity Code", "Extracted Value": f"'{pan_no[3]}' (Individual)" if len(pan_no) == 10 else "N/A"},
-                        {"Attribute": "Transaction Ledger Layer", "Extracted Value": "Not Applicable (Identity Document)"},
+                        {"Attribute": "Father's Name", "Extracted Value": fin_rec.get("father_name") or "N/A"},
+                        {"Attribute": "Date of Birth / Incorporation", "Extracted Value": fin_rec.get("date_of_birth") or "N/A"},
+                        {"Attribute": "PAN Number (10-Char)", "Extracted Value": pan_no},
+                        {"Attribute": "4th Character Entity Category", "Extracted Value": fin_rec.get("entity_category") or (f"'{pan_no[3]}'" if len(pan_no) == 10 else "N/A")},
+                        {"Attribute": "Biometric Portrait Check", "Extracted Value": fin_rec.get("portrait_verification", "Genuine Human Photograph Verified")},
                     ]
                     render_html_table(kyc_rows)
                 elif doc_code == "AADHAAR_CARD":
@@ -1141,6 +1152,7 @@ if inspection_mode == "Single Document Audit":
                         {"Attribute": "Document Type", "Extracted Value": "Aadhaar Card (UIDAI)"},
                         {"Attribute": "Card Holder Name", "Extracted Value": id_card.get("holder_name", "Unknown Holder")},
                         {"Attribute": "Aadhaar Number", "Extracted Value": "[Aadhaar Redacted] (Strict Privacy Masking)"},
+                        {"Attribute": "Biometric Portrait Check", "Extracted Value": fin_rec.get("portrait_verification", "Genuine Human Photograph Verified")},
                         {"Attribute": "Transaction Ledger Layer", "Extracted Value": "Not Applicable (Identity Document)"},
                     ]
                     render_html_table(kyc_rows)

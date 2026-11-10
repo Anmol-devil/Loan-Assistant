@@ -74,8 +74,8 @@ Given structural samples from a multi-page Indian bank statement (with both poin
     "ifsc_code": "11-char IFSC of the issuing branch or null"
   },
   "stated_summary": {
-    "summary_found_on_page": 1,
-    "opening_balance": 500000.00,
+    "summary_found_on_page": null,
+    "opening_balance": null,
     "total_debits": null,
     "total_credits": null,
     "closing_balance": null
@@ -98,9 +98,9 @@ Given structural samples from a multi-page Indian bank statement (with both poin
   }
 }
 Rules:
-1. For `issuing_bank`, return the full bank name that issued the statement (from the top header or footer), NEVER a counterparty IFSC inside a NEFT/RTGS transaction row.
-2. For `holder_name`, extract the account holder / company name from the top header (e.g., 'K2 Beverages LLP', 'M/S. Hind Services'), NEVER a city or address fragment.
-3. Extract monetary summary figures as pure floats (strip commas and ₹/INR; use negative float if marked Dr or '-').
+1. For `issuing_bank`, return the full bank name that issued the statement, NEVER a counterparty IFSC inside a transaction row.
+2. For `holder_name`, extract the account holder / company name from the top header.
+3. For `stated_summary`, set fields to null unless an EXPLICIT summary label ('Opening Balance', 'Total Withdrawals', 'Total Deposits', 'Closing Balance') is printed in the statement. NEVER copy a transaction row's debit, credit, or running balance into `stated_summary`!
 4. Return ONLY raw JSON without markdown code fences.
 """
 
@@ -233,9 +233,6 @@ def _parse_float_safe(val_str: Any) -> Optional[float]:
 
 
 def call_zai_llm_sync(sample_payload: Dict[str, Any], model: Optional[str] = None) -> Optional[Tuple[Dict[str, Any], str, float]]:
-    """
-    Calls the Stage 2 LLM and returns (parsed_blueprint_dict, provider_and_model_str, elapsed_seconds).
-    """
     if not isinstance(sample_payload, dict):
         return None
 
@@ -378,7 +375,6 @@ def _deterministic_blueprint_discovery(scan_data: Dict[str, Any], smart_sample: 
                 if c_clean:
                     pre_cells.append(c_clean)
 
-    # Priority 2A: Explicit 'Account Name | <VALUE>' or 'Customer Name | <VALUE>' on same line
     for ln in pre_lines:
         parts = [p.strip() for p in ln.split("|") if p.strip()]
         if len(parts) >= 2 and re.match(r"^(?:account\s*name|customer\s*name|holder\s*name|primary\s*holder)$", parts[0], re.I):
@@ -387,7 +383,6 @@ def _deterministic_blueprint_discovery(scan_data: Dict[str, Any], smart_sample: 
                 holder_name = cand_p.title()
                 break
 
-    # Priority 2B: Explicit M/S. firm/company name
     if holder_name == "Unknown Holder":
         for cell in pre_cells:
             m_ms = re.search(r"\b(M/S\.?[ \t]+[A-Za-z][A-Za-z0-9 \t\.\&\-]{2,50})", cell, re.I)
@@ -397,7 +392,6 @@ def _deterministic_blueprint_discovery(scan_data: Dict[str, Any], smart_sample: 
                     holder_name = cand_ms.title()
                     break
 
-    # Priority 2C: Explicit company suffix (LLP, PRIVATE LIMITED, PVT LTD, SERVICES, SONS, ENTERPRISES, COLLECTION)
     if holder_name == "Unknown Holder":
         for cell in pre_cells:
             if re.search(r"\b(?:PRIVATE[ \t]+LIMITED|PVT\.?[ \t]*LTD|LIMITED|LLP|SERVICES|AND[ \t]+SONS|ENTERPRISES|TRADERS|INDUSTRIES|CORPORATION|COLLECTION)\b", cell, re.I):
@@ -405,7 +399,6 @@ def _deterministic_blueprint_discovery(scan_data: Dict[str, Any], smart_sample: 
                     holder_name = re.sub(r"[ \t]+", " ", cell).strip(" :-|.,").title()
                     break
 
-    # Priority 2D: Inline Labeled Customer / Account Holder Name
     if holder_name == "Unknown Holder":
         for cell in pre_cells:
             m_lbl = re.search(
@@ -419,7 +412,6 @@ def _deterministic_blueprint_discovery(scan_data: Dict[str, Any], smart_sample: 
                     holder_name = cand.title()
                     break
 
-    # Priority 2E: Top-of-page unlabeled entity/customer name
     if holder_name == "Unknown Holder":
         for cell in pre_cells[:12]:
             clean_c = re.sub(r"^(?:Mr\.?|Mrs\.?|Ms\.?|M/s\.?)[ \t]+", "", cell, flags=re.I).strip()
@@ -433,13 +425,15 @@ def _deterministic_blueprint_discovery(scan_data: Dict[str, Any], smart_sample: 
                 holder_name = clean_c.title()
                 break
 
-    # 3. Discover Stated Summary
+    # 3. Discover Stated Summary STRICTLY from Labelled Summary Blocks (NEVER from transaction rows!)
     stated_summary = {
         "summary_found_on_page": None,
         "opening_balance": None,
+        "opening_balance_source": None,
         "total_debits": None,
         "total_credits": None,
         "closing_balance": None,
+        "grounding_evidence": {},
     }
     summary_search_blocks = list(smart_sample.get("summary_blocks_across_pages") or [])
     summary_search_blocks.insert(0, {"page": 1, "summary_text_block": strict_pre_hdr})
@@ -452,43 +446,55 @@ def _deterministic_blueprint_discovery(scan_data: Dict[str, Any], smart_sample: 
 
         m_hdfc_sum = re.search(
             r"Opening\s+Balance[\s\|]+Dr\s+Count[\s\|]+Cr\s+Count[\s\|]+Debits[\s\|]+Credits[\s\|]+Closing\s+Bal(?:ance)?[\s\S]{0,120}?"
-            r"([+-]?[\d,]+\.\d{2})[\s\|]+\d+[\s\|]+\d+[\s\|]+([+-]?[\d,]+\.\d{2})[\s\|]+([+-]?[\d,]+\.\d{2})[\s\|]+([+-]?[\d,]+\.\d{2})",
+            r"([+-]?[\d,]+\.\d{2})[\s\|]+\d+[\s\|]+\d+[\s\|]+([\d,]+\.\d{2})[\s\|]+([\d,]+\.\d{2})[\s\|]+([+-]?[\d,]+\.\d{2})",
             s_txt,
             re.I,
         )
         if m_hdfc_sum:
             stated_summary["summary_found_on_page"] = p_no
             stated_summary["opening_balance"] = _parse_float_safe(m_hdfc_sum.group(1))
-            stated_summary["total_debits"] = _parse_float_safe(m_hdfc_sum.group(2))
-            stated_summary["total_credits"] = _parse_float_safe(m_hdfc_sum.group(3))
+            stated_summary["opening_balance_source"] = "EXTRACTED_FROM_STATEMENT"
+            stated_summary["total_debits"] = abs(_parse_float_safe(m_hdfc_sum.group(2)) or 0.0)
+            stated_summary["total_credits"] = abs(_parse_float_safe(m_hdfc_sum.group(3)) or 0.0)
             stated_summary["closing_balance"] = _parse_float_safe(m_hdfc_sum.group(4))
+            stated_summary["grounding_evidence"]["summary_table"] = {"page": p_no, "label": "Statement Summary Table"}
             break
 
         m_axis_tot = re.search(r"TRANSACTION\s+TOTAL\s+DR/CR[\s\|]*([\d,]+\.\d{2})\s*/\s*([\d,]+\.\d{2})", s_txt, re.I)
         if m_axis_tot:
             stated_summary["summary_found_on_page"] = p_no
-            stated_summary["total_debits"] = _parse_float_safe(m_axis_tot.group(1))
-            stated_summary["total_credits"] = _parse_float_safe(m_axis_tot.group(2))
+            stated_summary["total_debits"] = abs(_parse_float_safe(m_axis_tot.group(1)) or 0.0)
+            stated_summary["total_credits"] = abs(_parse_float_safe(m_axis_tot.group(2)) or 0.0)
+            stated_summary["grounding_evidence"]["transaction_total"] = {"page": p_no, "label": "TRANSACTION TOTAL DR/CR"}
 
-        m_ob = re.search(r"OPENING\s+BAL(?:ANCE)?[\s\|:]*([+-]?\s*(?:INR|Rs\.?|₹)?\s*[\d,]+\.\d{2}(?:\s*\(?[CD]r\)?)?)", s_txt, re.I)
+        m_ob = re.search(r"OPENING\s+BAL(?:ANCE)?[\s\|:]+([+-]?\s*(?:INR|Rs\.?|₹)?\s*[\d,]+\.\d{2}(?:\s*\(?[CD]r\)?)?)", s_txt, re.I)
         if m_ob and stated_summary["opening_balance"] is None:
             stated_summary["opening_balance"] = _parse_float_safe(m_ob.group(1))
+            stated_summary["opening_balance_source"] = "EXTRACTED_FROM_STATEMENT"
             stated_summary["summary_found_on_page"] = stated_summary["summary_found_on_page"] or p_no
+            stated_summary["grounding_evidence"]["opening_balance"] = {"page": p_no, "label": "Opening Balance"}
 
-        m_td = re.search(r"(?:TOTAL\s+(?:DEBITS?|WITHDRAWALS?)|DEBITS?\s+TOTAL)[\s\|:]*([+-]?\s*(?:INR|Rs\.?|₹)?\s*[\d,]+\.\d{2})", s_txt, re.I)
+        m_td = re.search(r"(?:TOTAL\s+(?:DEBITS?|WITHDRAWALS?|WITHDRAWL)|DEBITS?\s+TOTAL)[\s\|:]+((?:INR|Rs\.?|₹)?\s*[\d,]+\.\d{2})", s_txt, re.I)
         if m_td and stated_summary["total_debits"] is None:
-            stated_summary["total_debits"] = abs(_parse_float_safe(m_td.group(1)) or 0.0) or None
+            v_td = _parse_float_safe(m_td.group(1))
+            if v_td is not None and v_td >= 0:
+                stated_summary["total_debits"] = abs(v_td)
+                stated_summary["grounding_evidence"]["total_debits"] = {"page": p_no, "label": "Total Debits/Withdrawals"}
 
-        m_tc = re.search(r"(?:TOTAL\s+(?:CREDITS?|DEPOSITS?)|CREDITS?\s+TOTAL)[\s\|:]*([+-]?\s*(?:INR|Rs\.?|₹)?\s*[\d,]+\.\d{2})", s_txt, re.I)
+        m_tc = re.search(r"(?:TOTAL\s+(?:CREDITS?|DEPOSITS?)|CREDITS?\s+TOTAL)[\s\|:]+((?:INR|Rs\.?|₹)?\s*[\d,]+\.\d{2})", s_txt, re.I)
         if m_tc and stated_summary["total_credits"] is None:
-            stated_summary["total_credits"] = abs(_parse_float_safe(m_tc.group(1)) or 0.0) or None
+            v_tc = _parse_float_safe(m_tc.group(1))
+            if v_tc is not None and v_tc >= 0:
+                stated_summary["total_credits"] = abs(v_tc)
+                stated_summary["grounding_evidence"]["total_credits"] = {"page": p_no, "label": "Total Credits/Deposits"}
 
-        m_cb = re.search(r"CLOSING\s+BAL(?:ANCE)?(?!\s+figure|\s+includes)[\s\|:]*([+-]?\s*(?:INR|Rs\.?|₹)?\s*[\d,]+\.\d{2}(?:\s*\(?[CD]r\)?)?)", s_txt, re.I)
+        m_cb = re.search(r"CLOSING\s+BAL(?:ANCE)?(?!\s+figure|\s+includes)[\s\|:]+([+-]?\s*(?:INR|Rs\.?|₹)?\s*[\d,]+\.\d{2}(?:\s*\(?[CD]r\)?)?)", s_txt, re.I)
         if m_cb and stated_summary["closing_balance"] is None:
             stated_summary["closing_balance"] = _parse_float_safe(m_cb.group(1))
             stated_summary["summary_found_on_page"] = stated_summary["summary_found_on_page"] or p_no
+            stated_summary["grounding_evidence"]["closing_balance"] = {"page": p_no, "label": "Closing Balance"}
 
-    # 4. Discover Table Header & Dual Column Coordinates (Combines up to 4 wrapped header lines!)
+    # 4. Discover Table Header & Dual Column Coordinates
     columns: Dict[str, Any] = {}
     amount_rep = "SEPARATE_DEBIT_CREDIT_COLUMNS"
     table_start_y = 0.0
@@ -501,7 +507,7 @@ def _deterministic_blueprint_discovery(scan_data: Dict[str, Any], smart_sample: 
 
         if h_idx is not None and h_idx < len(lines):
             hdr_spans = list(lines[h_idx])
-            for k_off in range(1, 4):
+            for k_off in range(1, 5):
                 if h_idx + k_off < len(lines):
                     next_ln = lines[h_idx + k_off]
                     if any(re.search(r"\d+\.\d{2}", s["text"]) or DATE_START_RE.match(s["text"]) for s in next_ln):
@@ -609,6 +615,27 @@ def _deterministic_blueprint_discovery(scan_data: Dict[str, Any], smart_sample: 
     }
 
 
+def _verify_summary_label_near_value(pages_list: List[Dict[str, Any]], label_keywords: Tuple[str, ...], cand_val: float) -> Optional[Dict[str, Any]]:
+    """
+    Strictly verifies that an LLM-proposed summary figure has an actual summary label
+    on the same page within vertical proximity, NEVER accepting a number just because it appears in a transaction row!
+    """
+    target_int = str(int(abs(cand_val)))
+    for p in pages_list:
+        if not isinstance(p, dict):
+            continue
+        lines = p.get("lines") or []
+        for idx, ln in enumerate(lines):
+            ln_low = " ".join((s.get("text") or "").lower() for s in ln)
+            if any(kw in ln_low for kw in label_keywords):
+                # Check a 4-line window around the label for the exact number
+                win_spans = [s for w_ln in lines[max(0, idx - 1):min(len(lines), idx + 4)] for s in w_ln]
+                win_digits = re.sub(r"[^\d]", "", " ".join(s.get("text", "") for s in win_spans))
+                if target_int in win_digits:
+                    return {"page": p.get("page", 1), "label_verified": True}
+    return None
+
+
 def discover_and_ground_blueprint(scan_data: Dict[str, Any], smart_sample: Dict[str, Any], use_llm: bool = True) -> Dict[str, Any]:
     scan_data = scan_data or {}
     smart_sample = smart_sample or {}
@@ -629,7 +656,6 @@ def discover_and_ground_blueprint(scan_data: Dict[str, Any], smart_sample: Dict[
     llm_bp, source_info, elapsed_sec = llm_res
     elapsed_min = elapsed_sec / 60.0
 
-    # Terminal Logging as requested
     print(f"[Stage 2 LLM] Blueprint received successfully from {source_info}")
     print(f"[Stage 2 LLM] Document processing time: {elapsed_sec:.2f} seconds ({elapsed_min:.2f} min).")
 
@@ -637,11 +663,6 @@ def discover_and_ground_blueprint(scan_data: Dict[str, Any], smart_sample: Dict[
     det_blueprint["llm_model_used"] = source_info
 
     pages_list = scan_data.get("pages") or []
-    full_pdf_text = "\n".join(
-        s.get("text", "")
-        for p in pages_list if isinstance(p, dict)
-        for s in (p.get("spans") or []) if isinstance(s, dict)
-    )
     strict_pre_lines = [ln.strip().lower() for ln in safe_sample["page1_pre_table_header"].splitlines() if ln.strip()]
 
     # 1. Ground Identity Fields from LLM
@@ -665,20 +686,30 @@ def discover_and_ground_blueprint(scan_data: Dict[str, Any], smart_sample: Dict[
         raw_b = llm_id.get("issuing_bank") or llm_id.get("ifsc_code")
         det_blueprint["document_identity"]["issuing_bank"] = _normalize_issuing_bank_name(raw_b, fallback_bank=det_bank)
 
-    # 2. Ground Stated Summary Figures from LLM
+    # 2. Ground Stated Summary Figures from LLM ONLY if label-verified in PDF!
     llm_sum = llm_bp.get("stated_summary")
     if not isinstance(llm_sum, dict):
         llm_sum = {}
     det_sum = det_blueprint["stated_summary"]
-    digits_in_pdf = re.sub(r"[^\d]", "", full_pdf_text)
 
-    for k in ("opening_balance", "total_debits", "total_credits", "closing_balance"):
+    label_reqs = {
+        "opening_balance": ("opening balance", "opening bal", "brought forward", "b/f"),
+        "total_debits": ("total debit", "total withdrawal", "total withdrawl", "debits", "transaction total"),
+        "total_credits": ("total credit", "total deposit", "credits", "transaction total"),
+        "closing_balance": ("closing balance", "closing bal", "carried forward", "c/f"),
+    }
+    for k, req_kws in label_reqs.items():
         if det_sum.get(k) is None and llm_sum.get(k) is not None:
             cand_val = _parse_float_safe(llm_sum.get(k))
             if cand_val is not None:
-                int_str = str(int(abs(cand_val)))
-                if int_str in digits_in_pdf:
+                if k in ("total_debits", "total_credits") and cand_val < 0:
+                    continue
+                ev = _verify_summary_label_near_value(pages_list, req_kws, cand_val)
+                if ev:
                     det_sum[k] = cand_val
+                    det_sum["grounding_evidence"][k] = ev
+                    if k == "opening_balance":
+                        det_sum["opening_balance_source"] = "EXTRACTED_FROM_STATEMENT"
 
     # 3. Ground Column Definitions from LLM
     llm_tb = llm_bp.get("table_structure_blueprint")

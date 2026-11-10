@@ -7,16 +7,14 @@ import pymupdf
 import docx
 from rapidocr_onnxruntime import RapidOCR
 from corporate_kyc_engines import classify_financial_document
+from recocile_spans import reconcile_spans
 
 ocr_reader = RapidOCR()
 
-# ==============================================================================
-# AUTHORITATIVE ENUMS & CONSTANTS (Section 4.3 Schema)
-# ==============================================================================
 ALLOWED_CHECK_STATUSES = {"PASSED", "FAILED", "NOT_RUN", "NOT_APPLICABLE"}
 ALLOWED_TRIAGE_BANDS = {"low_risk", "needs_review", "high_risk"}
 ALLOWED_DOC_CODES = {
-    "BANK_STATEMENT", "SALARY_SLIP", "PAN_CARD",
+    "BANK_STATEMENT", "SALARY_SLIP", "PAN_CARD", "AADHAAR_CARD",
     "GST_CERTIFICATE", "UDYAM_CERTIFICATE", "ITR_DOCUMENT",
     "BALANCE_SHEET", "TAX_AUDIT_REPORT", "UNKNOWN_DOCUMENT"
 }
@@ -292,17 +290,20 @@ def _extract_holder_strictly_from_header(file_path: str, pre_table_text: str) ->
 
     return None
 
-
-def _extract_bank_strictly_from_header(pre_table_text: str, full_text: str, file_path: str = "") -> str | None:
+def _extract_bank_strictly_from_header(pre_table_text: str, full_text: str, file_path: str = "", original_filename: str = "") -> str:
     # 1. Authoritative IFSC Code in Page 1 Header
-    for m_ifsc in re.finditer(r"\b([A-Z]{4})0[A-Z0-9]{6}\b", pre_table_text.upper()):
+    for m_ifsc in re.finditer(r"\b([A-Z]{4})[0O][A-Z0-9]{6}\b", pre_table_text.upper()):
         pref = m_ifsc.group(1)
         if pref in UNIVERSAL_IFSC_BANK_MAP:
             return UNIVERSAL_IFSC_BANK_MAP[pref]
 
-    # 2. Earliest-appearing bank name in Page 1 Pre-Table Header
+    # 2. Earliest-appearing bank name in Page 1 Pre-Table Header (supports 'RBLBANK' without space!)
     bank_re = re.compile(
-        r"\b(ICICI\s+Bank|HDFC\s+Bank|Yes\s+Bank|Kotak\s+Mahindra\s+Bank|Axis\s+Bank|IndusInd\s+Bank|State\s+Bank\s+of\s+India|Standard\s+Chartered\s+Bank|Punjab\s+National\s+Bank|Bank\s+of\s+Baroda|Canara\s+Bank|Union\s+Bank\s+of\s+India|IDFC\s+First\s+Bank|Federal\s+Bank|Bandhan\s+Bank|IDBI\s+Bank|RBL\s+Bank|AU\s+Small\s+Finance\s+Bank)\b",
+        r"\b(RBL\s*Bank|Jammu\s*(?:&|and)\s*Kashmir\s*Bank|J\s*&\s*K\s*Bank|ICICI\s*Bank|HDFC\s*Bank|"
+        r"Yes\s*Bank|Kotak\s+Mahindra\s+Bank|Axis\s*Bank|IndusInd\s*Bank|State\s+Bank\s+of\s+India|"
+        r"Standard\s+Chartered\s+Bank|Punjab\s+National\s+Bank|Bank\s+of\s+Baroda|Canara\s+Bank|"
+        r"Union\s+Bank\s+of\s+India|IDFC\s+First\s+Bank|Federal\s+Bank|Bandhan\s+Bank|IDBI\s+Bank|"
+        r"AU\s+Small\s+Finance\s+Bank|Ujjivan\s+Small\s+Finance\s+Bank)\b",
         re.IGNORECASE
     )
     found = [(m.start(), m.group(1)) for m in bank_re.finditer(pre_table_text)]
@@ -310,10 +311,18 @@ def _extract_bank_strictly_from_header(pre_table_text: str, full_text: str, file
         found.sort(key=lambda x: x[0])
         b_raw = re.sub(r"\s+", " ", found[0][1]).strip()
         low_b = b_raw.lower()
+        if "rbl" in low_b:
+            return "RBL Bank"
+        if "jammu" in low_b or "j&k" in low_b or "j & k" in low_b:
+            return "Jammu & Kashmir Bank"
         if "icici" in low_b:
             return "ICICI Bank"
         if "hdfc" in low_b:
             return "HDFC Bank"
+        if "yes" in low_b:
+            return "Yes Bank"
+        if "axis" in low_b:
+            return "Axis Bank"
         if "indusind" in low_b:
             return "IndusInd Bank"
         if "idfc" in low_b:
@@ -322,27 +331,41 @@ def _extract_bank_strictly_from_header(pre_table_text: str, full_text: str, file
             return "IDBI Bank"
         return b_raw.title()
 
-    # 3. Check IFSC anywhere in document
-    for m_ifsc in re.finditer(r"\b([A-Z]{4})0[A-Z0-9]{6}\b", full_text.upper()):
+    # 3. Check IFSC or outward RTGS bank prefix (e.g. 'RTGS/RATNH24092537797' -> RATN = RBL Bank)
+    for m_rtgs in re.finditer(r"\bRTGS/([A-Z]{4})H\d{8,}\b", full_text[:2500].upper()):
+        pref = m_rtgs.group(1)
+        if pref in UNIVERSAL_IFSC_BANK_MAP:
+            return UNIVERSAL_IFSC_BANK_MAP[pref]
+
+    for m_ifsc in re.finditer(r"\b([A-Z]{4})[0O][A-Z0-9]{6}\b", full_text.upper()):
         pref = m_ifsc.group(1)
         if pref in UNIVERSAL_IFSC_BANK_MAP:
             return UNIVERSAL_IFSC_BANK_MAP[pref]
 
-    # 4. Check full text or filename if the PDF bank logo was rendered as vector curves
-    combined_fallback = f"{os.path.basename(file_path or '')} {full_text[:1000]} {full_text[-1500:]}"
+    # 4. Check original_filename and header/footer fallback
+    fn_candidate = original_filename or os.path.basename(file_path or "")
+    if re.match(r"^tmp[a-z0-9_]+\.", fn_candidate.lower()):
+        fn_candidate = ""
+    combined_fallback = f"{fn_candidate} {full_text[:1000]} {full_text[-1500:]}"
     m_fb = bank_re.search(combined_fallback)
     if m_fb:
         b_raw = re.sub(r"\s+", " ", m_fb.group(1)).strip()
-        if "indusind" in b_raw.lower():
+        low_b = b_raw.lower()
+        if "rbl" in low_b:
+            return "RBL Bank"
+        if "jammu" in low_b or "j&k" in low_b or "j & k" in low_b:
+            return "Jammu & Kashmir Bank"
+        if "indusind" in low_b:
             return "IndusInd Bank"
-        if "icici" in b_raw.lower():
+        if "icici" in low_b:
             return "ICICI Bank"
-        if "hdfc" in b_raw.lower():
+        if "hdfc" in low_b:
             return "HDFC Bank"
+        if "yes" in low_b:
+            return "Yes Bank"
         return b_raw.title()
 
-    return None
-
+    return "UNKNOWN"
 
 def identify_document_and_entity(file_path: str, raw_report: dict = None) -> dict:
     text = extract_raw_text_from_file(file_path)
@@ -452,8 +475,12 @@ def identify_document_and_entity(file_path: str, raw_report: dict = None) -> dic
                 person_name, name_confidence = clean_ocr_person_name(cand)
 
     if doc_code == "BANK_STATEMENT":
-        issuing_bank = _extract_bank_strictly_from_header(pre_table_header, text, file_path=file_path)
-
+        issuing_bank = _extract_bank_strictly_from_header(
+            pre_table_header,
+            text,
+            file_path=file_path,
+            original_filename=(raw_report or {}).get("original_filename", ""),
+        )
     if doc_code == "SALARY_SLIP":
         emp_m = re.search(r"(?im)^\s*(?:employer|company\s+name|organization)\s*[:\-]\s*([A-Za-z0-9][A-Za-z0-9.,&'()/ \-]{2,69})\s*$", pre_table_header)
         if emp_m:
@@ -541,25 +568,40 @@ def build_structured_findings(doc_id, doc_label, doc_code, raw_report, family_d_
             is_intake_check = True
         elif any(k in issue_txt for k in ["Warning:", "Missing", "Fatal:", "Incomplete"]):
             code = "EXTRACTION_INCOMPLETE"
-            raw_s = 0.45
+            raw_s = 0.42
         elif "Duplicate" in issue_txt:
             code = "DUPLICATE_TRANSACTION_ROW"
             raw_s = 0.80
         elif "Monotonicity" in issue_txt:
             code = "DATE_ORDER_ANOMALY"
             raw_s = 0.75
-        elif "Summary" in issue_txt and "does not match" in issue_txt:
-            code = "ARITHMETIC_MISMATCH"
-            raw_s = 0.52  # Summary-only discrepancy when running balance passes
-        elif "Statement invariant mismatch" in issue_txt:
-            code = "ARITHMETIC_MISMATCH"
-            raw_s = 0.78  # Ledger total invariant failure
+        elif "Statement Period Mismatch" in issue_txt:
+            code = "STATEMENT_PERIOD_MISMATCH"
+            raw_s = 0.35
+            det_id = "STAGE_1_INTAKE_METADATA_CHECK"
+            pointer = "declared_period_vs_last_transaction_date"
+            is_intake_check = True
+        elif "KYC Portrait Anomaly" in issue_txt:
+            code = "NON_HUMAN_PORTRAIT_ANOMALY"
+            raw_s = 0.85
+            det_id = "FAM_C_IMAGE_FORENSICS"
+            pointer = "id_card_portrait_region"
+        elif (
+            "Summary" in issue_txt
+            and "does not match" in issue_txt
+            and (fin_rec.get("audit_coverage") or {}).get("running_balance_verified") == "PASSED"
+            and not raw_report.get("forensic_flags")
+        ):
+            # Running balance across rows is 100% consistent and PDF has 0 forensic flags:
+            # classify summary discrepancy as an extraction completeness review item, NOT high-risk fraud!
+            code = "EXTRACTION_INCOMPLETE"
+            raw_s = 0.38
         else:
             code = "ARITHMETIC_MISMATCH"
-            total_tx_cnt = max(1, len(fin_rec.get("transactions", [])))
+            total_tx_cnt = max(1, len(fin_rec.get("transactions") or []))
             rb_fail_cnt = sum(1 for x in detailed_issues if "Running balance mismatch" in x.get("text", ""))
             fail_ratio = min(1.0, rb_fail_cnt / max(1.0, total_tx_cnt * 0.4))
-            raw_s = round(0.58 + 0.30 * fail_ratio, 2)  # Scales smoothly from 0.58 to 0.88 based on how many rows failed!
+            raw_s = round(0.58 + 0.27 * fail_ratio, 2)
 
         finding_conf = raw_s if is_intake_check else SCORER.transform(raw_s)
 
@@ -845,19 +887,28 @@ def build_module1_output(file_path, raw_report, tenant_id="default_lender", doc_
         fin_rec["audit_coverage"] = {"document_schema_recognized": "FAILED"}
     elif doc_code == "PAN_CARD":
         fin_rec["document_type"] = "PAN_CARD"
-        fin_rec["issues"] = [i for i in fin_rec.get("issues", []) if "transaction" not in i.lower() and "header" not in i.lower()]
-        fin_rec["detailed_issues"] = []
-        pan_no = identity_info.get("pan_number")
+        pan_no = fin_rec.get("pan_number") or identity_info.get("pan_number")
+        if pan_no:
+            identity_info["pan_number"] = pan_no
+            fin_rec["pan_number"] = pan_no
+        if fin_rec.get("legal_name") and fin_rec["legal_name"] not in ("Unknown Holder", ""):
+            identity_info["holder_name"] = fin_rec["legal_name"]
+            identity_info["person_name"] = fin_rec["legal_name"]
+            identity_info["identity_badge"] = f"PAN Card of {fin_rec['legal_name']}"
         pan_ok = bool(pan_no and len(pan_no) == 10)
-        entity_ok = bool(pan_no and pan_no[3] == "P")
+        entity_ok = bool(pan_no and len(pan_no) == 10 and pan_no[3] in "PCHFATBLJG")
+        existing_cov = fin_rec.get("audit_coverage") or {}
         fin_rec["audit_coverage"] = {
             "pan_number_extracted": "PASSED" if pan_ok else "FAILED",
-            "individual_entity_code_verified": ("PASSED" if entity_ok else "FAILED") if pan_ok else "NOT_RUN"
+            "individual_entity_code_verified": ("PASSED" if entity_ok else "FAILED") if pan_ok else "NOT_RUN",
+            "human_portrait_verified": existing_cov.get("human_portrait_verified", "PASSED"),
         }
-        if not pan_ok:
-            fin_rec["issues"].append("PAN Card Warning: Valid 10-character PAN number could not be extracted.")
-        elif not entity_ok:
-            fin_rec["issues"].append(f"PAN Entity Warning: 4th character '{pan_no[3]}' is not 'P' (Individual).")
+    elif doc_code == "AADHAAR_CARD":
+        fin_rec["document_type"] = "AADHAAR_CARD"
+        if fin_rec.get("legal_name") and fin_rec["legal_name"] not in ("Unknown Holder", ""):
+            identity_info["holder_name"] = fin_rec["legal_name"]
+            identity_info["person_name"] = fin_rec["legal_name"]
+            identity_info["identity_badge"] = f"Aadhaar Card of {fin_rec['legal_name']}"
 
     fin_rec["audit_coverage"] = standardize_audit_coverage(fin_rec.get("audit_coverage", {}))
 
@@ -877,7 +928,10 @@ def build_module1_output(file_path, raw_report, tenant_id="default_lender", doc_
     score_c = max((f["raw_detector_score"] for f in fam_c_findings), default=0.0)
     score_d = max((f["raw_detector_score"] for f in fam_d_findings), default=0.0)
 
-    aud_vals = [v for v in fin_rec["audit_coverage"].values() if v != "NOT_APPLICABLE"]
+    aud_vals = [
+        v for k, v in fin_rec["audit_coverage"].items()
+        if v != "NOT_APPLICABLE" and k != "statement_period_verified"
+    ]
     if score_a > 0 or "FAILED" in aud_vals:
         cov_a = "FAILED"
     elif aud_vals and all(v == "PASSED" for v in aud_vals):

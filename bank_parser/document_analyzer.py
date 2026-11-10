@@ -1,4 +1,4 @@
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from .structural_scanner import scan_pdf_structure
 from .smart_sampler import build_smart_llm_sample
 from .bank_schema import discover_and_ground_blueprint
@@ -67,10 +67,15 @@ def compute_empirical_schema_confidence(
     else:
         math_score = 0.0
 
+    cand_cov = float(extraction_res.get("candidate_coverage_ratio") or 1.0)
+    structural_conf = round(0.55 * header_score + 0.45 * align_score, 3)
+    extraction_conf = round(0.45 * align_score + 0.55 * math_score, 3)
+    completeness_conf = round(0.55 * cand_cov + 0.25 * anchor_score + 0.20 * summary_score, 3)
+
     empirical = round(
         0.25 * header_score
         + 0.20 * align_score
-        + 0.20 * anchor_score
+        + 0.20 * cand_cov
         + 0.15 * summary_score
         + 0.20 * math_score,
         3,
@@ -80,21 +85,37 @@ def compute_empirical_schema_confidence(
     if llm_conf is None:
         llm_conf = round(max(empirical, 0.92), 2)
 
+    llm_sec = blueprint.get("llm_processing_time")
+
     return {
         "llm_self_confidence": llm_conf,
         "empirical_confidence": empirical,
+        "structural_confidence": structural_conf,
+        "extraction_confidence": extraction_conf,
+        "completeness_confidence": completeness_conf,
+        "llm_processing_time": llm_sec,
+        "llm_elapsed_seconds": llm_sec,
         "evidence_breakdown": {
             "headers_verified_in_pdf": round(header_score, 2),
             "numeric_clusters_aligned": round(align_score, 2),
             "table_start_supported": round(anchor_score, 2),
             "summary_values_grounded": round(summary_score, 2),
             "ledger_math_reconciled": round(math_score, 2),
+            "candidate_row_coverage": round(cand_cov, 2),
         },
     }
 
 
-def analyze_bank_statement_hybrid(file_path: str, run_math_checks_fn, ocr_engine=None, use_llm: bool = True) -> Dict[str, Any]:
+def analyze_bank_statement_hybrid(
+    file_path: str,
+    run_math_checks_fn,
+    ocr_engine=None,
+    use_llm: bool = True,
+    original_filename: Optional[str] = None,
+) -> Dict[str, Any]:
     scan_data = scan_pdf_structure(file_path, ocr_engine=ocr_engine) or {}
+    if original_filename:
+        scan_data["file_path"] = original_filename
     smart_sample = build_smart_llm_sample(scan_data) or {}
     blueprint = discover_and_ground_blueprint(scan_data, smart_sample, use_llm=use_llm) or {}
     extraction_res = extract_transactions_with_blueprint(scan_data, blueprint) or {}
@@ -105,23 +126,67 @@ def analyze_bank_statement_hybrid(file_path: str, run_math_checks_fn, ocr_engine
         stated = {}
 
     summary_dict = {
-        "opening_balance": [stated["opening_balance"]] if stated.get("opening_balance") is not None else [],
-        "summary_debits": [stated["total_debits"]] if stated.get("total_debits") is not None else [],
-        "summary_credits": [stated["total_credits"]] if stated.get("total_credits") is not None else [],
-        "closing_balance": [stated["closing_balance"]] if stated.get("closing_balance") is not None else [],
+        "opening_balance": [
+            stated["opening_balance"]
+        ] if stated.get("opening_balance") is not None else [],
+
+        "opening_balance_source": (
+            stated.get("opening_balance_source") or "UNKNOWN"
+        ),
+
+        "summary_debits": [
+            stated["total_debits"]
+        ] if stated.get("total_debits") is not None else [],
+
+        "summary_credits": [
+            stated["total_credits"]
+        ] if stated.get("total_credits") is not None else [],
+
+        "closing_balance": [
+            stated["closing_balance"]
+        ] if stated.get("closing_balance") is not None else [],
     }
+    full_doc_text = "\n".join(
+        s.get("text", "")
+        for p in (scan_data.get("pages") or []) if isinstance(p, dict)
+        for s in (p.get("spans") or []) if isinstance(s, dict)
+    )
 
     issues = []
     detailed_issues = []
-    recon_res = run_math_checks_fn(summary_dict, txs, issues, detailed_issues) or {}
+    try:
+        recon_res = run_math_checks_fn(summary_dict, txs, issues, detailed_issues, full_text=full_doc_text) or {}
+    except TypeError:
+        recon_res = run_math_checks_fn(summary_dict, txs, issues, detailed_issues) or {}
+
+    if stated.get("opening_balance_source") and not recon_res.get("opening_balance_source"):
+        recon_res["opening_balance_source"] = stated["opening_balance_source"]
+
+    expected_cands = max(
+        int(scan_data.get("total_candidate_balances") or 0),
+        int(extraction_res.get("total_candidate_balances") or 0),
+    )
+    if expected_cands >= 5 and len(txs) < expected_cands * 0.85:
+        missing_cnt = expected_cands - len(txs)
+        recon_res.setdefault("audit_coverage", {})["row_completeness_verified"] = "FAILED"
+        recon_res["status"] = "REVIEW_REQUIRED"
+        msg_inc = (
+            f"Extraction Completeness Warning: Document contains {expected_cands} independent balance entries across "
+            f"{scan_data.get('total_pages', 1)} page(s), but only {len(txs)} transaction rows were extracted ({missing_cnt} omitted)."
+        )
+        recon_res.setdefault("issues", []).insert(0, msg_inc)
+        recon_res.setdefault("detailed_issues", []).insert(0, {"page": 1, "bbox": None, "text": msg_inc})
+    elif expected_cands >= 1 and len(txs) >= expected_cands * 0.90:
+        if recon_res.get("audit_coverage", {}).get("row_completeness_verified") in (None, "NOT_RUN"):
+            recon_res.setdefault("audit_coverage", {})["row_completeness_verified"] = "PASSED"
+
+    llm_sec = blueprint.get("llm_processing_time")
     recon_res["total_pages_processed"] = scan_data.get("total_pages", 1)
     recon_res["per_page_summary"] = extraction_res.get("per_page_summary") or []
     recon_res["discovery_source"] = blueprint.get("discovery_source") or "ZAI_LLM_AND_GEOMETRIC_GROUNDED"
-    recon_res["llm_elapsed_seconds"] = blueprint.get("llm_elapsed_seconds")
     recon_res["blueprint_metadata"] = blueprint.get("document_identity") or {}
-    recon_res["schema_confidence"] = compute_empirical_schema_confidence(blueprint, extraction_res, recon_res)
-    recon_res["llm_processing_time"] = blueprint.get("llm_processing_time")
+    recon_res["llm_processing_time"] = llm_sec
+    recon_res["llm_elapsed_seconds"] = llm_sec
     recon_res["llm_model_used"] = blueprint.get("llm_model_used")
-    if isinstance(recon_res.get("schema_confidence"), dict):
-        recon_res["schema_confidence"]["llm_processing_time"] = blueprint.get("llm_processing_time")
+    recon_res["schema_confidence"] = compute_empirical_schema_confidence(blueprint, extraction_res, recon_res)
     return recon_res
