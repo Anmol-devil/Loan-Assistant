@@ -50,8 +50,8 @@ UNIVERSAL_IFSC_MAP = {
 }
 
 HEADER_LINE_CHECK_RE = re.compile(
-    r"\b(?:date|transactio|txn|tran|narration|particulars?|description|remarks?|details|instrument|chq|cheque|ref|inst|"
-    r"withdrawals?|withdrawl|deposits?|debits?|credits?|dr|cr|amount|amt|balance)\b",
+    r"(?:date|transactio|txn|tran|narration|particulars?|description|remarks?|details|instrument|chq|cheque|cho\.no|ref|inst|"
+    r"withdrawals?|withdrawl|deposits?|debits?|credits?|amount|amt|balance)",
     re.I,
 )
 
@@ -223,16 +223,18 @@ def _parse_float_safe(val_str: Any) -> Optional[float]:
     if isinstance(val_str, (int, float)):
         return round(float(val_str), 2)
     s = re.sub(r"(?:INR|Rs\.?|₹|\$|\s)", "", str(val_str), flags=re.I)
-    is_dr = bool(re.search(r"\(?Dr\)?$", s, re.I)) or s.startswith("-")
-    s = re.sub(r"\(?[CD]r\)?$", "", s, flags=re.I).replace(",", "")
+    is_dr = bool(re.search(r"\(?Dr\.?\)?$", s, re.I)) or s.startswith("-")
+    s = re.sub(r"\(?[CD]r\.?\)?$", "", s, flags=re.I).replace(",", "")
     try:
         v = round(float(s), 2)
         return -abs(v) if is_dr else v
     except ValueError:
         return None
 
-
-def call_zai_llm_sync(sample_payload: Dict[str, Any], model: Optional[str] = None) -> Optional[Tuple[Dict[str, Any], str, float]]:
+def call_zai_llm_sync(
+    sample_payload: Dict[str, Any],
+    model: Optional[str] = None,
+) -> Optional[Tuple[Dict[str, Any], str, float]]:
     if not isinstance(sample_payload, dict):
         return None
 
@@ -242,6 +244,7 @@ def call_zai_llm_sync(sample_payload: Dict[str, Any], model: Optional[str] = Non
 
     api_key = zai_key or oai_key or groq_key
     if not api_key:
+        print("[Stage 2 LLM] Skipped: No API key (ZAI_API_KEY / OPENAI_API_KEY / GROQ_API_KEY) found in environment.")
         return None
 
     if os.environ.get("ZAI_BASE_URL"):
@@ -262,6 +265,7 @@ def call_zai_llm_sync(sample_payload: Dict[str, Any], model: Optional[str] = Non
         provider_name = "Z.ai"
 
     model_name = model or os.environ.get("ZAI_MODEL", default_model)
+    source_label = f"{provider_name} ({model_name})"
 
     compact_payload = {
         "page1_pre_table_header": (sample_payload.get("page1_pre_table_header") or "")[:1500],
@@ -271,9 +275,12 @@ def call_zai_llm_sync(sample_payload: Dict[str, Any], model: Optional[str] = Non
     }
 
     t0 = time.perf_counter()
-    for url in ([base_url, "https://api.z.ai/api/paas/v4/"] if "bigmodel" in base_url else [base_url]):
+    print(f"[Stage 2 LLM] Sending layout sample to {source_label}...")
+    urls_to_try = [base_url, "https://api.z.ai/api/paas/v4/"] if "bigmodel" in base_url else [base_url]
+
+    for url in urls_to_try:
         try:
-            client = OpenAI(api_key=api_key, base_url=url, max_retries=0, timeout=35.0)
+            client = OpenAI(api_key=api_key, base_url=url, max_retries=0, timeout=40.0)
             response = client.chat.completions.create(
                 model=model_name,
                 messages=[
@@ -281,7 +288,7 @@ def call_zai_llm_sync(sample_payload: Dict[str, Any], model: Optional[str] = Non
                     {"role": "user", "content": json.dumps(compact_payload, ensure_ascii=False)},
                 ],
                 temperature=0.0,
-                timeout=35.0,
+                timeout=40.0,
             )
             raw_content = response.choices[0].message.content or ""
             cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_content.strip(), flags=re.I)
@@ -290,12 +297,15 @@ def call_zai_llm_sync(sample_payload: Dict[str, Any], model: Optional[str] = Non
                 parsed = json.loads(m_json.group(0))
                 if isinstance(parsed, dict):
                     elapsed = round(time.perf_counter() - t0, 2)
-                    source_label = f"{provider_name} ({model_name})"
+                    print(f"[Stage 2 LLM] Blueprint received successfully from {source_label}.")
+                    print(f"[Stage 2 LLM] Document processing time: {elapsed:.2f} seconds ({elapsed / 60.0:.2f} min).")
                     return parsed, source_label, elapsed
-        except Exception:
+        except Exception as exc:
+            print(f"[Stage 2 LLM] Endpoint {url} warning: {exc}")
             continue
-    return None
 
+    print(f"[Stage 2 LLM] Fallback: {source_label} did not return a blueprint; using deterministic geometric engine.")
+    return None
 
 def _strictly_truncate_pre_table_lines(raw_pre_hdr: str) -> List[str]:
     out: List[str] = []
@@ -306,18 +316,58 @@ def _strictly_truncate_pre_table_lines(raw_pre_hdr: str) -> List[str]:
         cells = [c.strip() for c in clean_ln.split("|") if c.strip()]
         low_ln = clean_ln.lower()
 
-        kw_hits = len(set(m.group(0).lower().rstrip("s") for m in HEADER_LINE_CHECK_RE.finditer(low_ln)))
-        if kw_hits >= 3 and ("balance" in low_ln or "withdrawl" in low_ln or "withdrawal" in low_ln) and "opening balance" not in low_ln:
+        if any(
+            h_tok in low_ln
+            for h_tok in (
+                "tran date", "transaction date", "withdrawal(dr)", "deposit(cr)", "balance(inr)",
+                "chq./ref.no.", "cheque no", "closing balance", "running balance"
+            )
+        ) and "opening balance" not in low_ln and "closing balance includes" not in low_ln:
             break
 
-        if cells and DATE_START_RE.match(cells[0]) and re.search(r"\d+\.\d{2}", clean_ln):
+        kw_hits = len(set(m.group(0).lower().rstrip("s") for m in HEADER_LINE_CHECK_RE.finditer(low_ln)))
+        if kw_hits >= 3 and ("balance" in low_ln or "withdraw" in low_ln) and "opening balance" not in low_ln:
             break
+
+        if cells and DATE_START_RE.match(cells[0]) and not any(
+            p in low_ln for p in ("period", "from", "as on", "open date", "expiry")
+        ):
+            if re.search(r"\d+\.\d{2}", clean_ln) or any(k in low_ln for k in ("mbk/", "neft", "rtgs", "imps", "upi")):
+                break
 
         out.append(clean_ln)
     return out
 
 
-def _deterministic_blueprint_discovery(scan_data: Dict[str, Any], smart_sample: Dict[str, Any], filename: str = "") -> Dict[str, Any]:
+def _format_entity_title(raw_name: str) -> str:
+    if not raw_name:
+        return "Unknown Holder"
+    cleaned = re.sub(r"[ \t]+", " ", str(raw_name)).strip(" :-|.,")
+    cleaned = re.sub(
+        r"^([A-Za-z])\s+([A-Za-z])(?=\s+(?:ENTERPRISES|TRADERS|SERVICES|INDUSTRIES|CORPORATION|ASSOCIATES|COMPANY|AGENCIES|SONS)\b)",
+        r"\1\2",
+        cleaned,
+        flags=re.I,
+    )
+    keep_upper = {
+        "SM", "K2", "LLP", "PVT", "PVT.", "LTD", "LTD.", "HUF", "PROP",
+        "M/S", "M/S.", "SRK", "JSH", "VS", "MS", "RK", "JK", "DR", "AR", "PK"
+    }
+    words = []
+    for w in cleaned.split():
+        w_up = w.upper()
+        if w_up in keep_upper or (len(w) == 2 and w.isalpha() and w.isupper()):
+            words.append(w_up)
+        else:
+            words.append(w.title())
+    return " ".join(words)
+
+
+def _deterministic_blueprint_discovery(
+    scan_data: Dict[str, Any],
+    smart_sample: Dict[str, Any],
+    filename: str = "",
+) -> Dict[str, Any]:
     scan_data = scan_data or {}
     smart_sample = smart_sample or {}
     pages = scan_data.get("pages") or []
@@ -327,29 +377,34 @@ def _deterministic_blueprint_discovery(scan_data: Dict[str, Any], smart_sample: 
     strict_pre_hdr = "\n".join(pre_lines)
     header_blob = f"{strict_pre_hdr}\n{ftr_hdr}"
 
-    # 1. Discover Issuing Bank
     issuing_bank = None
     ifsc_code = None
+    branch_name = None
+    account_number = None
+    customer_id = None
 
-    for m_ifsc in re.finditer(r"IFSC(?:\s*Code)?\s*[:\-]?\s*([A-Z]{4})[0O]([A-Z0-9]{6})\b", header_blob, re.I):
+    m_br = re.search(
+        r"(?:Branch\s*Name|Account\s*Branch|Home\s*Branch)[\s:\|\-]+([A-Za-z0-9][A-Za-z0-9 \t,\.\-&]{2,40})",
+        strict_pre_hdr,
+        re.I,
+    )
+    if m_br:
+        branch_name = re.sub(r"[ \t]+", " ", m_br.group(1).splitlines()[0].split("|")[0]).strip(" :-|.,").upper()
+
+    m_ac = re.search(r"(?:Account\s*(?:No|Number)|A/C\s*No)[\s:\|\-]+([A-Z0-9X\*]{6,22})", strict_pre_hdr, re.I)
+    if m_ac:
+        account_number = m_ac.group(1).strip()
+
+    m_cid = re.search(r"(?:Customer\s*Id|Cust\s*ID|CIF\s*Number)[\s:\|\-]+([A-Z0-9]{5,18})", strict_pre_hdr, re.I)
+    if m_cid:
+        customer_id = m_cid.group(1).strip()
+
+    for m_ifsc in re.finditer(r"IFSC(?:\s*Code)?[\s:\|\-]*([A-Z]{4})[0O]([A-Z0-9]{6})\b", header_blob, re.I):
         pref = m_ifsc.group(1).upper()
         if pref in UNIVERSAL_IFSC_MAP:
             ifsc_code = f"{pref}0{m_ifsc.group(2).upper()}"
             issuing_bank = UNIVERSAL_IFSC_MAP[pref]
             break
-
-    bank_re = re.compile(
-        r"\b(RBL\s*BANK|Jammu\s*(?:&|and)\s*Kashmir\s*Bank|J\s*&\s*K\s*Bank|HDFC\s*Bank|ICICI\s*Bank|Axis\s*Bank|"
-        r"Yes\s*Bank|Kotak\s+Mahindra\s+Bank|IndusInd\s*Bank|State\s+Bank\s+of\s+India|"
-        r"Ujjivan\s+Small\s+Finance\s+Bank|AU\s+Small\s+Finance\s+Bank|Punjab\s+National\s+Bank|"
-        r"Bank\s+of\s+Baroda|Canara\s+Bank|Union\s+Bank\s+of\s+India|IDFC\s+First\s+Bank|"
-        r"Federal\s+Bank|Bandhan\s+Bank|IDBI\s+Bank|Indian\s+Bank|Bank\s+of\s+India|Central\s+Bank\s+of\s+India)\b",
-        re.I,
-    )
-    if not issuing_bank:
-        m_b = bank_re.search(strict_pre_hdr) or bank_re.search(ftr_hdr)
-        if m_b:
-            issuing_bank = _normalize_issuing_bank_name(m_b.group(1))
 
     if not issuing_bank:
         for m_ifsc in re.finditer(r"(?<![A-Z0-9\-/])\b([A-Z]{4})[0O]([A-Z0-9]{6})\b", strict_pre_hdr.upper()):
@@ -362,10 +417,26 @@ def _deterministic_blueprint_discovery(scan_data: Dict[str, Any], smart_sample: 
                 issuing_bank = UNIVERSAL_IFSC_MAP[pref]
                 break
 
+    bank_re = re.compile(
+        r"\b(Bank\s+of\s+Baroda|bob\s+World|bob\s+Internet|Bank\s+of\s+Maharashtra|"
+        r"RBL\s*BANK|Jammu\s*(?:&|and)\s*Kashmir\s*Bank|J\s*&\s*K\s*Bank|HDFC\s*Bank|ICICI\s*Bank|Axis\s*Bank|"
+        r"Yes\s*Bank|Kotak\s+Mahindra\s+Bank|IndusInd\s*Bank|State\s+Bank\s+of\s+India|"
+        r"Ujjivan\s+Small\s+Finance\s+Bank|AU\s+Small\s+Finance\s+Bank|Punjab\s+National\s+Bank|"
+        r"Canara\s+Bank|Union\s+Bank\s+of\s+India|IDFC\s+First\s+Bank|"
+        r"Federal\s+Bank|Bandhan\s+Bank|IDBI\s+Bank|Indian\s+Bank|Bank\s+of\s+India|Central\s+Bank\s+of\s+India)\b",
+        re.I,
+    )
+    if not issuing_bank:
+        if re.search(r"\bbob\b", strict_pre_hdr, re.I) or "बड़ौदा" in strict_pre_hdr:
+            issuing_bank = "Bank of Baroda"
+        else:
+            m_b = bank_re.search(strict_pre_hdr)
+            if m_b:
+                issuing_bank = _normalize_issuing_bank_name(m_b.group(1))
+
     if not issuing_bank and filename:
         issuing_bank = _normalize_issuing_bank_name(filename)
 
-    # 2. Discover Account Holder Name
     holder_name = "Unknown Holder"
     pre_cells: List[str] = []
     for ln in pre_lines:
@@ -376,11 +447,15 @@ def _deterministic_blueprint_discovery(scan_data: Dict[str, Any], smart_sample: 
                     pre_cells.append(c_clean)
 
     for ln in pre_lines:
-        parts = [p.strip() for p in ln.split("|") if p.strip()]
-        if len(parts) >= 2 and re.match(r"^(?:account\s*name|customer\s*name|holder\s*name|primary\s*holder)$", parts[0], re.I):
-            cand_p = parts[1].lstrip(":- ").strip()
-            if not _is_address_or_branch_line(cand_p):
-                holder_name = cand_p.title()
+        m_main_lbl = re.search(
+            r"(?:Main\s*Account\s*Holder\s*Name|Primary\s*Account\s*Holder\s*Name|Account\s*Holder\s*Names?|Primary\s*Holder|Account\s*Name|Customer\s*Name)[\s:\|\-]+([A-Za-z][A-Za-z0-9 \t\.\&\-]{2,48})",
+            ln,
+            re.I,
+        )
+        if m_main_lbl:
+            cand_p = m_main_lbl.group(1).split("|")[0].strip(" :-|.,")
+            if "bank" not in cand_p.lower() and not _is_address_or_branch_line(cand_p):
+                holder_name = _format_entity_title(cand_p)
                 break
 
     if holder_name == "Unknown Holder":
@@ -389,27 +464,37 @@ def _deterministic_blueprint_discovery(scan_data: Dict[str, Any], smart_sample: 
             if m_ms:
                 cand_ms = re.sub(r"[ \t]+", " ", m_ms.group(1)).strip(" :-|.,")
                 if "bank" not in cand_ms.lower() and not _is_address_or_branch_line(cand_ms):
-                    holder_name = cand_ms.title()
+                    holder_name = _format_entity_title(cand_ms)
                     break
 
     if holder_name == "Unknown Holder":
         for cell in pre_cells:
-            if re.search(r"\b(?:PRIVATE[ \t]+LIMITED|PVT\.?[ \t]*LTD|LIMITED|LLP|SERVICES|AND[ \t]+SONS|ENTERPRISES|TRADERS|INDUSTRIES|CORPORATION|COLLECTION)\b", cell, re.I):
+            if re.search(
+                r"\b(?:PRIVATE[ \t]+LIMITED|PVT\.?[ \t]*LTD|LIMITED|LLP|SERVICES|AND[ \t]+SONS|ENTERPRISES|TRADERS|INDUSTRIES|CORPORATION|COLLECTION)\b",
+                cell,
+                re.I,
+            ):
                 if "bank" not in cell.lower() and not _is_address_or_branch_line(cell):
-                    holder_name = re.sub(r"[ \t]+", " ", cell).strip(" :-|.,").title()
+                    cand_ent = re.sub(
+                        r"^(?:Main\s*Account\s*Holder\s*Name|Account\s*Holder\s*Names?|Name)\s*[:\-]\s*",
+                        "",
+                        cell,
+                        flags=re.I,
+                    )
+                    holder_name = _format_entity_title(cand_ent)
                     break
 
     if holder_name == "Unknown Holder":
         for cell in pre_cells:
             m_lbl = re.search(
-                r"(?<!Bank\s)(?<!Branch\s)(?:Primary[ \t]*Account[ \t]*Holder[ \t]*Name|Primary[ \t]*Holder|Account[ \t]*Holder(?:[ \t]*Name)?|Account[ \t]*Name|Customer[ \t]*Name|Holder[ \t]*Name|Name)[ \t]*[:\-][ \t]*([A-Za-z][A-Za-z0-9 \t\.\&/\-]{2,45})",
+                r"(?<!Bank\s)(?<!Branch\s)(?:Account[ \t]*Holder(?:[ \t]*Name)?|Account[ \t]*Name|Customer[ \t]*Name|Holder[ \t]*Name|Name)[ \t]*[:\-][ \t]*([A-Za-z][A-Za-z0-9 \t\.\&/\-]{2,45})",
                 cell,
                 re.I,
             )
             if m_lbl:
                 cand = m_lbl.group(1).strip(" :-|.,")
                 if "bank" not in cand.lower() and not _is_address_or_branch_line(cand):
-                    holder_name = cand.title()
+                    holder_name = _format_entity_title(cand)
                     break
 
     if holder_name == "Unknown Holder":
@@ -422,10 +507,9 @@ def _deterministic_blueprint_discovery(scan_data: Dict[str, Any], smart_sample: 
                 and "bank" not in clean_c.lower()
                 and not _is_address_or_branch_line(clean_c)
             ):
-                holder_name = clean_c.title()
+                holder_name = _format_entity_title(clean_c)
                 break
 
-    # 3. Discover Stated Summary STRICTLY from Labelled Summary Blocks (NEVER from transaction rows!)
     stated_summary = {
         "summary_found_on_page": None,
         "opening_balance": None,
@@ -488,13 +572,16 @@ def _deterministic_blueprint_discovery(scan_data: Dict[str, Any], smart_sample: 
                 stated_summary["total_credits"] = abs(v_tc)
                 stated_summary["grounding_evidence"]["total_credits"] = {"page": p_no, "label": "Total Credits/Deposits"}
 
-        m_cb = re.search(r"CLOSING\s+BAL(?:ANCE)?(?!\s+figure|\s+includes)[\s\|:]+([+-]?\s*(?:INR|Rs\.?|₹)?\s*[\d,]+\.\d{2}(?:\s*\(?[CD]r\)?)?)", s_txt, re.I)
+        m_cb = re.search(
+            r"CLOSING\s+BAL(?:ANCE)?(?!\s+figure|\s+includes)[\s\|:]+([+-]?\s*(?:INR|Rs\.?|₹)?\s*[\d,]+\.\d{2}(?:\s*\(?[CD]r\)?)?)",
+            s_txt,
+            re.I,
+        )
         if m_cb and stated_summary["closing_balance"] is None:
             stated_summary["closing_balance"] = _parse_float_safe(m_cb.group(1))
             stated_summary["summary_found_on_page"] = stated_summary["summary_found_on_page"] or p_no
             stated_summary["grounding_evidence"]["closing_balance"] = {"page": p_no, "label": "Closing Balance"}
 
-    # 4. Discover Table Header & Dual Column Coordinates
     columns: Dict[str, Any] = {}
     amount_rep = "SEPARATE_DEBIT_CREDIT_COLUMNS"
     table_start_y = 0.0
@@ -533,7 +620,7 @@ def _deterministic_blueprint_discovery(scan_data: Dict[str, Any], smart_sample: 
                     columns.setdefault("date", col_entry)
                 elif any(k in t_low for k in ["narration", "particular", "description", "remark", "detail"]):
                     columns["narration"] = col_entry
-                elif any(k in t_low for k in ["chq", "cheque", "ref", "inst", "instrument"]):
+                elif any(k in t_low for k in ["chq", "cheque", "cho.no", "ref", "inst", "instrument"]):
                     columns["reference"] = col_entry
                 elif t_low in ("dr/cr", "cr/dr", "dr|cr", "type", "dr / cr"):
                     columns["dr_cr_flag"] = col_entry
@@ -546,12 +633,13 @@ def _deterministic_blueprint_discovery(scan_data: Dict[str, Any], smart_sample: 
                     columns["credit"] = col_entry
                 elif ("balance" in t_low or t_low in ("closing bal", "running bal")) and "opening" not in t_low:
                     columns["balance"] = col_entry
-                elif "amount" in t_low and "debit" not in columns and "credit" not in columns and not any(x in t_low for x in ["withdrawal", "withdrawl", "deposit", "debit", "credit", "balance", "dr", "cr"]):
+                elif "amount" in t_low and "debit" not in columns and "credit" not in columns and not any(
+                    x in t_low for x in ["withdrawal", "withdrawl", "deposit", "debit", "credit", "balance", "dr", "cr"]
+                ):
                     columns["single_amount"] = col_entry
                     amount_rep = "SINGLE_AMOUNT_WITH_FLAG"
             break
 
-    # 5. Synthesize missing monetary column coordinates from numeric_x_clusters on Page 1
     p1_clusters = (pages[0].get("numeric_x_clusters") or []) if pages and isinstance(pages[0], dict) else []
     p1_w = float((pages[0].get("width_points") or 595.0)) if pages and isinstance(pages[0], dict) else 595.0
     if p1_clusters:
@@ -597,7 +685,10 @@ def _deterministic_blueprint_discovery(scan_data: Dict[str, Any], smart_sample: 
             "doc_code": "BANK_STATEMENT",
             "issuing_bank": issuing_bank,
             "holder_name": holder_name,
+            "branch_name": branch_name,
+            "account_number": account_number,
             "ifsc_code": ifsc_code,
+            "customer_id": customer_id,
         },
         "stated_summary": stated_summary,
         "table_structure_blueprint": {
@@ -615,11 +706,11 @@ def _deterministic_blueprint_discovery(scan_data: Dict[str, Any], smart_sample: 
     }
 
 
-def _verify_summary_label_near_value(pages_list: List[Dict[str, Any]], label_keywords: Tuple[str, ...], cand_val: float) -> Optional[Dict[str, Any]]:
-    """
-    Strictly verifies that an LLM-proposed summary figure has an actual summary label
-    on the same page within vertical proximity, NEVER accepting a number just because it appears in a transaction row!
-    """
+def _verify_summary_label_near_value(
+    pages_list: List[Dict[str, Any]],
+    label_keywords: Tuple[str, ...],
+    cand_val: float,
+) -> Optional[Dict[str, Any]]:
     target_int = str(int(abs(cand_val)))
     for p in pages_list:
         if not isinstance(p, dict):
@@ -628,15 +719,18 @@ def _verify_summary_label_near_value(pages_list: List[Dict[str, Any]], label_key
         for idx, ln in enumerate(lines):
             ln_low = " ".join((s.get("text") or "").lower() for s in ln)
             if any(kw in ln_low for kw in label_keywords):
-                # Check a 4-line window around the label for the exact number
-                win_spans = [s for w_ln in lines[max(0, idx - 1):min(len(lines), idx + 4)] for s in w_ln]
+                win_spans = [s for w_ln in lines[max(0, idx - 1) : min(len(lines), idx + 4)] for s in w_ln]
                 win_digits = re.sub(r"[^\d]", "", " ".join(s.get("text", "") for s in win_spans))
                 if target_int in win_digits:
                     return {"page": p.get("page", 1), "label_verified": True}
     return None
 
 
-def discover_and_ground_blueprint(scan_data: Dict[str, Any], smart_sample: Dict[str, Any], use_llm: bool = True) -> Dict[str, Any]:
+def discover_and_ground_blueprint(
+    scan_data: Dict[str, Any],
+    smart_sample: Dict[str, Any],
+    use_llm: bool = True,
+) -> Dict[str, Any]:
     scan_data = scan_data or {}
     smart_sample = smart_sample or {}
     filename = os.path.basename(scan_data.get("file_path") or "")
@@ -665,7 +759,6 @@ def discover_and_ground_blueprint(scan_data: Dict[str, Any], smart_sample: Dict[
     pages_list = scan_data.get("pages") or []
     strict_pre_lines = [ln.strip().lower() for ln in safe_sample["page1_pre_table_header"].splitlines() if ln.strip()]
 
-    # 1. Ground Identity Fields from LLM
     llm_id = llm_bp.get("document_identity")
     if not isinstance(llm_id, dict):
         llm_id = {}
@@ -686,7 +779,6 @@ def discover_and_ground_blueprint(scan_data: Dict[str, Any], smart_sample: Dict[
         raw_b = llm_id.get("issuing_bank") or llm_id.get("ifsc_code")
         det_blueprint["document_identity"]["issuing_bank"] = _normalize_issuing_bank_name(raw_b, fallback_bank=det_bank)
 
-    # 2. Ground Stated Summary Figures from LLM ONLY if label-verified in PDF!
     llm_sum = llm_bp.get("stated_summary")
     if not isinstance(llm_sum, dict):
         llm_sum = {}
@@ -711,7 +803,6 @@ def discover_and_ground_blueprint(scan_data: Dict[str, Any], smart_sample: Dict[
                     if k == "opening_balance":
                         det_sum["opening_balance_source"] = "EXTRACTED_FROM_STATEMENT"
 
-    # 3. Ground Column Definitions from LLM
     llm_tb = llm_bp.get("table_structure_blueprint")
     if not isinstance(llm_tb, dict):
         llm_tb = {}

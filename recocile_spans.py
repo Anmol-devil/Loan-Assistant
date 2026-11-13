@@ -184,6 +184,8 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
 
             if any(stop_k in row_joined_lower for stop_k in [
                 "page total", "period totals", "transaction total", "cumulative total", "dr count",
+                "total transaction count", "total debit count", "total credit count",
+                "total debit amount", "total credit amount", "summary for account", "b. summary",
                 "reconciliation note", "statement summary", "end of statement", "end of the statement",
                 "--end of statement", "++++ end", "charge breakup", "recover date", "legends", "disclaimer", "closing balance as on"
             ]):
@@ -194,8 +196,17 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
 
         def is_valid_balance_span(s):
             txt = normalize_ocr_amount_str(s["text"].strip())
-            if not (abs(s["cx"] - bal_col_x) <= 75 or abs(s["bbox"][2] - bal_col_x) <= 75):
+            if not (abs(s["cx"] - bal_col_x) <= 65 or abs(s["bbox"][2] - bal_col_x) <= 65):
                 return False, None
+            # Ensure this span is closer to the 'balance' column than to 'debit', 'credit', or 'single_amount'
+            if monetary_col_keys:
+                def _c_dist(col_k):
+                    hx = header_map[col_k]
+                    return min(abs(s["cx"] - hx), abs(s["bbox"][2] - (hx + 18.0)), abs(s["bbox"][0] - (hx - 18.0)))
+                closest_k = min(monetary_col_keys, key=_c_dist)
+                if closest_k != "balance":
+                    return False, None
+
             if re.match(r"^\d{2}$", txt) and abs(s["cx"] - bal_col_x) <= 45:
                 return True, round(float("0." + txt), 2)
             if re.match(r"^\d{6,9}$", txt) and abs(s["cx"] - bal_col_x) <= 45:
@@ -271,7 +282,11 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
             block.sort(key=lambda s: (round(s["cy"], 1), s["cx"]))
             row_joined_lower = " ".join(s["text"].lower() for s in block)
 
-            if any(tot_k in row_joined_lower for tot_k in ["transaction total", "total :", "total:", "grand total", "summary", "charge breakup"]):
+            if any(tot_k in row_joined_lower for tot_k in [
+                "transaction total", "total :", "total:", "grand total", "summary", "charge breakup",
+                "total debit count", "total credit count", "total debit amount", "total credit amount",
+                "total transaction count"
+            ]):
                 continue
 
             if bool(re.search(r"\b(?:brought\s+forward|opening\s+balance|b/f)\b", row_joined_lower)) and not any(u in row_joined_lower for u in ["upi/", "imps/", "neft/", "rtgs/", "mob/"]):
@@ -368,7 +383,7 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
                 if "branch_code" in header_map and abs(s["cx"] - header_map["branch_code"]) <= 38 and "." not in txt and "," not in txt:
                     continue
 
-                if re.match(r"^\(?(?:DR|CR|CF|CH|CI)\)?$", txt, re.IGNORECASE) and ("dr_cr_col" in header_map or s["cx"] > date_x_max):
+                if re.match(r"^\(?(?:DR|CR|CF|CH|CI)\.?\)?$", txt, re.IGNORECASE) and ("dr_cr_col" in header_map or s["cx"] > date_x_max):
                     clean_flg = "DR" if "DR" in txt.upper() else "CR"
                     row_dr_cr_flags.append((s["cx"], clean_flg))
                     continue

@@ -681,14 +681,32 @@ if inspection_mode == "Single Document Audit":
             temp_path = tmp.name
 
         try:
+            try:
+                report = verify_any_file(
+                    temp_path,
+                    original_filename=uploaded_file.name
+                )
+                print("[DEBUG] AFTER verify_any_file", flush=True)
+
+            except Exception as e:
+                print("[DEBUG] PIPELINE ERROR:", repr(e), flush=True)
+                raise
+
+            print("[DEBUG] BEFORE build_module1_output", flush=True)
+
+            m1_out = build_module1_output(
+                temp_path,
+                report,
+                tenant_id=tenant_choice
+            )
+
             with st.spinner("Running 5-Stage Verification Pipeline..."):
                 report = verify_any_file(temp_path, original_filename=uploaded_file.name)
-                if suffix in (".png", ".jpg", ".jpeg"):
-                    cm_flags = detect_copy_move_forgery(temp_path)
-                    report.setdefault("forensic_flags", []).extend(cm_flags)
-
+                report["original_filename"] = uploaded_file.name
                 m1_out = build_module1_output(temp_path, report, tenant_id=tenant_choice)
+            
 
+            print("[DEBUG] AFTER build_module1_output", flush=True)   
             id_card = m1_out["identity_card"]
             fin_rec = report.get("financial_reconciliation", {})
             doc_code = fin_rec.get("document_type") or id_card.get("doc_code", "UNKNOWN_DOCUMENT")
@@ -804,32 +822,52 @@ if inspection_mode == "Single Document Audit":
 
             with col_id:
                 if doc_code == "BANK_STATEMENT":
-                    bank_disp = id_card.get("issuing_bank") or "UNKNOWN"
-                    logo_txt = bank_disp.upper() if bank_disp != "UNKNOWN" else "UNKNOWN BANK"
-                    sub_line_1 = f"Category: <b>Bank Statement</b> &nbsp;|&nbsp; Issuing Bank: <b>{html.escape(str(bank_disp))}</b>"
+                 bank_disp = id_card.get("issuing_bank") or "UNKNOWN"
+                 logo_txt = bank_disp.upper() if bank_disp != "UNKNOWN" else "UNKNOWN BANK"
+                 extra_meta = ""
+                 if id_card.get("branch_name"):
+                     extra_meta += f" &nbsp;|&nbsp; Branch: <b>{html.escape(str(id_card['branch_name']))}</b>"
+                 if id_card.get("ifsc_code"):
+                     extra_meta += f" &nbsp;|&nbsp; IFSC: <b>{html.escape(str(id_card['ifsc_code']))}</b>"
+                 if id_card.get("account_number"):
+                     extra_meta += f" &nbsp;|&nbsp; A/C: <b>{html.escape(str(id_card['account_number']))}</b>"
+                 sub_line_1 = f"Category: <b>Bank Statement</b> &nbsp;|&nbsp; Issuing Bank: <b>{html.escape(str(bank_disp))}</b>{extra_meta}"
                 elif doc_code == "PAN_CARD":
                     logo_txt = "INCOME TAX\nDEPT (PAN)"
-                    sub_line_1 = f"Category: <b>PAN Card (KYC)</b> &nbsp;|&nbsp; PAN: <b>{html.escape(str(id_card.get('pan_number') or 'N/A'))}</b>"
+                    pan_disp = fin_rec.get("pan_number") or id_card.get("pan_number") or "NOT FOUND"
+                    sub_line_1 = (
+                        f"Category: <b>PAN Card (KYC)</b> &nbsp;|&nbsp; Father's Name: <b>{html.escape(str(fin_rec.get('father_name') or 'N/A'))}</b> "
+                        f"&nbsp;|&nbsp; DOB: <b>{html.escape(str(fin_rec.get('date_of_birth') or 'N/A'))}</b>"
+                        f"<div style='margin-top:6px;'>PAN No: <span style='font-size:30px; font-weight:800; color:#1e1b4b; letter-spacing:1.5px;'>{html.escape(str(pan_disp))}</span></div>"
+                    )
                 elif doc_code == "AADHAAR_CARD":
                     logo_txt = "UIDAI\nAADHAAR"
-                    sub_line_1 = "Category: <b>Aadhaar Card (KYC)</b> &nbsp;|&nbsp; UID: <b>[Aadhaar Redacted]</b>"
+                    uid_disp = fin_rec.get("aadhaar_number_display") or id_card.get("aadhaar_number") or "N/A"
+                    father_disp = fin_rec.get("father_name") or "N/A"
+                    addr_disp = fin_rec.get("address") or "N/A"
+                    sub_line_1 = (
+                        f"Category: <b>Aadhaar Card (KYC)</b> &nbsp;|&nbsp; Father/C/O: <b>{html.escape(str(father_disp))}</b> "
+                        f"&nbsp;|&nbsp; DOB: <b>{html.escape(str(fin_rec.get('date_of_birth') or 'N/A'))}</b>"
+                        f"<div style='margin-top:6px;'>Aadhaar No: <span style='font-size:30px; font-weight:800; color:#1e1b4b; letter-spacing:2px;'>{html.escape(str(uid_disp))}</span></div>"
+                        f"<div style='font-size:12px; color:#334155; margin-top:4px;'>📍 <b>Address:</b> {html.escape(str(addr_disp))}</div>"
+                    )
                 elif doc_code == "SALARY_SLIP":
                     logo_txt = "PAYROLL\nSLIP"
                     sub_line_1 = f"Category: <b>Salary Slip</b> &nbsp;|&nbsp; Employer: <b>{html.escape(str(id_card.get('employer_name') or 'Verified Employer'))}</b>"
-                elif doc_code in ("PAN_CARD", "AADHAAR_CARD"):
-                    portrait_verdict = fin_rec.get("portrait_verification", "Genuine Human Photograph Verified")
-                    portrait_ok = fin_rec.get("audit_coverage", {}).get("human_portrait_verified", "PASSED") == "PASSED"
-                    if not portrait_ok:
-                        st.error(f"🚨 **Biometric Photo Alert:** {portrait_verdict} — This ID does NOT contain a real human photograph!")
-                    else:
-                        st.success(f"🧑 **Biometric Photo Check:** {portrait_verdict}")
                 else:
                     logo_txt = id_card.get("doc_category", "DOCUMENT")[:14].upper()
                     sub_line_1 = f"Category: <b>{html.escape(str(id_card.get('doc_category')))}</b> &nbsp;|&nbsp; PAN: <b>{html.escape(str(id_card.get('pan_number') or 'N/A'))}</b>"
 
+                portrait_b64 = fin_rec.get("portrait_base64")
+                portrait_html = (
+                    f'<img src="data:image/png;base64,{portrait_b64}" '
+                    f'style="width:78px; height:92px; object-fit:cover; border-radius:10px; border:2px solid #6366f1;" />'
+                    if portrait_b64 and doc_code in ("PAN_CARD", "AADHAAR_CARD")
+                    else f'<div class="entity-logo-box">{html.escape(logo_txt)}</div>'
+                )
                 st.markdown(f"""
                 <div class="entity-box">
-                    <div class="entity-logo-box">{html.escape(logo_txt)}</div>
+                    {portrait_html}
                     <div>
                         <div class="entity-main-title">{html.escape(id_card.get('identity_badge', 'Identified Document'))}</div>
                         <div class="entity-meta-line">{sub_line_1}</div>
@@ -837,6 +875,7 @@ if inspection_mode == "Single Document Audit":
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
+
 
             with col_tri:
                 band = m1_out["triage_band"]
@@ -1120,9 +1159,7 @@ if inspection_mode == "Single Document Audit":
                     st.success("✓ Zero structured anomaly findings generated.")
 
             with tab_breakdown:
-                # --------------------------------------------------------------
                 # DOCUMENT-AWARE DATA TAB: NO TRANSACTION LEDGER FOR PAN/AADHAAR
-                # --------------------------------------------------------------
                 if doc_code == "BANK_STATEMENT":
                     render_html_table(
                         fin_rec.get("transactions", []),
@@ -1150,10 +1187,14 @@ if inspection_mode == "Single Document Audit":
                 elif doc_code == "AADHAAR_CARD":
                     kyc_rows = [
                         {"Attribute": "Document Type", "Extracted Value": "Aadhaar Card (UIDAI)"},
-                        {"Attribute": "Card Holder Name", "Extracted Value": id_card.get("holder_name", "Unknown Holder")},
+                        {"Attribute": "Card Holder Name", "Extracted Value": fin_rec.get("legal_name") or id_card.get("holder_name", "Unknown Holder")},
+                        {"Attribute": "Date of Birth / YOB", "Extracted Value": fin_rec.get("date_of_birth") or "N/A"},
+                        {"Attribute": "Gender", "Extracted Value": fin_rec.get("gender") or "N/A"},
+                        {"Attribute": "Father / Care-Of Name", "Extracted Value": fin_rec.get("father_name") or "N/A (Front View)"},
+                        {"Attribute": "Address", "Extracted Value": fin_rec.get("address") or "N/A (Front View)"},
+                        {"Attribute": "Aadhaar Issued Date", "Extracted Value": fin_rec.get("issue_date") or "N/A"},
                         {"Attribute": "Aadhaar Number", "Extracted Value": "[Aadhaar Redacted] (Strict Privacy Masking)"},
                         {"Attribute": "Biometric Portrait Check", "Extracted Value": fin_rec.get("portrait_verification", "Genuine Human Photograph Verified")},
-                        {"Attribute": "Transaction Ledger Layer", "Extracted Value": "Not Applicable (Identity Document)"},
                     ]
                     render_html_table(kyc_rows)
                 elif doc_code == "SALARY_SLIP":
@@ -1228,67 +1269,296 @@ if inspection_mode == "Single Document Audit":
             </div>
             """, unsafe_allow_html=True)
 
-# ==============================================================================
 # MODE 2: MULTI-DOCUMENT PACK CROSS-CHECK (FAMILY D)
-# ==============================================================================
 else:
     st.markdown("#### 📁 Multi-Document Application Pack Identifier & Verifier (Family D)")
-    col_u1, col_u2, col_u3 = st.columns(3)
-    with col_u1:
-        f_stmt = st.file_uploader("Upload Primary Document (e.g. Bank Statement)", type=["pdf", "png", "jpg", "docx"], key="u1")
-    with col_u2:
-        f_slip = st.file_uploader("Upload Secondary Document (e.g. Salary Slip / GST)", type=["pdf", "png", "jpg", "docx"], key="u2")
-    with col_u3:
-        f_pan = st.file_uploader("Upload KYC Document (e.g. PAN / ITR)", type=["pdf", "png", "jpg", "docx"], key="u3")
+    st.caption("Upload any 2 to 4 loan application documents (Bank Statement, PAN Card, Aadhaar Card, Salary Slip, GST, Udyam, ITR) to run cross-document KYC & financial consistency checks.")
 
-    if st.button("🚀 Identify All Documents & Run Cross-Check", type="primary"):
-        uploaded_list = [f for f in (f_stmt, f_slip, f_pan) if f is not None]
+    col_u1, col_u2, col_u3, col_u4 = st.columns(4)
+    with col_u1:
+        f_doc1 = st.file_uploader("Document 1 (e.g. Bank Statement)", type=["pdf", "png", "jpg", "jpeg", "docx"], key="u1")
+    with col_u2:
+        f_doc2 = st.file_uploader("Document 2 (e.g. PAN Card)", type=["pdf", "png", "jpg", "jpeg", "docx"], key="u2")
+    with col_u3:
+        f_doc3 = st.file_uploader("Document 3 (e.g. Aadhaar Card)", type=["pdf", "png", "jpg", "jpeg", "docx"], key="u3")
+    with col_u4:
+        f_doc4 = st.file_uploader("Document 4 (e.g. GST / Udyam / Salary Slip)", type=["pdf", "png", "jpg", "jpeg", "docx"], key="u4")
+
+    def _normalize_name_tokens(name_str: str) -> set[str]:
+        if not name_str:
+            return set()
+        stop_w = {
+            "mr", "mrs", "ms", "shri", "smt", "kumari", "dr", "m/s", "ms", "prop",
+            "proprietor", "unknown", "holder", "verified", "enterprises", "traders",
+            "services", "private", "limited", "pvt", "ltd", "llp", "and", "sons", "co"
+        }
+        tokens = re.findall(r"[a-z]{2,}", str(name_str).lower())
+        return {t for t in tokens if t not in stop_w}
+
+    def _names_match_fuzzy(n1: str, n2: str) -> bool:
+        t1 = _normalize_name_tokens(n1)
+        t2 = _normalize_name_tokens(n2)
+        if not t1 or not t2:
+            return True
+        if t1 == t2 or t1.issubset(t2) or t2.issubset(t1):
+            return True
+        overlap = len(t1 & t2)
+        return overlap >= max(1, min(len(t1), len(t2)) - 1) and overlap >= 1
+
+    def run_comprehensive_family_d_checks(results_list: list) -> dict:
+        checks = []
+        mismatches = []
+        warnings = []
+
+        by_code = {}
+        for fname, rep, m1 in results_list:
+            d_code = m1["identity_card"].get("doc_code") or rep.get("financial_reconciliation", {}).get("document_type", "UNKNOWN_DOCUMENT")
+            by_code.setdefault(d_code, []).append((fname, rep, m1))
+
+        pan_docs = by_code.get("PAN_CARD", [])
+        aadhaar_docs = by_code.get("AADHAAR_CARD", [])
+        bank_docs = by_code.get("BANK_STATEMENT", [])
+        slip_docs = by_code.get("SALARY_SLIP", [])
+        gst_docs = by_code.get("GST_CERTIFICATE", [])
+        udyam_docs = by_code.get("UDYAM_CERTIFICATE", [])
+        itr_docs = by_code.get("ITR_DOCUMENT", [])
+
+        # 1. Cross-Check Personal KYC Holder Name: PAN Card vs. Aadhaar Card
+        if pan_docs and aadhaar_docs:
+            p_fn, p_rep, p_m1 = pan_docs[0]
+            a_fn, a_rep, a_m1 = aadhaar_docs[0]
+            p_name = p_rep.get("financial_reconciliation", {}).get("legal_name") or p_m1["identity_card"].get("holder_name", "Unknown")
+            a_name = a_rep.get("financial_reconciliation", {}).get("legal_name") or a_m1["identity_card"].get("holder_name", "Unknown")
+
+            if _names_match_fuzzy(p_name, a_name):
+                checks.append({
+                    "Cross-Check": "PAN vs. Aadhaar Holder Name",
+                    "Documents": f"{p_fn} ↔ {a_fn}",
+                    "Comparison": f"'{p_name}' ↔ '{a_name}'",
+                    "Status": "PASSED",
+                })
+            else:
+                msg = f"KYC Identity Mismatch: PAN Card belongs to '{p_name}' ({p_fn}), whereas Aadhaar Card belongs to '{a_name}' ({a_fn})."
+                mismatches.append(msg)
+                checks.append({
+                    "Cross-Check": "PAN vs. Aadhaar Holder Name",
+                    "Documents": f"{p_fn} ↔ {a_fn}",
+                    "Comparison": f"'{p_name}' ≠ '{a_name}'",
+                    "Status": "FAILED",
+                })
+
+            # 2. Cross-Check Date of Birth: PAN Card DOB vs. Aadhaar Card DOB
+            p_dob = p_rep.get("financial_reconciliation", {}).get("date_of_birth")
+            a_dob = a_rep.get("financial_reconciliation", {}).get("date_of_birth")
+            if p_dob and a_dob:
+                p_dob_norm = re.sub(r"[^\d]", "", str(p_dob))
+                a_dob_norm = re.sub(r"[^\d]", "", str(a_dob))
+                dob_ok = (p_dob_norm == a_dob_norm) or (len(a_dob_norm) == 4 and p_dob_norm.endswith(a_dob_norm))
+                if dob_ok:
+                    checks.append({
+                        "Cross-Check": "PAN vs. Aadhaar Date of Birth",
+                        "Documents": f"{p_fn} ↔ {a_fn}",
+                        "Comparison": f"DOB '{p_dob}' ↔ '{a_dob}'",
+                        "Status": "PASSED",
+                    })
+                else:
+                    msg = f"KYC Date of Birth Mismatch: PAN Card shows DOB '{p_dob}' ({p_fn}), but Aadhaar Card shows DOB '{a_dob}' ({a_fn})."
+                    mismatches.append(msg)
+                    checks.append({
+                        "Cross-Check": "PAN vs. Aadhaar Date of Birth",
+                        "Documents": f"{p_fn} ↔ {a_fn}",
+                        "Comparison": f"DOB '{p_dob}' ≠ '{a_dob}'",
+                        "Status": "FAILED",
+                    })
+
+        # 3. Cross-Check 10-Char PAN Number Across All Documents Carrying a PAN
+        extracted_pans = []
+        for fname, rep, m1 in results_list:
+            f_rec = rep.get("financial_reconciliation", {})
+            p_val = f_rec.get("pan_number") or f_rec.get("embedded_pan") or m1["identity_card"].get("pan_number")
+            if p_val and len(str(p_val).strip()) == 10:
+                extracted_pans.append((fname, m1["identity_card"].get("doc_category", "Document"), str(p_val).strip().upper()))
+
+        if len(extracted_pans) >= 2:
+            unique_pans = {p for _, _, p in extracted_pans}
+            pan_summary_str = ", ".join(f"{cat}: {p}" for _, cat, p in extracted_pans)
+            if len(unique_pans) == 1:
+                checks.append({
+                    "Cross-Check": "10-Character PAN Consistency",
+                    "Documents": f"{len(extracted_pans)} Documents",
+                    "Comparison": pan_summary_str,
+                    "Status": "PASSED",
+                })
+            else:
+                msg = f"Cross-Document PAN Mismatch: Conflicting PAN numbers detected across pack ({pan_summary_str})."
+                mismatches.append(msg)
+                checks.append({
+                    "Cross-Check": "10-Character PAN Consistency",
+                    "Documents": f"{len(extracted_pans)} Documents",
+                    "Comparison": pan_summary_str,
+                    "Status": "FAILED",
+                })
+
+        # 4. Cross-Check Bank Statement Entity vs. KYC / Business Documents
+        if bank_docs:
+            b_fn, b_rep, b_m1 = bank_docs[0]
+            b_holder = b_m1["identity_card"].get("holder_name", "Unknown Holder")
+            b_txs = b_rep.get("financial_reconciliation", {}).get("transactions", [])
+            b_full_narration = " ".join((t.get("description") or "") for t in b_txs).lower()
+            is_business_acct = bool(re.search(r"\b(?:M/S|ENTERPRISES|TRADERS|SERVICES|PRIVATE|LIMITED|PVT|LTD|LLP|SONS|INDUSTRIES|CORPORATION)\b", b_holder, re.I))
+
+            # Compare against GST / Udyam business name if uploaded
+            for bus_fn, bus_rep, bus_m1 in (gst_docs + udyam_docs):
+                bus_name = bus_m1["identity_card"].get("holder_name", "Unknown")
+                if _names_match_fuzzy(b_holder, bus_name):
+                    checks.append({
+                        "Cross-Check": "Bank Account vs. Business Registration",
+                        "Documents": f"{b_fn} ↔ {bus_fn}",
+                        "Comparison": f"'{b_holder}' ↔ '{bus_name}'",
+                        "Status": "PASSED",
+                    })
+                else:
+                    msg = f"Business Entity Mismatch: Bank Statement is for '{b_holder}', while {bus_m1['identity_card'].get('doc_category')} is for '{bus_name}'."
+                    mismatches.append(msg)
+                    checks.append({
+                        "Cross-Check": "Bank Account vs. Business Registration",
+                        "Documents": f"{b_fn} ↔ {bus_fn}",
+                        "Comparison": f"'{b_holder}' ≠ '{bus_name}'",
+                        "Status": "FAILED",
+                    })
+
+            # Compare Bank Statement against Personal KYC (PAN / Aadhaar)
+            for kyc_fn, kyc_rep, kyc_m1 in (pan_docs + aadhaar_docs):
+                kyc_name = kyc_rep.get("financial_reconciliation", {}).get("legal_name") or kyc_m1["identity_card"].get("holder_name", "Unknown")
+                kyc_cat = kyc_m1["identity_card"].get("doc_category", "KYC ID")
+                if not is_business_acct:
+                    if _names_match_fuzzy(b_holder, kyc_name):
+                        checks.append({
+                            "Cross-Check": f"Bank Account Holder vs. {kyc_cat}",
+                            "Documents": f"{b_fn} ↔ {kyc_fn}",
+                            "Comparison": f"'{b_holder}' ↔ '{kyc_name}'",
+                            "Status": "PASSED",
+                        })
+                    else:
+                        msg = f"Account Holder vs. {kyc_cat} Mismatch: Bank account belongs to '{b_holder}', whereas {kyc_cat} belongs to '{kyc_name}'."
+                        mismatches.append(msg)
+                        checks.append({
+                            "Cross-Check": f"Bank Account Holder vs. {kyc_cat}",
+                            "Documents": f"{b_fn} ↔ {kyc_fn}",
+                            "Comparison": f"'{b_holder}' ≠ '{kyc_name}'",
+                            "Status": "FAILED",
+                        })
+                else:
+                    kyc_tokens = _normalize_name_tokens(kyc_name)
+                    in_narration = any(tok in b_full_narration for tok in kyc_tokens if len(tok) >= 4)
+                    co_app_hint = any(k in kyc_fn.lower() for k in ("co app", "co_app", "prop", b_holder.lower()[:6]))
+                    status_lbl = "PASSED" if (in_narration or co_app_hint) else "REVIEW"
+                    comp_note = f"Business A/C '{b_holder}' ↔ Proprietor/Co-Applicant '{kyc_name}'"
+                    if status_lbl == "REVIEW":
+                        warnings.append(
+                            f"Proprietor / Co-Applicant Linkage Notice: Bank Statement is in business name '{b_holder}' while {kyc_cat} is for individual '{kyc_name}' — verify proprietorship/partnership deed."
+                        )
+                    checks.append({
+                        "Cross-Check": f"Business Bank A/C vs. Individual {kyc_cat}",
+                        "Documents": f"{b_fn} ↔ {kyc_fn}",
+                        "Comparison": comp_note,
+                        "Status": "PASSED" if status_lbl == "PASSED" else "NEEDS_REVIEW",
+                    })
+
+        # 5. Roll up individual document biometric or forensic failures
+        for fname, rep, m1 in results_list:
+            f_rec = rep.get("financial_reconciliation", {})
+            cov = f_rec.get("audit_coverage", {})
+            if cov.get("human_portrait_verified") == "FAILED":
+                msg = f"Biometric Portrait Alert on {fname}: {f_rec.get('portrait_verification', 'Non-human / spoof portrait detected')}."
+                mismatches.append(msg)
+                checks.append({
+                    "Cross-Check": "KYC Biometric Portrait Integrity",
+                    "Documents": fname,
+                    "Comparison": f_rec.get("portrait_verification", "FAILED"),
+                    "Status": "FAILED",
+                })
+            elif m1.get("triage_band") == "high_risk":
+                msg = f"High-Risk Document Alert on {fname}: Document scored {m1.get('overall_document_risk_score', 0):.2f} risk ({len(m1.get('structured_findings', []))} finding(s))."
+                mismatches.append(msg)
+                checks.append({
+                    "Cross-Check": "Individual Document Integrity Gate",
+                    "Documents": fname,
+                    "Comparison": f"Triage: HIGH RISK ({int(m1.get('overall_document_risk_score', 0)*100)}%)",
+                    "Status": "FAILED",
+                })
+
+        status = "MISMATCH_DETECTED" if mismatches else ("REVIEW_REQUIRED" if warnings else "NO_MISMATCH_FOUND")
+        return {
+            "status": status,
+            "checks": checks,
+            "findings": mismatches + warnings if (mismatches or warnings) else ["All uploaded documents passed Family D cross-document verification."],
+            "mismatches": mismatches,
+            "warnings": warnings,
+        }
+
+    if st.button("🚀 Identify All Documents & Run Family D Cross-Check", type="primary"):
+        uploaded_list = [f for f in (f_doc1, f_doc2, f_doc3, f_doc4) if f is not None]
         if len(uploaded_list) < 2:
             st.error("Please upload at least 2 documents to run Family D Cross-Document verification.")
         else:
             temp_paths = []
             results = []
             try:
-                with st.spinner("Analyzing uploaded pack and running cross-reconciliation..."):
+                with st.spinner("Analyzing uploaded pack and running Family D cross-reconciliation..."):
                     for uf in uploaded_list:
                         ext = os.path.splitext(uf.name)[1].lower()
                         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as t:
                             t.write(uf.getbuffer())
                             temp_paths.append(t.name)
-                            rep = verify_any_file(t.name, original_filename=uf.name)
+                            rep = verify_any_file(t.name, original_filename=uf.name, use_llm=False)
+                            rep["original_filename"] = uf.name
                             m1 = build_module1_output(t.name, rep, tenant_id=tenant_choice)
                             results.append((uf.name, rep, m1))
 
-                stmt_m1 = next((m1 for _, _, m1 in results if m1["identity_card"]["doc_code"] == "BANK_STATEMENT"), results[0][2])
-                slip_m1 = next((m1 for _, _, m1 in results if m1["identity_card"]["doc_code"] == "SALARY_SLIP"), None)
-                pan_m1 = next((m1 for _, _, m1 in results if m1["identity_card"]["doc_code"] == "PAN_CARD"), None)
+                # Render Summary Cards for each uploaded document in the pack
+                st.markdown("##### 📋 Uploaded Application Pack Summary")
+                pack_cols = st.columns(len(results))
+                for idx_c, (fname, rep, m1) in enumerate(results):
+                    ic = m1["identity_card"]
+                    fr = rep.get("financial_reconciliation", {})
+                    d_code = fr.get("document_type") or ic.get("doc_code", "UNKNOWN")
+                    with pack_cols[idx_c]:
+                        extra_line = ""
+                        if d_code == "BANK_STATEMENT":
+                            extra_line = f"Bank: <b>{html.escape(str(ic.get('issuing_bank') or 'UNKNOWN'))}</b><br>Closing: <b>₹ {fr.get('closing_balance', 0):,.2f}</b>"
+                        elif d_code == "PAN_CARD":
+                            extra_line = f"PAN: <b>{html.escape(str(fr.get('pan_number') or ic.get('pan_number') or 'N/A'))}</b><br>DOB: <b>{html.escape(str(fr.get('date_of_birth') or 'N/A'))}</b>"
+                        elif d_code == "AADHAAR_CARD":
+                            extra_line = f"UID: <b>[Aadhaar Redacted]</b><br>DOB: <b>{html.escape(str(fr.get('date_of_birth') or 'N/A'))}</b>"
+                        else:
+                            extra_line = f"Status: <b>{html.escape(str(fr.get('status', 'VERIFIED')))}</b>"
 
-                if slip_m1:
-                    detected_pan = (pan_m1["identity_card"]["pan_number"] if pan_m1 else None) or slip_m1["identity_card"]["pan_number"] or stmt_m1["identity_card"]["pan_number"] or "ABCDE1234P"
-                    detected_emp = slip_m1["identity_card"]["employer_name"] or "Verified Employer"
-                    stmt_data = {
-                        "account_holder": stmt_m1["identity_card"]["holder_name"],
-                        "transactions": stmt_m1["extracted_financials"].get("transactions", [])
-                    }
-                    slip_data = {
-                        "employee_name": slip_m1["identity_card"]["holder_name"],
-                        "employer_name": detected_emp,
-                        "net_pay": slip_m1["extracted_financials"].get("net_pay")
-                    }
-                    app_data = {
-                        "applicant_name": stmt_m1["identity_card"]["holder_name"],
-                        "pan": detected_pan,
-                        "monthly_income": slip_m1["extracted_financials"].get("net_pay") or 0.0
-                    }
-                    cross_rep = verify_application_pack(stmt_data, slip_data, app_data)
-                else:
-                    cross_rep = {"status": "NO_MISMATCH_FOUND", "findings": ["Identity pack evaluated cleanly."]}
+                        st.markdown(f"""
+                        <div class="saas-card" style="margin-bottom:12px;">
+                            <div style="font-size:11px; font-weight:700; color:#4f46e5;">{html.escape(str(ic.get('doc_category', 'Document')).upper())}</div>
+                            <div style="font-size:14px; font-weight:800; color:#0f172a; margin:3px 0;">{html.escape(str(ic.get('holder_name', 'Unknown Holder')))}</div>
+                            <div style="font-size:12px; color:#475569;">{extra_line}</div>
+                            <div style="font-size:11px; color:#64748b; margin-top:4px;">📄 {html.escape(fname)}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                cross_rep = run_comprehensive_family_d_checks(results)
+
+                st.markdown("##### 🛡️ Family D Cross-Document Verification Matrix")
+                if cross_rep.get("checks"):
+                    render_html_table(cross_rep["checks"])
 
                 if cross_rep["status"] == "NO_MISMATCH_FOUND":
-                    st.success("✅ All uploaded documents belong to the same applicant/entity and cross-reconcile!")
+                    st.success("✅ Family D PASSED: All uploaded documents belong to the same applicant/entity and cross-reconcile cleanly!")
+                elif cross_rep["status"] == "REVIEW_REQUIRED":
+                    for w_msg in cross_rep.get("warnings", []):
+                        st.warning(f"⚠️ {w_msg}")
                 else:
-                    for finding in cross_rep.get("findings", []):
-                        st.error(f"🚨 {finding}")
+                    for m_msg in cross_rep.get("mismatches", []):
+                        st.error(f"🚨 {m_msg}")
+                    for w_msg in cross_rep.get("warnings", []):
+                        st.warning(f"⚠️ {w_msg}")
 
                 with st.expander("View Complete Module 1 Multi-Document JSON Payload"):
                     st.json({

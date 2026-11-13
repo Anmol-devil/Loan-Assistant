@@ -3,7 +3,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from .structural_scanner import DATE_TOKEN_RE
 
 INLINE_DEC_RE = re.compile(
-    r"(?<![A-Za-z0-9\./\-])([+-]?(?:\d{1,3}(?:,\d{2,3})+|\d{1,9})[\.,:\-]\d{2}(?:\s*\(?[CD]r\)?)?)(?![A-Za-z0-9\./\-])",
+    r"(?<![A-Za-z0-9\./\-])([+-]?(?:\d{1,3}(?:,\d{2,3})+|\d{1,9})[\.,:\-]\d{2}(?:\s*\(?[CD]r\.?\)?)?)(?![A-Za-z0-9\./\-])",
     re.I,
 )
 
@@ -17,6 +17,13 @@ PAGE_LOCAL_STOP_MARKERS = (
     "cumulative total",
     "transaction total",
     "statement summary",
+    "summary for account",
+    "b. summary",
+    "total transaction count",
+    "total debit count",
+    "total credit count",
+    "total debit amount",
+    "total credit amount",
     "charge breakup",
     "end of statement",
     "++++ end",
@@ -35,6 +42,12 @@ NON_TX_ROW_MARKERS = (
     "cumulative total",
     "transaction total",
     "statement summary",
+    "summary for account",
+    "total transaction count",
+    "total debit count",
+    "total credit count",
+    "total debit amount",
+    "total credit amount",
     "closing balance",
     "carried forward",
     "c/f",
@@ -65,7 +78,11 @@ def _parse_monetary_token(text: str) -> Tuple[Optional[float], Optional[str]]:
     if (DATE_TOKEN_RE.match(s) and len(s) <= 12) or TIME_TOKEN_RE.match(s):
         return None, None
     s_clean = re.sub(r"(?:INR|Rs\.?|₹|\$|\s)", "", s, flags=re.I)
-    m = re.match(r"^([+-]?(?:\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d{1,2})?|\.\d{2})(?:\(?([CD]r)\)?)?([+-])?$", s_clean, re.I)
+    m = re.match(
+        r"^([+-]?(?:\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d{1,2})?|\.\d{2})(?:\(?([CD]r)\.?\)?)?([+-])?$",
+        s_clean,
+        re.I,
+    )
     if not m:
         return None, None
     num_part = m.group(1).replace(",", "")
@@ -81,8 +98,12 @@ def _parse_monetary_token(text: str) -> Tuple[Optional[float], Optional[str]]:
 def _is_left_date_span(sp: Dict[str, Any]) -> bool:
     if not isinstance(sp, dict):
         return False
+    txt = (sp.get("text") or "").strip()
+    # Ignore date-range strings inside narration like '1-05-2024to29-06-2024'
+    if re.search(r"\d{2,4}\s*to\s*\d{1,2}", txt, re.I):
+        return False
     return (sp.get("cx_norm", 1.0) <= 0.38 or (sp.get("bbox_norm") or [1.0])[0] <= 0.28) and bool(
-        DATE_TOKEN_RE.match((sp.get("text") or "").strip())
+        DATE_TOKEN_RE.match(txt)
     )
 
 
@@ -119,7 +140,10 @@ def _adapt_columns_to_page(
         for k_off in range(1, 5):
             if h_idx + k_off < len(lines):
                 nxt = lines[h_idx + k_off]
-                if any(DATE_TOKEN_RE.match(s.get("text", "")) or re.search(r"\d+\.\d{2}", s.get("text", "")) for s in nxt):
+                if any(
+                    DATE_TOKEN_RE.match(s.get("text", "")) or re.search(r"\d+\.\d{2}", s.get("text", ""))
+                    for s in nxt
+                ):
                     break
                 hdr_spans.extend(nxt)
         for s in hdr_spans:
@@ -168,7 +192,11 @@ def _extract_inline_summary_from_line(joined_low: str, stated_sum_dict: Dict[str
         if v is not None and v >= 0:
             stated_sum_dict["total_credits"] = abs(v)
 
-    m_cb = re.search(r"closing\s+bal(?:ance)?(?!\s+figure|\s+includes)\s*[:\-]\s*([+-]?[\d,]+\.\d{2}(?:\s*\(?[cd]r\)?)?)", joined_low, re.I)
+    m_cb = re.search(
+        r"closing\s+bal(?:ance)?(?!\s+figure|\s+includes)\s*[:\-]\s*([+-]?[\d,]+\.\d{2}(?:\s*\(?[cd]r\)?)?)",
+        joined_low,
+        re.I,
+    )
     if m_cb and stated_sum_dict.get("closing_balance") is None:
         v, ind = _parse_monetary_token(m_cb.group(1))
         if v is not None:
@@ -221,6 +249,9 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
     total_numeric_spans = 0
     total_candidate_balances = 0
 
+    # Keep all monetary numbers found on each page (including orphan sub-lines) for post-reversal delta healing
+    page_all_numbers: Dict[int, List[Tuple[float, float]]] = {}
+
     for page_obj in pages_list:
         if not isinstance(page_obj, dict):
             continue
@@ -230,6 +261,20 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
             page_obj, base_deb_cx, base_cred_cx, base_bal_cx, base_bal_x1
         )
 
+        # Record all monetary numbers on this page for boundary healing
+        p_nums: List[Tuple[float, float]] = []
+        for sp in page_obj.get("spans") or []:
+            txt_s = (sp.get("text") or "").strip()
+            v_s, _ = _parse_monetary_token(txt_s)
+            if v_s is not None and ("." in _clean_ocr_number(txt_s) or "," in txt_s):
+                p_nums.append((float(sp.get("cy_points", 0.0)), abs(v_s)))
+            else:
+                for m_in in INLINE_DEC_RE.finditer(txt_s):
+                    v_in, _ = _parse_monetary_token(m_in.group(1))
+                    if v_in is not None:
+                        p_nums.append((float(sp.get("cy_points", 0.0)), abs(v_in)))
+        page_all_numbers[p_num] = p_nums
+
         lines = page_obj.get("lines") or []
         h_idx = page_obj.get("header_line_idx")
 
@@ -237,15 +282,19 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
         for idx_l, ln in enumerate(lines):
             if any(_is_left_date_span(sp) for sp in ln):
                 ln_low = " ".join((s.get("text") or "").lower() for s in ln)
-                if any(hdr_k in ln_low for hdr_k in ("from:", "to:", "from date", "to date", "open date", "a/c open", "generated on", "period:")):
+                if any(
+                    hdr_k in ln_low
+                    for hdr_k in ("from:", "to:", "from date", "to date", "open date", "a/c open", "generated on", "period:")
+                ):
                     continue
                 first_dated_idx = idx_l
                 break
 
-        if h_idx is not None and (first_dated_idx is None or h_idx < first_dated_idx):
+        # On Page 1 (or pages with a repeated table header), start right after the table header.
+        # On continuation pages without a table header (h_idx is None), start at line 0 so we NEVER
+        # slice off a top-of-page balance line whose date sits on the sub-line below it!
+        if h_idx is not None:
             start_line = h_idx + 1
-        elif first_dated_idx is not None:
-            start_line = first_dated_idx
         else:
             start_line = 0
 
@@ -255,11 +304,19 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
         for ln in lines[start_line:]:
             if not ln:
                 continue
-            if p_num == 1 and table_start_y > 0 and first_dated_idx is None and max(s["bbox_points"][1] for s in ln) < table_start_y - 2.0:
+            if (
+                p_num == 1
+                and table_start_y > 0
+                and h_idx is None
+                and max(s["bbox_points"][1] for s in ln) < table_start_y - 2.0
+            ):
                 continue
             joined_low = " ".join((s.get("text") or "").lower() for s in ln).strip()
 
-            if any(k in joined_low for k in ("opening balance", "total withdrawal", "total deposit", "total debit", "total credit", "closing bal")):
+            if any(
+                k in joined_low
+                for k in ("opening balance", "total withdrawal", "total deposit", "total debit", "total credit", "closing bal")
+            ):
                 _extract_inline_summary_from_line(joined_low, stated_sum_dict)
 
             if any(sm in joined_low for sm in PAGE_LOCAL_STOP_MARKERS):
@@ -274,27 +331,43 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
                     continue
                 in_summary_section = False
 
-            if any(ign in joined_low for ign in [
-                "page no.:", "we understand your world", "closing balance includes funds",
-                "contents of this statement", "registered office address:", "state account branch gstn",
-                "statement of account", "computer generated", "system generated", "printed by",
-                "od limit", "account branch", "cust id", "a/c open date", "yes touch phonebanking",
-                "cin l65190", "email us at", "sms \"help\""
-            ]):
+            if any(
+                ign in joined_low
+                for ign in [
+                    "page no.:", "we understand your world", "closing balance includes funds",
+                    "contents of this statement", "registered office address:", "state account branch gstn",
+                    "statement of account", "computer generated", "system generated", "printed by",
+                    "od limit", "account branch", "cust id", "a/c open date", "yes touch phonebanking",
+                    "cin l65190", "email us at", "sms \"help\""
+                ]
+            ):
                 continue
 
-            # Skip wrapped table header fragment lines on continuation pages
             if not any(re.search(r"\d+\.\d{2}", s.get("text", "")) for s in ln):
                 if (
-                    any(h_w in joined_low for h_w in (
-                        "transactio", "n date", "value date", "transaction remarks", "withdrawl",
-                        "amt (inr)", "balance (in", "cheque no/reference"
-                    ))
+                    any(
+                        h_w in joined_low
+                        for h_w in (
+                            "transactio", "n date", "value date", "transaction remarks", "withdrawl",
+                            "amt (inr)", "balance (in", "cheque no/reference"
+                        )
+                    )
                     or joined_low in ("r)", "n", "id", "inr)")
                 ) and not any(_is_left_date_span(s) for s in ln):
                     continue
 
             body_lines.append(ln)
+
+        def is_strictly_balance_col_span(sp: Dict[str, Any]) -> bool:
+            cx_n = float(sp.get("cx_norm", 0.0))
+            x1_n = float((sp.get("bbox_norm") or [0, 0, 0, 0])[2])
+            dist_bal = min(abs(cx_n - bal_cx_norm), abs(x1_n - bal_x1_norm))
+            dist_deb = abs(cx_n - deb_cx_norm) if deb_cx_norm else 9.0
+            dist_cred = abs(cx_n - cred_cx_norm) if cred_cx_norm else 9.0
+
+            if dist_bal > min(dist_deb, dist_cred) + 0.015 and x1_n < bal_x1_norm - 0.04:
+                return False
+            return dist_bal <= 0.10 or x1_n >= max(0.84, bal_x1_norm - 0.05)
 
         def get_line_balance_spans(ln_spans: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             joined_l = " ".join((s.get("text") or "").lower() for s in ln_spans)
@@ -305,9 +378,9 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
                 txt_sp = sp.get("text") or ""
                 val, _ = _parse_monetary_token(txt_sp)
                 if val is not None and ("." in _clean_ocr_number(txt_sp) or "," in txt_sp):
-                    if abs(sp["cx_norm"] - bal_cx_norm) <= 0.12 or abs(sp["bbox_norm"][2] - bal_x1_norm) <= 0.12 or sp["bbox_norm"][2] >= 0.82:
+                    if is_strictly_balance_col_span(sp):
                         b_spans.append(sp)
-                elif INLINE_DEC_RE.search(txt_sp) and sp["bbox_norm"][2] >= 0.80:
+                elif INLINE_DEC_RE.search(txt_sp) and sp["bbox_norm"][2] >= max(0.84, bal_x1_norm - 0.05):
                     b_spans.append(sp)
             return b_spans
 
@@ -332,23 +405,29 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
         page_candidate_balances = sum(len(get_line_balance_spans(ln)) for ln in body_lines)
         total_candidate_balances += page_candidate_balances
 
-        def line_is_bf_or_dated_anchor(ln_spans: List[Dict[str, Any]]) -> bool:
-            joined_l = " ".join((s.get("text") or "").lower() for s in ln_spans)
-            if any(sm in joined_l for sm in NON_TX_ROW_MARKERS):
-                return False
-            if any(k in joined_l for k in ["opening balance", "brought forward", "b/f"]):
-                return True
-            if len(get_line_balance_spans(ln_spans)) > 0:
-                return True
-            has_left_date = any(_is_left_date_span(sp) for sp in ln_spans)
-            has_dec = any(
-                (_parse_monetary_token(sp.get("text") or "")[0] is not None and "." in _clean_ocr_number(sp.get("text") or ""))
-                or bool(INLINE_DEC_RE.search(sp.get("text") or ""))
-                for sp in ln_spans
-            )
-            return has_left_date and has_dec
+        bal_anchor_idxs = [
+            i for i, ln in enumerate(body_lines)
+            if len(get_line_balance_spans(ln)) > 0
+            or any(k in " ".join((s.get("text") or "").lower() for s in ln) for k in ("opening balance", "brought forward", "b/f"))
+        ]
 
-        anchor_idxs = [i for i, ln in enumerate(body_lines) if line_is_bf_or_dated_anchor(ln)]
+        if len(bal_anchor_idxs) >= 1:
+            anchor_idxs = bal_anchor_idxs
+        else:
+            def fallback_dated_anchor(ln_spans: List[Dict[str, Any]]) -> bool:
+                joined_l = " ".join((s.get("text") or "").lower() for s in ln_spans)
+                if any(sm in joined_l for sm in NON_TX_ROW_MARKERS):
+                    return False
+                has_left_date = any(_is_left_date_span(sp) for sp in ln_spans)
+                has_dec = any(
+                    (_parse_monetary_token(sp.get("text") or "")[0] is not None and "." in _clean_ocr_number(sp.get("text") or ""))
+                    or bool(INLINE_DEC_RE.search(sp.get("text") or ""))
+                    for sp in ln_spans
+                )
+                return has_left_date and has_dec
+
+            anchor_idxs = [i for i, ln in enumerate(body_lines) if fallback_dated_anchor(ln)]
+
         if not anchor_idxs:
             per_page_stats.append({
                 "page": p_num,
@@ -362,6 +441,23 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
             sum(s["cy_points"] for s in body_lines[a_i]) / len(body_lines[a_i])
             for a_i in anchor_idxs
         ]
+
+        # Determine if Date + Debit/Credit sits on a sub-line BELOW the Balance anchor (PNB layout)
+        # or ABOVE the Balance anchor.
+        anchors_with_dates = sum(1 for a_i in anchor_idxs if any(_is_left_date_span(s) for s in body_lines[a_i]))
+        dates_on_separate_subline = (anchors_with_dates < len(anchor_idxs) * 0.5)
+        dated_line_cys = [
+            sum(s["cy_points"] for s in ln) / len(ln)
+            for ln in body_lines
+            if any(_is_left_date_span(s) for s in ln)
+        ]
+        # In PNB, the first Balance line on the page is ABOVE the first Date+Amount line (anchor_cys[0] < dated_line_cys[0])
+        subline_sits_below_anchor = (
+            dates_on_separate_subline
+            and bool(dated_line_cys)
+            and anchor_cys[0] < dated_line_cys[0] - 1.5
+        )
+
         grouped_blocks: List[List[Dict[str, Any]]] = [[] for _ in anchor_idxs]
         for l_i, ln in enumerate(body_lines):
             if l_i in anchor_idxs:
@@ -369,8 +465,17 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
                 grouped_blocks[pos].extend(ln)
             else:
                 ln_cy = sum(s["cy_points"] for s in ln) / len(ln)
-                best_pos = min(range(len(anchor_cys)), key=lambda k: abs(ln_cy - anchor_cys[k]))
-                if abs(ln_cy - anchor_cys[best_pos]) <= 28.0:
+                if dates_on_separate_subline:
+                    if subline_sits_below_anchor:
+                        above_cands = [k for k, a_cy in enumerate(anchor_cys) if a_cy <= ln_cy + 3.0]
+                        best_pos = above_cands[-1] if above_cands else 0
+                    else:
+                        below_cands = [k for k, a_cy in enumerate(anchor_cys) if a_cy >= ln_cy - 3.0]
+                        best_pos = below_cands[0] if below_cands else (len(anchor_cys) - 1)
+                else:
+                    best_pos = min(range(len(anchor_cys)), key=lambda k: abs(ln_cy - anchor_cys[k]))
+
+                if abs(ln_cy - anchor_cys[best_pos]) <= 48.0:
                     grouped_blocks[best_pos].extend(ln)
 
         page_tx_count = 0
@@ -400,22 +505,28 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
             desc_parts: List[str] = []
             row_monetary_tokens: List[Tuple[float, float, float, Optional[str], str]] = []
             dr_cr_ind = None
+            bal_dr_cr_ind = None
 
             for sp in block_spans:
                 txt = (sp.get("text") or "").strip()
                 if not txt or TIME_TOKEN_RE.match(txt):
                     continue
 
-                m_dt = DATE_TOKEN_RE.match(txt)
-                if m_dt and (sp["cx_norm"] <= 0.38 or sp["bbox_norm"][0] <= 0.28):
-                    if not date_str:
-                        date_str = m_dt.group(0)
-                    txt = txt[m_dt.end():].strip()
-                    if not txt or TIME_TOKEN_RE.match(txt):
-                        continue
+                if _is_left_date_span(sp):
+                    m_dt = DATE_TOKEN_RE.match(txt)
+                    if m_dt:
+                        if not date_str:
+                            date_str = m_dt.group(0)
+                        txt = txt[m_dt.end():].strip()
+                        if not txt or TIME_TOKEN_RE.match(txt):
+                            continue
 
-                if re.match(r"^\(?([CD]r)\)?$", txt, re.I):
-                    dr_cr_ind = "DR" if "D" in txt.upper() else "CR"
+                if re.match(r"^\(?([CD]r)\.?\)?$", txt, re.I):
+                    flg = "DR" if "D" in txt.upper() else "CR"
+                    if sp["cx_norm"] >= 0.70 or abs(sp["cx_norm"] - bal_cx_norm) <= 0.14:
+                        bal_dr_cr_ind = flg
+                    else:
+                        dr_cr_ind = flg
                     continue
 
                 val, ind = _parse_monetary_token(txt)
@@ -457,8 +568,23 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
 
             row_monetary_tokens.sort(key=lambda item: item[0])
             b_cx, b_x1, b_v, b_ind, b_txt = row_monetary_tokens[-1]
-            bal_val = -abs(b_v) if (b_ind == "DR" or b_txt.startswith("-")) else b_v
+
+            if len(row_monetary_tokens) == 1 and abs(b_cx - bal_cx_norm) > 0.11 and b_x1 < bal_x1_norm - 0.06:
+                if transactions and transactions[-1]["credit"] == 0.0 and transactions[-1]["debit"] == 0.0:
+                    prev_tx = transactions[-1]
+                    if abs(b_cx - deb_cx_norm) <= abs(b_cx - cred_cx_norm):
+                        prev_tx["debit"] = abs(b_v)
+                    else:
+                        prev_tx["credit"] = abs(b_v)
+                    if date_str and prev_tx["date"].startswith("Page-"):
+                        prev_tx["date"] = date_str
+                    if desc_clean:
+                        prev_tx["description"] = f"{prev_tx['description']} {desc_clean}".strip()
+                continue
+
             aligned_numeric_hits += 1
+            eff_b_ind = b_ind or bal_dr_cr_ind
+            bal_val = -abs(b_v) if (eff_b_ind == "DR" or b_txt.startswith("-")) else b_v
 
             debit_val = 0.0
             credit_val = 0.0
@@ -495,10 +621,6 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
                     debit_val = abs(a_v)
                 elif a_ind == "CR" or dr_cr_ind == "CR":
                     credit_val = abs(a_v)
-                elif prev_b is not None and abs((prev_b - abs(a_v)) - bal_val) <= 1.0:
-                    debit_val = abs(a_v)
-                elif prev_b is not None and abs((prev_b + abs(a_v)) - bal_val) <= 1.0:
-                    credit_val = abs(a_v)
                 elif deb_cx_norm is not None and cred_cx_norm is not None and abs(deb_cx_norm - cred_cx_norm) > 0.025:
                     d_dist = abs(a_cx - deb_cx_norm)
                     c_dist = abs(a_cx - cred_cx_norm)
@@ -506,6 +628,10 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
                         debit_val = -abs(a_v) if is_neg_token else abs(a_v)
                     else:
                         credit_val = -abs(a_v) if is_neg_token else abs(a_v)
+                elif prev_b is not None and abs((prev_b - abs(a_v)) - bal_val) <= 1.0:
+                    debit_val = abs(a_v)
+                elif prev_b is not None and abs((prev_b + abs(a_v)) - bal_val) <= 1.0:
+                    credit_val = abs(a_v)
                 else:
                     if prev_b is not None and bal_val < prev_b:
                         debit_val = abs(a_v)
@@ -535,6 +661,7 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
             "transactions_extracted": page_tx_count,
         })
 
+    # Detect Reverse Chronological Order (e.g. PNB OpTransactionHistory)
     if len(transactions) >= 3:
         fwd_hits = sum(
             1 for i in range(len(transactions) - 1)
@@ -544,9 +671,43 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
             1 for i in range(len(transactions) - 1)
             if abs((transactions[i + 1]["balance"] + transactions[i]["credit"] - transactions[i]["debit"]) - transactions[i]["balance"]) <= 1.0
         )
-        if rev_hits > fwd_hits and rev_hits >= (len(transactions) - 1) * 0.5:
+        if rev_hits > fwd_hits and rev_hits >= (len(transactions) - 1) * 0.45:
             transactions.reverse()
             tb["chronological_order"] = "REVERSE_CHRONOLOGICAL"
+
+    # Post-Reversal Cross-Page & Boundary Delta Healing:
+    # If a transaction at a page boundary missed its Debit/Credit because the amount wrapped onto the adjacent page/line,
+    # check if that exact `abs_delta` exists in the PDF's spans on `tx["page"]` or `tx["page"] +/- 1`!
+    for idx in range(1, len(transactions)):
+        prev_b = transactions[idx - 1]["balance"]
+        tx = transactions[idx]
+        delta = round(tx["balance"] - prev_b, 2)
+        abs_delta = abs(delta)
+        curr_net = round(tx["credit"] - tx["debit"], 2)
+
+        if abs_delta > 0 and abs(curr_net - delta) > 1.0:
+            p_curr = tx["page"]
+            row_cy = (tx["bbox"][1] + tx["bbox"][3]) / 2.0
+            found_on_page = False
+
+            # Check current page (within 65pt of row_cy or at page top/bottom) and adjacent pages (top/bottom boundary)
+            for p_search in (p_curr, p_curr - 1, p_curr + 1):
+                for sp_cy, sp_val in page_all_numbers.get(p_search, []):
+                    if abs(sp_val - abs_delta) <= 0.5:
+                        if p_search == p_curr and abs(sp_cy - row_cy) <= 75.0:
+                            found_on_page = True
+                            break
+                        elif p_search != p_curr:
+                            found_on_page = True
+                            break
+                if found_on_page:
+                    break
+
+            if found_on_page:
+                if delta > 0:
+                    tx["credit"], tx["debit"] = round(abs_delta, 2), 0.0
+                else:
+                    tx["debit"], tx["credit"] = round(abs_delta, 2), 0.0
 
     for i in range(1, len(transactions) - 1):
         prev_b = transactions[i - 1]["balance"]
@@ -572,7 +733,6 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
                                 next_t["credit"], next_t["debit"] = amt2, 0.0
                             break
 
-    # Calibrate Row 1 Debit vs Credit when no explicit Opening Balance was stated before Row 1
     if len(transactions) >= 2 and stated_sum_dict.get("opening_balance") is None:
         r1 = transactions[0]
         r1_amt = max(abs(r1["debit"]), abs(r1["credit"]))
@@ -583,7 +743,6 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
             elif any(k in desc_r1 for k in ("NEFT CR", "RTGS CR", "CHQ DEP", "CASH DEP", "IMPS", "FROM ")):
                 r1["credit"], r1["debit"] = r1_amt, 0.0
 
-    # Infer opening_balance ONLY if no explicit opening balance was stated in the document
     if transactions and stated_sum_dict.get("opening_balance") is None:
         first_tx = transactions[0]
         stated_sum_dict["opening_balance"] = round(first_tx["balance"] - first_tx["credit"] + first_tx["debit"], 2)
@@ -594,7 +753,8 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
     alignment_ratio = min(1.0, (aligned_numeric_hits / max(1, total_numeric_spans))) if total_numeric_spans > 0 else 0.0
     candidate_coverage_ratio = (
         min(1.0, len(transactions) / float(max(1, total_candidate_balances)))
-        if total_candidate_balances > 0 else 1.0
+        if total_candidate_balances > 0
+        else 1.0
     )
 
     return {
@@ -604,4 +764,5 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
         "valid_anchor_rows_found": len(transactions),
         "total_candidate_balances": total_candidate_balances,
         "candidate_coverage_ratio": round(candidate_coverage_ratio, 3),
+        "chronological_order": tb.get("chronological_order", "CHRONOLOGICAL"),
     }

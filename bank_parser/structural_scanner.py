@@ -14,7 +14,7 @@ DATE_TOKEN_RE = re.compile(
 )
 
 DECIMAL_NUMBER_RE = re.compile(
-    r"^[₹$\s]*[+-]?(?:\d{1,3}(?:,\d{2,3})+|\d+)[\.,:\-]\d{2}(?:\s*\(?[CD]r\)?)?$",
+    r"^[₹$\s]*[+-]?(?:\d{1,3}(?:,\d{2,3})+|\d+)[\.,:\-]\d{2}(?:\s*\(?[CD]r\.?\)?)?$",
     re.IGNORECASE,
 )
 
@@ -43,21 +43,14 @@ def _transform_rotated_bbox(
     rx0: float, ry0: float, rx1: float, ry1: float,
     raw_w: float, raw_h: float, line_dir: Tuple[float, float]
 ) -> Tuple[float, float, float, float, float, float]:
-    """
-    Normalizes PDF span coordinates when a PDF creator writes landscape tables using a
-    90-degree or 270-degree CTM (line['dir'] == (0, -1) or (0, 1)), such as RBL Bank PDFs.
-    Returns (vis_x0, vis_y0, vis_x1, vis_y1, vis_page_w, vis_page_h).
-    """
     d_cos, d_sin = float(line_dir[0]), float(line_dir[1])
     if abs(d_cos) < 0.5 and d_sin < -0.5:
-        # 90-deg counter-clockwise baseline: visual X is (raw_h - y), visual Y is x
         vx0 = max(0.0, raw_h - ry1)
         vx1 = max(vx0 + 1.0, raw_h - ry0)
         vy0 = rx0
         vy1 = rx1
         return vx0, vy0, vx1, vy1, raw_h, raw_w
     elif abs(d_cos) < 0.5 and d_sin > 0.5:
-        # 90-deg clockwise baseline: visual X is y, visual Y is (raw_w - x)
         vx0 = ry0
         vx1 = ry1
         vy0 = max(0.0, raw_w - rx1)
@@ -129,11 +122,14 @@ def _compute_numeric_x_clusters(
 def _is_true_table_header_window(win_low: str, win_spans: List[Dict[str, Any]], date_rows_seen_so_far: int) -> bool:
     if date_rows_seen_so_far > 0:
         return False
-    if any(bad in win_low for bad in (
-        "opening balance", "statement summary", "dr count", "closing balance includes",
-        "earmarked for hold", "contents of this statement", "within 30 days", "registered office",
-        "from date", "to date"
-    )):
+    if any(
+        bad in win_low
+        for bad in (
+            "opening balance", "statement summary", "dr count", "closing balance includes",
+            "earmarked for hold", "contents of this statement", "within 30 days", "registered office",
+            "from date", "to date"
+        )
+    ):
         return False
     if any(DATE_TOKEN_RE.match(s["text"].strip()) or DECIMAL_NUMBER_RE.match(s["text"].strip()) for s in win_spans):
         return False
@@ -304,7 +300,7 @@ def scan_pdf_structure(file_path: str, ocr_engine=None) -> Dict[str, Any]:
                                 })
             elif ocr_engine is not None:
                 scanned_page_count += 1
-                pix = page.get_pixmap(dpi=200)
+                pix = page.get_pixmap(dpi=150)
                 img_w = max(1.0, float(pix.width))
                 img_h = max(1.0, float(pix.height))
                 tmp_img = f"{file_path}_p{page_num}_scan.png"
@@ -353,28 +349,32 @@ def scan_pdf_structure(file_path: str, ocr_engine=None) -> Dict[str, Any]:
                 if SUMMARY_KEYWORD_RE.search(joined_ln):
                     summary_lines.append(joined_ln)
 
-                if any(
-                    (s["cx_norm"] <= 0.35 or s["bbox_norm"][0] <= 0.28)
-                    and DATE_TOKEN_RE.match(s["text"])
-                    and "from date" not in joined_low
-                    for s in ln
-                ):
-                    date_row_count += 1
-
                 if header_line_idx is None and date_row_count == 0:
                     win_spans = list(ln)
                     for k_off in range(1, 5):
                         if l_idx + k_off < len(lines):
                             nxt = lines[l_idx + k_off]
-                            if any(DATE_TOKEN_RE.match(s["text"]) or DECIMAL_NUMBER_RE.match(s["text"]) for s in nxt):
+                            if any(DECIMAL_NUMBER_RE.match(s["text"]) for s in nxt):
                                 break
                             win_spans.extend(nxt)
                     win_low = " ".join(s["text"].lower() for s in win_spans)
                     if _is_true_table_header_window(win_low, win_spans, date_row_count):
                         header_line_idx = l_idx
 
+                if any(
+                    (s["cx_norm"] <= 0.35 or s["bbox_norm"][0] <= 0.28)
+                    and DATE_TOKEN_RE.match(s["text"])
+                    and not re.search(r"\d{2,4}\s*to\s*\d{1,2}", s["text"], re.I)
+                    for s in ln
+                ):
+                    if not any(
+                        hk in joined_low
+                        for hk in ("from date", "statement period", "for the period", "as on", "open date", "expiry date")
+                    ):
+                        if any(re.search(r"\d+\.\d{2}", s["text"]) for s in ln) or header_line_idx is not None:
+                            date_row_count += 1
+
             numeric_clusters = _compute_numeric_x_clusters(page_spans, date_row_count=date_row_count)
-            # Independent count of rightmost balance-column entries on this page
             page_cand_balances = numeric_clusters[-1]["count"] if numeric_clusters else 0
             doc_candidate_balances += page_cand_balances
 

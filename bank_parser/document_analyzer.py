@@ -30,7 +30,10 @@ def compute_empirical_schema_confidence(
     raw_align = float(extraction_res.get("numeric_alignment_ratio") or 0.0)
     tx_list = recon_res.get("transactions") or []
     if raw_align == 0.0 and tx_list and matched_cols >= 3:
-        populated_txs = sum(1 for t in tx_list if isinstance(t, dict) and t.get("balance") is not None and (t.get("debit", 0) > 0 or t.get("credit", 0) > 0))
+        populated_txs = sum(
+            1 for t in tx_list
+            if isinstance(t, dict) and t.get("balance") is not None and (t.get("debit", 0) > 0 or t.get("credit", 0) > 0)
+        )
         align_score = min(1.0, max(0.75, populated_txs / max(1, len(tx_list))))
     else:
         align_score = raw_align
@@ -116,6 +119,7 @@ def analyze_bank_statement_hybrid(
     scan_data = scan_pdf_structure(file_path, ocr_engine=ocr_engine) or {}
     if original_filename:
         scan_data["file_path"] = original_filename
+
     smart_sample = build_smart_llm_sample(scan_data) or {}
     blueprint = discover_and_ground_blueprint(scan_data, smart_sample, use_llm=use_llm) or {}
     extraction_res = extract_transactions_with_blueprint(scan_data, blueprint) or {}
@@ -126,46 +130,39 @@ def analyze_bank_statement_hybrid(
         stated = {}
 
     summary_dict = {
-        "opening_balance": [
-            stated["opening_balance"]
-        ] if stated.get("opening_balance") is not None else [],
-
-        "opening_balance_source": (
-            stated.get("opening_balance_source") or "UNKNOWN"
-        ),
-
-        "summary_debits": [
-            stated["total_debits"]
-        ] if stated.get("total_debits") is not None else [],
-
-        "summary_credits": [
-            stated["total_credits"]
-        ] if stated.get("total_credits") is not None else [],
-
-        "closing_balance": [
-            stated["closing_balance"]
-        ] if stated.get("closing_balance") is not None else [],
+        "opening_balance": [stated["opening_balance"]] if stated.get("opening_balance") is not None else [],
+        "opening_balance_source": stated.get("opening_balance_source") or "UNKNOWN",
+        "summary_debits": [stated["total_debits"]] if stated.get("total_debits") is not None else [],
+        "summary_credits": [stated["total_credits"]] if stated.get("total_credits") is not None else [],
+        "closing_balance": [stated["closing_balance"]] if stated.get("closing_balance") is not None else [],
     }
+
     full_doc_text = "\n".join(
         s.get("text", "")
         for p in (scan_data.get("pages") or []) if isinstance(p, dict)
         for s in (p.get("spans") or []) if isinstance(s, dict)
     )
 
+    is_rev = extraction_res.get("chronological_order") == "REVERSE_CHRONOLOGICAL"
     issues = []
     detailed_issues = []
+
     try:
-        recon_res = run_math_checks_fn(summary_dict, txs, issues, detailed_issues, full_text=full_doc_text) or {}
+        recon_res = run_math_checks_fn(
+            summary_dict,
+            txs,
+            issues,
+            detailed_issues,
+            is_reverse_chrono=is_rev,
+            full_text=full_doc_text,
+        ) or {}
     except TypeError:
         recon_res = run_math_checks_fn(summary_dict, txs, issues, detailed_issues) or {}
 
     if stated.get("opening_balance_source") and not recon_res.get("opening_balance_source"):
         recon_res["opening_balance_source"] = stated["opening_balance_source"]
 
-    expected_cands = max(
-        int(scan_data.get("total_candidate_balances") or 0),
-        int(extraction_res.get("total_candidate_balances") or 0),
-    )
+    expected_cands = int(extraction_res.get("total_candidate_balances") or 0)
     if expected_cands >= 5 and len(txs) < expected_cands * 0.85:
         missing_cnt = expected_cands - len(txs)
         recon_res.setdefault("audit_coverage", {})["row_completeness_verified"] = "FAILED"
