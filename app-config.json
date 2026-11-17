@@ -1,0 +1,8 @@
+{
+    "command": "sh -c 'export PYTHONPATH=\"$PWD/vendor${PYTHONPATH:+:$PYTHONPATH}\"; python3 -m streamlit run app.py --server.address 0.0.0.0 --server.port \"$X_ZOHO_CATALYST_LISTEN_PORT\" --server.headless true --browser.gatherUsageStats false'",
+    "build_path": "./appsail_build",
+    "stack": "python_3_13",
+    "env_variables": {},
+    "memory": 2048,
+    "scripts": {}
+}
