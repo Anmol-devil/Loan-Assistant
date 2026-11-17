@@ -41,9 +41,9 @@ jobs:
       - rm -rf appsail_build
       - mkdir -p appsail_build
 
-      - echo "Copying committed application files"
-      - git archive HEAD | tar -x -C appsail_build
-      - rm -f appsail_build/app-config.json appsail_build/catalyst.json appsail_build/catalyst-pipelines.yml appsail_build/.gitignore
+            - echo "Copying application source files"
+      - tar --exclude='./.git' --exclude='./.venv' --exclude='./venv' --exclude='./appsail_build' --exclude='./.env' --exclude='./.env.*' --exclude='./.catalystrc' --exclude='./__pycache__' --exclude='./app-config.json' --exclude='./catalyst.json' --exclude='./catalyst-pipelines.yml' -czf /tmp/loan-assistant-source.tar.gz .
+      - tar -xzf /tmp/loan-assistant-source.tar.gz -C appsail_build
 
       - echo "Installing dependencies into AppSail vendor directory"
       - .venv/bin/python -m pip install --no-cache-dir --no-compile --target appsail_build/vendor -r requirements.txt
