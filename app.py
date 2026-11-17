@@ -20,9 +20,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ==============================================================================
+glm_api_key = st.secrets["a04cccfa817d4cc9bc7b0078217b1190.7XKO8B0BZBG0v6Xa"]
+
 # MINIMAL ENTERPRISE SAAS STYLING (MATCHING REFERENCE UI)
-# ==============================================================================
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
