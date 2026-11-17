@@ -1,33 +1,45 @@
 version: 1.0
 
 jobs:
-  python313-check:
+  loan-assistant-build:
     steps:
-      - echo "Setting up Python 3.13 for Loan Assistant"
+      - echo "Starting Loan Assistant Python 3.13 Build"
 
+      - echo "Installing system dependencies"
       - apt-get update
-      - apt-get install -y curl ca-certificates
+      - apt-get install -y curl ca-certificates libgomp1 libglib2.0-0 libgl1
 
+      - echo "Installing UV"
       - curl -LsSf https://astral.sh/uv/install.sh -o /tmp/uv-install.sh
-
       - env UV_INSTALL_DIR=/tmp/uv-bin sh /tmp/uv-install.sh
-
-      - /tmp/uv-bin/uv --version
 
       - echo "Installing Python 3.13"
       - /tmp/uv-bin/uv python install 3.13
-
-      - echo "Creating Python 3.13 environment"
       - /tmp/uv-bin/uv venv --python 3.13 --seed .venv
 
-      - echo "Verifying Python version"
+      - echo "Checking Python version"
       - .venv/bin/python --version
+      - .venv/bin/python -c "import sys; assert sys.version_info[:2] == (3, 13); print('Python 3.13 verified')"
 
-      - .venv/bin/python -c "import sys; assert sys.version_info[:2] == (3, 13); print('Python 3.13 READY')"
+      - echo "Installing Loan Assistant requirements"
+      - .venv/bin/python -m pip install --upgrade pip
+      - .venv/bin/python -m pip install --no-cache-dir -r requirements.txt
 
-      - echo "Loan Assistant Python environment configured successfully"
+      - echo "Checking dependency compatibility"
+      - .venv/bin/python -m pip check
+
+      - echo "Checking project syntax"
+      - .venv/bin/python -m compileall -q app.py multiformated_reconciliation.py module_aggregator.py corporate_kyc_engines.py cross_document_verifier.py forensic_aggregator.py recocile_spans.py bank_parser
+
+      - echo "Testing OCR and ONNX dependencies"
+      - .venv/bin/python -c "import cv2, onnxruntime; from rapidocr import RapidOCR; from ocr_compat import ocr_engine; print('RapidOCR and ONNX imports successful')"
+
+      - echo "Testing application imports"
+      - .venv/bin/python -c "import multiformated_reconciliation, module_aggregator, corporate_kyc_engines, cross_document_verifier, forensic_aggregator; print('Loan Assistant modules imported successfully')"
+
+      - echo "Loan Assistant build completed successfully"
 
 stages:
-  - name: build
+  - name: build-and-test
     jobs:
-      - python313-check
+      - loan-assistant-build
