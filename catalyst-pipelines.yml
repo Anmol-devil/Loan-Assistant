@@ -21,7 +21,7 @@ jobs:
       - .venv/bin/python --version
       - .venv/bin/python -c "import sys; assert sys.version_info[:2] == (3, 13); print('Python 3.13 verified')"
 
-      - echo "Installing Loan Assistant requirements"
+      - echo "Installing Loan Assistant requirements for testing"
       - .venv/bin/python -m pip install --upgrade pip
       - .venv/bin/python -m pip install --no-cache-dir -r requirements.txt
 
@@ -37,9 +37,35 @@ jobs:
       - echo "Testing application imports"
       - .venv/bin/python -c "import multiformated_reconciliation, module_aggregator, corporate_kyc_engines, cross_document_verifier, forensic_aggregator; print('Loan Assistant modules imported successfully')"
 
-      - echo "Loan Assistant build completed successfully"
+      - echo "Preparing AppSail build directory"
+      - rm -rf appsail_build
+      - mkdir -p appsail_build
+
+      - echo "Copying committed application files"
+      - git archive HEAD | tar -x -C appsail_build
+      - rm -f appsail_build/app-config.json appsail_build/catalyst.json appsail_build/catalyst-pipelines.yml appsail_build/.gitignore
+
+      - echo "Installing dependencies into AppSail vendor directory"
+      - .venv/bin/python -m pip install --no-cache-dir --no-compile --target appsail_build/vendor -r requirements.txt
+
+      - echo "Verifying AppSail build files"
+      - test -f appsail_build/app.py
+      - test -f appsail_build/ocr_compat.py
+      - test -d appsail_build/bank_parser
+      - test -d appsail_build/vendor/streamlit
+
+      - echo "Testing imports from the AppSail package"
+      - PYTHONPATH="$PWD/appsail_build/vendor:$PWD/appsail_build" .venv/bin/python -c "import streamlit, cv2, onnxruntime; from rapidocr import RapidOCR; from ocr_compat import ocr_engine; import multiformated_reconciliation, module_aggregator, corporate_kyc_engines, cross_document_verifier, forensic_aggregator; print('AppSail package checks passed')"
+
+      - echo "Installing Catalyst CLI"
+      - npm install -g zcatalyst-cli@beta
+
+      - echo "Deploying Loan Assistant to AppSail"
+      - catalyst deploy appsail --verbose
+
+      - echo "Loan Assistant build and deployment completed"
 
 stages:
-  - name: build-and-test
+  - name: build-and-deploy
     jobs:
       - loan-assistant-build
