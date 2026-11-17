@@ -59,13 +59,14 @@ jobs:
       - echo "Testing imports from the AppSail package"
       - PYTHONPATH="$PWD/appsail_build/vendor:$PWD/appsail_build" .venv/bin/python -c "import streamlit, cv2, onnxruntime; from rapidocr import RapidOCR; from ocr_compat import ocr_engine; import multiformated_reconciliation, module_aggregator, corporate_kyc_engines, cross_document_verifier, forensic_aggregator; print('AppSail package checks passed')"
 
-      - echo "Installing Catalyst CLI"
-      - npm install -g zcatalyst-cli@beta
+      - echo "Measuring AppSail package"
+      - du -sh appsail_build
+      - du -sh appsail_build/vendor
 
-      - echo "Deploying Loan Assistant to AppSail"
-      - catalyst deploy appsail --verbose
+      - echo "Largest files and directories in AppSail package"
+      - du -ah appsail_build | sort -h | tail -30
 
-      - echo "Loan Assistant build and deployment completed"
+      - echo "AppSail package measurement completed"
 
 stages:
   - name: build-and-deploy
