@@ -1,0 +1,37 @@
+version: 1.0
+
+jobs:
+  validate-loan-assistant:
+    steps:
+      - echo "Starting Loan Assistant CI Pipeline"
+
+      - echo "Checking project files"
+      - test -f app.py
+      - test -f requirements.txt
+      - test -f multiformated_reconciliation.py
+      - test -f module_aggregator.py
+      - test -d bank_parser
+
+      - echo "Checking Python"
+      - python3 --version
+      - python3 -m pip --version
+
+      - echo "Installing dependencies"
+      - python3 -m pip install --upgrade pip
+      - python3 -m pip install -r requirements.txt
+
+      - echo "Checking dependency compatibility"
+      - python3 -m pip check
+
+      - echo "Checking Python syntax"
+      - python3 -m compileall -q .
+
+      - echo "Checking core libraries"
+      - python3 -c "import streamlit, pandas, numpy, pymupdf, cv2, docx, openai; from PIL import Image; print('Core imports successful')"
+
+      - echo "Loan Assistant validation completed"
+
+stages:
+  - name: build-and-test
+    jobs:
+      - validate-loan-assistant
