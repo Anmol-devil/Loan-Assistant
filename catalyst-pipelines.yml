@@ -1,31 +1,33 @@
-version: 1
+version: 1.0
 
 jobs:
-  validate-loan-assistant:
+  python313-check:
     steps:
-      - echo "Starting Loan Assistant CI"
+      - echo "Setting up Python 3.13 for Loan Assistant"
 
-      - echo "Checking Python"
-      - python3 --version
-      - whoami
-
-      - echo "Installing pip"
       - apt-get update
-      - apt-get install -y python3-pip
+      - apt-get install -y curl ca-certificates
 
-      - echo "Verifying pip"
-      - python3 -m pip --version
+      - curl -LsSf https://astral.sh/uv/install.sh -o /tmp/uv-install.sh
 
-      - echo "Checking Loan Assistant files"
-      - test -f app.py
-      - test -f requirements.txt
-      - test -f multiformated_reconciliation.py
-      - test -f module_aggregator.py
-      - test -d bank_parser
+      - env UV_INSTALL_DIR=/tmp/uv-bin sh /tmp/uv-install.sh
 
-      - echo "Loan Assistant environment check completed"
+      - /tmp/uv-bin/uv --version
+
+      - echo "Installing Python 3.13"
+      - /tmp/uv-bin/uv python install 3.13
+
+      - echo "Creating Python 3.13 environment"
+      - /tmp/uv-bin/uv venv --python 3.13 --seed .venv
+
+      - echo "Verifying Python version"
+      - .venv/bin/python --version
+
+      - .venv/bin/python -c "import sys; assert sys.version_info[:2] == (3, 13); print('Python 3.13 READY')"
+
+      - echo "Loan Assistant Python environment configured successfully"
 
 stages:
-  - name: build-and-test
+  - name: build
     jobs:
-      - validate-loan-assistant
+      - python313-check
