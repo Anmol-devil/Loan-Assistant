@@ -572,9 +572,7 @@ def draw_visual_findings_on_image(image_path, forensic_flags):
     return img
 
 
-# ==============================================================================
 # SIDEBAR (EXACT MATCH TO MOCKUP)
-# ==============================================================================
 with st.sidebar:
     st.markdown("""
     <div class="sb-brand">
@@ -626,9 +624,7 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
 
-# ==============================================================================
 # TOP MINIMAL HEADER BAR & PAGE TITLE
-# ==============================================================================
 st.markdown("""
 <div class="top-bar">
     <div class="top-pill">📄 Module 1: Document Checker & Risk Calibration</div>
@@ -641,11 +637,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ==============================================================================
 # MODE 1: SINGLE DOCUMENT AUDIT
-# ==============================================================================
 if inspection_mode == "Single Document Audit":
-    # 3-Column Intake Row: [Uploader (1.35) | Supported Documents (1.05) | Processing Pipeline (1.5)]
     col_up, col_sup, col_pipe = st.columns([1.35, 1.05, 1.55])
 
     with col_up:
@@ -681,32 +674,41 @@ if inspection_mode == "Single Document Audit":
             temp_path = tmp.name
 
         try:
-            try:
-                report = verify_any_file(
-                    temp_path,
-                    original_filename=uploaded_file.name
-                )
-                print("[DEBUG] AFTER verify_any_file", flush=True)
-
-            except Exception as e:
-                print("[DEBUG] PIPELINE ERROR:", repr(e), flush=True)
-                raise
-
-            print("[DEBUG] BEFORE build_module1_output", flush=True)
-
-            m1_out = build_module1_output(
-                temp_path,
-                report,
-                tenant_id=tenant_choice
-            )
-
             with st.spinner("Running 5-Stage Verification Pipeline..."):
-                report = verify_any_file(temp_path, original_filename=uploaded_file.name)
+                try:
+                    report = verify_any_file(temp_path, original_filename=uploaded_file.name)
+
+                    print("[DEBUG] AFTER verify_any_file", flush=True)
+
+                except Exception as e:
+                    print(
+                        "[DEBUG] PIPELINE ERROR:",
+                        repr(e),
+                        flush=True
+                    )
+                    raise
                 report["original_filename"] = uploaded_file.name
+
                 m1_out = build_module1_output(temp_path, report, tenant_id=tenant_choice)
+
+            print("[DEBUG] AFTER build_module1_output", flush=True)
+            # try:
+            #     report = verify_any_file(temp_path, original_filename=uploaded_file.name)
+            #     print("[DEBUG] AFTER verify_any_file", flush=True)
+
+            # except Exception as e:
+            #     print("[DEBUG] PIPELINE ERROR:", repr(e), flush=True)
+            #     raise
+
+            # m1_out = build_module1_output(temp_path, report, tenant_id=tenant_choice)
+
+            # with st.spinner("Running 5-Stage Verification Pipeline..."):
+            #     report = verify_any_file(temp_path, original_filename=uploaded_file.name)
+            #     report["original_filename"] = uploaded_file.name
+            #     m1_out = build_module1_output(temp_path, report, tenant_id=tenant_choice)
             
 
-            print("[DEBUG] AFTER build_module1_output", flush=True)   
+            # print("[DEBUG] AFTER build_module1_output", flush=True)   
             id_card = m1_out["identity_card"]
             fin_rec = report.get("financial_reconciliation", {})
             doc_code = fin_rec.get("document_type") or id_card.get("doc_code", "UNKNOWN_DOCUMENT")
@@ -732,9 +734,7 @@ if inspection_mode == "Single Document Audit":
                 </div>
                 """, unsafe_allow_html=True)
 
-            # ------------------------------------------------------------------
             # FILE STATUS STRIP (ONLY SHOWS '• N Rows' FOR BANK STATEMENTS!)
-            # ------------------------------------------------------------------
             pages_cnt = m1_out.get("total_pages_processed", 1)
             tx_list = fin_rec.get("transactions", [])
             if doc_code == "BANK_STATEMENT":
@@ -1236,7 +1236,7 @@ if inspection_mode == "Single Document Audit":
                     page_obj = doc[selected_page - 1]
                     scale = 150 / 72.0
                     pix = page_obj.get_pixmap(dpi=150)
-                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
                     draw = ImageDraw.Draw(img)
                     for pf in [f for f in s_findings if f.get("page") == selected_page and f.get("bbox")]:
                         x0, y0, x1, y1 = [c * scale for c in pf["bbox"]]

@@ -6,3 +6,6 @@ PyMuPDF
 Pillow
 python-docx
 rapidocr-onnxruntime
+opencv-python
+python-dotenv
+openai
