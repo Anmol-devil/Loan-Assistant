@@ -1,22 +1,31 @@
 version: 1
 
-images:
-  python311:
-    image: python:3.11-slim
-    auth:
-      username: << env.DOCKERHUB_USERNAME >>
-      password: << env.DOCKERHUB_PASSWORD >>
-
 jobs:
-  test-python-image:
-    image: python311
+  validate-loan-assistant:
     steps:
-      - echo "Testing Loan Assistant build environment"
+      - echo "Starting Loan Assistant CI"
+
+      - echo "Checking Python"
       - python3 --version
+      - whoami
+
+      - echo "Installing pip"
+      - apt-get update
+      - apt-get install -y python3-pip
+
+      - echo "Verifying pip"
       - python3 -m pip --version
-      - python3 -c "print('Python image working successfully')"
+
+      - echo "Checking Loan Assistant files"
+      - test -f app.py
+      - test -f requirements.txt
+      - test -f multiformated_reconciliation.py
+      - test -f module_aggregator.py
+      - test -d bank_parser
+
+      - echo "Loan Assistant environment check completed"
 
 stages:
-  - name: build
+  - name: build-and-test
     jobs:
-      - test-python-image
+      - validate-loan-assistant
