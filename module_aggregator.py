@@ -5,11 +5,10 @@ import uuid
 import numpy as np
 import pymupdf
 import docx
-from rapidocr_onnxruntime import RapidOCR
+from ocr_compat import ocr_engine as ocr_reader
 from corporate_kyc_engines import classify_financial_document
 from recocile_spans import reconcile_spans
 
-ocr_reader = RapidOCR()
 
 ALLOWED_CHECK_STATUSES = {"PASSED", "FAILED", "NOT_RUN", "NOT_APPLICABLE"}
 ALLOWED_TRIAGE_BANDS = {"low_risk", "needs_review", "high_risk"}
@@ -75,9 +74,7 @@ UNIVERSAL_IFSC_BANK_MAP = {
 }
 
 
-# ==============================================================================
 # 1. HONEST RISK SCORING & OPTIONAL EMPIRICAL CALIBRATOR
-# ==============================================================================
 class RiskScoreCalibrator:
     def __init__(self, external_labeled_json_path: str = None):
         self.is_empirically_validated = False
@@ -563,24 +560,30 @@ def identify_document_and_entity(file_path: str, raw_report: dict = None) -> dic
             ifsc_code = f"{m_ifsc.group(1)}0{m_ifsc.group(2)}"
 
         m_ac = re.search(
-            r"(?:Account\s*(?:No|Number)|A/C\s*No|Statement\s+of\s+account)\s*[:\|\-\n]+\s*([A-Z0-9X\*]{6,22})",
+            r"(?:Account\s*(?:No\.?|Number)|A/C\s*(?:No\.?|Number)?)\s*[:\|\-\n]+\s*([A-Z0-9X\*]{6,22})",
             pre_table_header,
             re.IGNORECASE,
         )
-        if m_ac:
+        if m_ac and sum(1 for ch in m_ac.group(1) if ch.isdigit() or ch in "X*") >= 3:
             account_number = m_ac.group(1).strip()
 
-        if not holder:
-            m_main = re.search(
-                r"(?:Main\s*Account\s*Holder\s*Name|Primary\s*Account\s*Holder\s*Name|Account\s*Holder\s*Names?|Primary\s*Holder|Account\s*Name|Customer\s*Name)\s*[:\|\-\n]+\s*([A-Za-z][A-Za-z0-9 \t\.\&\-]{2,48})",
-                pre_table_header,
-                re.IGNORECASE,
-            )
-            if m_main:
-                cand_h = m_main.group(1).splitlines()[0].split("|")[0].strip(" :-|.,")
-                if "bank" not in cand_h.lower() and not _is_address_or_noise_line(cand_h):
-                    holder = _format_entity_name_clean(cand_h)
-                    company_name = holder
+        m_actype = re.search(
+            r"(?:Account\s*Type|A/C\s*Type)\s*[:\|\-]+\s*([A-Za-z0-9\s\-\/]{2,25})",
+            pre_table_header,
+            re.IGNORECASE,
+        )
+        if m_actype:
+            raw_act = m_actype.group(1).splitlines()[0].split("|")[0].strip(" :-|.,").upper()
+            act_map = {
+                "CA": "CA (Current Account)",
+                "SB": "SB (Savings Account)",
+                "SA": "SA (Savings Account)",
+                "OD": "OD (Overdraft Account)",
+                "CC": "CC (Cash Credit Account)",
+            }
+            identity_info_acct_type = act_map.get(raw_act, raw_act)
+        else:
+            identity_info_acct_type = None
 
         if not holder:
             for ln in pre_table_header.splitlines():

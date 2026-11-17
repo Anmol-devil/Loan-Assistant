@@ -12,7 +12,7 @@ import pymupdf
 import numpy as np
 from PIL import Image, ImageChops, ExifTags
 import docx
-from rapidocr_onnxruntime import RapidOCR
+from ocr_compat import ocr_engine
 from corporate_kyc_engines import (
     classify_financial_document,
     verify_gst_certificate,
@@ -23,11 +23,9 @@ from corporate_kyc_engines import (
 )
 from recocile_spans import reconcile_spans
 
-ocr_engine = RapidOCR()
+# ocr_engine = RapidOCR()
 
-# ==============================================================================
 # 1. UNIVERSAL REGEXES & OCR-RESILIENT CURRENCY / DATE PARSERS
-# ==============================================================================
 DATE_RE = re.compile(
     r"^(?:(0?[1-9]|[12]\d|3[01])[-/\s\.]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|[A-Za-z]{3,9})[-/\s\.]*\d{2,4}"
     r"|(0?[1-9]|[12]\d|3[01])(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[-/\s\.]*\d{2,4}"
@@ -293,7 +291,6 @@ def _parse_indian_date_safe(date_str: str) -> datetime.date | None:
                 return None
     return None
 
-
 def extract_declared_statement_period(full_text: str):
     if not full_text:
         return None, None, None, None
@@ -305,17 +302,16 @@ def extract_declared_statement_period(full_text: str):
         rf"Period\s*[,:\-]?\s*{date_pat}\s*(?:to|\-|\–)\s*{date_pat}",
         rf"From\s*[,:\-]?\s*{date_pat}[\s\S]{{1,220}}?\b(?:To|Το)\s*[,:\-]?\s*{date_pat}",
         rf"period\s+of[\s\S]{{0,120}}?{date_pat}\s+to\s+{date_pat}",
+        rf"\b{date_pat}\s+(?:to|TO|To|\–)\s+{date_pat}\b",
     ]
     for pat in period_patterns:
-        m = re.search(pat, header_slice, re.IGNORECASE)
-        if m:
+        for m in re.finditer(pat, header_slice, re.IGNORECASE):
             raw_start, raw_end = m.group(1).strip(), m.group(2).strip()
             d_start = _parse_indian_date_safe(raw_start)
             d_end = _parse_indian_date_safe(raw_end)
             if d_start and d_end and d_end >= d_start:
                 return raw_start, raw_end, d_start, d_end
     return None, None, None, None
-
 
 def extract_summary_cards(page_spans, table_header_min_y):
     summary = {
@@ -442,9 +438,7 @@ def extract_summary_from_full_text(full_text: str) -> dict:
     return summary
 
 
-# ==============================================================================
 # 3. VERTICAL NUMBER, SIGN & DATE STITCHING
-# ==============================================================================
 def Stitch_Vertical_Wrapped_Numbers(page_spans, numeric_col_xs, x_tol=48.0, y_tol=24.0):
     spans = [dict(s) for s in page_spans]
     spans.sort(key=lambda s: (s["cy"], s["cx"]))
@@ -517,13 +511,9 @@ def Stitch_Vertical_Wrapped_Numbers(page_spans, numeric_col_xs, x_tol=48.0, y_to
                         skip_indices.add(j)
                         break
         stitched.append(s)
-
     return stitched
 
-
-# ==============================================================================
 # 4. BANK STATEMENT ARITHMETIC & INVARIANT RECONCILIATION
-# ==============================================================================
 def run_math_checks(
     summary,
     transactions,
@@ -610,7 +600,13 @@ def run_math_checks(
             issues.append(msg)
             detailed_issues.append({"page": 1, "bbox": None, "text": msg})
         else:
-            audit_coverage["row_completeness_verified"] = "PASSED"
+            all_fields_complete = all(
+                bool(t.get("date"))
+                and t.get("balance") is not None
+                and (abs(t.get("credit", 0.0)) > 0 or abs(t.get("debit", 0.0)) > 0 or bool(t.get("description")))
+                for t in active_txs
+            )
+            audit_coverage["row_completeness_verified"] = "PASSED" if (all_fields_complete and len(active_txs) > 0) else "FAILED"
     else:
         audit_coverage["row_completeness_verified"] = "NOT_RUN"
 
@@ -625,10 +621,24 @@ def run_math_checks(
             ]
             valid_tx_dates = [(p, ds, dt) for p, ds, dt in parsed_tx_dates if dt is not None]
             if valid_tx_dates:
+                min_page, min_ds, min_dt = min(valid_tx_dates, key=lambda item: (item[2], item[0]))
                 max_page, max_ds, max_dt = max(valid_tx_dates, key=lambda item: (item[2], item[0]))
                 missing_days = (d_end - max_dt).days
                 declared_span_days = max(1, (d_end - d_start).days)
-                if missing_days > 45 and declared_span_days >= 60 and not summary.get("closing_balance"):
+                out_of_bounds = [
+                    (p, ds) for p, ds, dt in valid_tx_dates
+                    if dt < (d_start - datetime.timedelta(days=5)) or dt > (d_end + datetime.timedelta(days=5))
+                ]
+                if out_of_bounds:
+                    audit_coverage["statement_period_verified"] = "FAILED"
+                    bad_p, bad_ds = out_of_bounds[0]
+                    msg_period = (
+                        f"Statement Period Mismatch: Transaction dated '{bad_ds}' on Page {bad_p} "
+                        f"falls outside declared statement period '{raw_start}' to '{raw_end}'."
+                    )
+                    issues.append(msg_period)
+                    detailed_issues.append({"page": bad_p, "bbox": None, "text": msg_period})
+                elif missing_days > 45 and declared_span_days >= 60 and not summary.get("closing_balance"):
                     audit_coverage["statement_period_verified"] = "FAILED"
                     final_bal = ordered_txs[-1]["balance"]
                     msg_period = (
@@ -638,7 +648,7 @@ def run_math_checks(
                     )
                     issues.append(msg_period)
                     detailed_issues.append({"page": max_page, "bbox": None, "text": msg_period})
-                elif missing_days <= 45:
+                else:
                     audit_coverage["statement_period_verified"] = "PASSED"
 
     r1 = ordered_txs[0]
@@ -785,10 +795,7 @@ def run_math_checks(
         "detailed_issues": detailed_issues,
     }
 
-
-# ==============================================================================
 # 5. PDF & OCR SPAN COLLECTION + FORENSICS
-# ==============================================================================
 def split_multi_token_numeric_span(span_dict):
     raw_text = span_dict["text"].strip()
     if "\n" in raw_text:
@@ -864,7 +871,6 @@ def split_multi_token_numeric_span(span_dict):
             sub_spans.append(sub_s)
 
     return sub_spans if len(sub_spans) > 1 else [span_dict]
-
 
 def collect_and_merge_spans(doc):
     raw_pages = []

@@ -391,8 +391,8 @@ def _deterministic_blueprint_discovery(
     if m_br:
         branch_name = re.sub(r"[ \t]+", " ", m_br.group(1).splitlines()[0].split("|")[0]).strip(" :-|.,").upper()
 
-    m_ac = re.search(r"(?:Account\s*(?:No|Number)|A/C\s*No)[\s:\|\-]+([A-Z0-9X\*]{6,22})", strict_pre_hdr, re.I)
-    if m_ac:
+    m_ac = re.search(r"(?:Account\s*(?:No\.?|Number)|A/C\s*No\.?)[\s:\|\-]+([A-Z0-9X\*]{6,22})", strict_pre_hdr, re.I)
+    if m_ac and sum(1 for ch in m_ac.group(1) if ch.isdigit() or ch in "X*") >= 3:
         account_number = m_ac.group(1).strip()
 
     m_cid = re.search(r"(?:Customer\s*Id|Cust\s*ID|CIF\s*Number)[\s:\|\-]+([A-Z0-9]{5,18})", strict_pre_hdr, re.I)

@@ -126,7 +126,11 @@ def verify_gst_certificate(full_text: str) -> Dict[str, Any]:
         "audit_coverage": audit_coverage,
         "gstin": gstin,
         "embedded_pan": embedded_pan,
-        "state_jurisdiction": f"{state_code} - {state_name}" if state_code else None,
+        "state_jurisdiction": (
+            f"{state_code} - {state_name}"
+            if state_code is not None
+            else None
+        ),
         "legal_name": legal_name,
         "trade_name": trade_name,
         "issues": [i["text"] for i in issues],
