@@ -1,9 +1,21 @@
-version: 1.0
+version: 1
+
+images:
+  python311:
+    image: python:3.11-slim
+    auth:
+      username: << env.DOCKERHUB_USERNAME >>
+      password: << env.DOCKERHUB_PASSWORD >>
 
 jobs:
   validate-loan-assistant:
+    image: python311
     steps:
       - echo "Starting Loan Assistant CI Pipeline"
+
+      - echo "Checking Python environment"
+      - python3 --version
+      - python3 -m pip --version
 
       - echo "Checking project files"
       - test -f app.py
@@ -12,24 +24,24 @@ jobs:
       - test -f module_aggregator.py
       - test -d bank_parser
 
-      - echo "Checking Python"
-      - python3 --version
-      - python3 -m pip --version
+      - echo "Installing system dependencies"
+      - apt-get update
+      - apt-get install -y libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
 
-      - echo "Installing dependencies"
+      - echo "Installing Python dependencies"
       - python3 -m pip install --upgrade pip
-      - python3 -m pip install -r requirements.txt
+      - python3 -m pip install --no-cache-dir -r requirements.txt
 
-      - echo "Checking dependency compatibility"
+      - echo "Checking dependencies"
       - python3 -m pip check
 
       - echo "Checking Python syntax"
-      - python3 -m compileall -q .
+      - python3 -m compileall -q app.py multiformated_reconciliation.py module_aggregator.py corporate_kyc_engines.py cross_document_verifier.py forensic_aggregator.py recocile_spans.py bank_parser
 
-      - echo "Checking core libraries"
-      - python3 -c "import streamlit, pandas, numpy, pymupdf, cv2, docx, openai; from PIL import Image; print('Core imports successful')"
+      - echo "Testing core libraries"
+      - python3 -c "import streamlit, pandas, numpy, pymupdf, cv2, docx, openai; from PIL import Image; from rapidocr_onnxruntime import RapidOCR; print('Core libraries OK')"
 
-      - echo "Loan Assistant validation completed"
+      - echo "Loan Assistant CI validation completed"
 
 stages:
   - name: build-and-test
