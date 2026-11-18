@@ -362,7 +362,8 @@ def _slice_page1_pre_table(page1_text: str) -> str:
     single_line_hdr_markers = {
         "tran date", "transaction date", "txn date", "value date", "value dt",
         "narration", "particulars", "withdrawal(dr)", "deposit(cr)", "balance(inr)",
-        "chq.no.", "chq./ref.no.", "cheque no", "running balance", "closing balance", "sr no"
+        "chq.no.", "chq./ref.no.", "cheque no", "running balance", "closing balance", "sr no",
+        "tran id", "transaction remarks", "transaction posted date", "withdra", "si no",
     }
     date_row_re = re.compile(
         r"^(?:[0-3]?\d[-/\.][01]?\d[-/\.]\d{2,4}|[0-3]?\d[\s\-/]+[A-Za-z]{3,9}[\s\-/]+\d{2,4})\b"

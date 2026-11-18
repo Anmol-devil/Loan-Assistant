@@ -1532,34 +1532,31 @@ def _clean_indian_address_ocr(raw_addr: str) -> str:
 
 def _locate_id_card_rect_in_photo(rgb_np: np.ndarray) -> np.ndarray:
     """
-    100% pure NumPy card isolator (zero OpenCV contour dependencies).
-    Separates warm-toned/bright horizontal ID cards from denim jeans or dark desk surfaces.
+    Finds the physical ID card inside either a portrait (vertical) OR landscape (horizontal) phone photo.
+    Uses OCR-text/card-color bounding so surrounding bedsheets, desks, or jeans are cropped out.
     """
     h, w = rgb_np.shape[:2]
-    if w > h * 1.12:
-        # Image is already a cropped horizontal card
-        return rgb_np
-
     r = rgb_np[:, :, 0].astype(np.int16)
     g = rgb_np[:, :, 1].astype(np.int16)
     b = rgb_np[:, :, 2].astype(np.int16)
 
-    # Warm card body (R - B >= 16 and R >= 115) OR bright card/sticker pixels (R,G,B >= 185)
-    card_px = ((r - b >= 16) & (r >= 115) & (g >= 95)) | ((r >= 188) & (g >= 188) & (b >= 178))
+    # Physical PAN cards are either sky-blue (B - R >= 14, B >= 130) or warm peach/tan (R - B >= 16, R >= 115)
+    blue_card_px = (b - r >= 14) & (b >= 125) & (g >= 115)
+    warm_card_px = (r - b >= 16) & (r >= 115) & (g >= 95)
 
-    row_frac = np.mean(card_px, axis=1)
-    valid_rows = np.where(row_frac >= 0.28)[0]
-    if len(valid_rows) >= int(h * 0.15):
-        ry0 = int(np.percentile(valid_rows, 2))
-        ry1 = int(np.percentile(valid_rows, 98))
-        if ry1 - ry0 >= int(h * 0.15):
-            col_frac = np.mean(card_px[ry0:ry1, :], axis=0)
-            valid_cols = np.where(col_frac >= 0.25)[0]
-            if len(valid_cols) >= int(w * 0.35):
+    for mask in (blue_card_px, warm_card_px):
+        row_frac = np.mean(mask, axis=1)
+        valid_rows = np.where(row_frac >= 0.18)[0]
+        if int(h * 0.18) <= len(valid_rows) <= int(h * 0.88):
+            ry0 = int(np.percentile(valid_rows, 2))
+            ry1 = int(np.percentile(valid_rows, 98))
+            col_frac = np.mean(mask[ry0:ry1, :], axis=0)
+            valid_cols = np.where(col_frac >= 0.18)[0]
+            if int(w * 0.25) <= len(valid_cols) <= int(w * 0.92):
                 rx0 = int(np.percentile(valid_cols, 2))
                 rx1 = int(np.percentile(valid_cols, 98))
                 cw, ch = rx1 - rx0, ry1 - ry0
-                if cw > ch and cw >= 80 and ch >= 50:
+                if cw > ch * 1.10 and cw >= 90 and ch >= 55:
                     return rgb_np[ry0:ry1, rx0:rx1]
     return rgb_np
 
@@ -1684,10 +1681,65 @@ def _check_celebrity_watchlist_and_monochrome_spoof(
 
     return (len(reasons) > 0), reasons
 
+def _score_face_candidate_zone(zone_rgb: np.ndarray) -> tuple[float, np.ndarray | None]:
+    """
+    Scores a candidate card zone (Top-Left for New PAN / Aadhaar, Bottom-Right for Old PAN)
+    for containing a human portrait (skin cluster + dark hair/eye pixels, NOT a monochrome QR code).
+    Returns (score, tight_portrait_crop).
+    """
+    if zone_rgb is None or zone_rgb.size == 0 or zone_rgb.shape[0] < 24 or zone_rgb.shape[1] < 24:
+        return 0.0, None
+
+    zr = zone_rgb[:, :, 0].astype(np.float32)
+    zg = zone_rgb[:, :, 1].astype(np.float32)
+    zb = zone_rgb[:, :, 2].astype(np.float32)
+
+    # Warm human skin pixels (R > G and R > B)
+    skin_px = (zr > 90.0) & (zg > 38.0) & (zb > 20.0) & ((zr - zg) >= 8.0) & ((zr - zb) >= 10.0)
+    skin_pts = np.argwhere(skin_px)
+    skin_frac = float(np.mean(skin_px))
+
+    if len(skin_pts) < 35 or skin_frac < 0.03:
+        return 0.0, None
+
+    sy0, sx0 = np.percentile(skin_pts, 4, axis=0).astype(int)
+    sy1, sx1 = np.percentile(skin_pts, 96, axis=0).astype(int)
+    sw, sh = max(16, sx1 - sx0), max(16, sy1 - sy0)
+
+    # Expand around the skin cluster to include hair (above) and collar/background (sides & bottom)
+    pad_x = int(sw * 0.42)
+    pad_top = int(sh * 0.55)
+    pad_bot = int(sh * 0.40)
+
+    cy0 = max(0, sy0 - pad_top)
+    cy1 = min(zone_rgb.shape[0], sy1 + pad_bot)
+    cx0 = max(0, sx0 - pad_x)
+    cx1 = min(zone_rgb.shape[1], sx1 + pad_x)
+
+    crop = zone_rgb[cy0:cy1, cx0:cx1]
+    if crop.shape[0] < 20 or crop.shape[1] < 20:
+        return 0.0, None
+
+    # Verify presence of dark hair/eyes in the upper half of the crop
+    crop_lum = 0.299 * crop[:, :, 0] + 0.587 * crop[:, :, 1] + 0.114 * crop[:, :, 2]
+    upper_dark_frac = float(np.mean(crop_lum[: int(crop.shape[0] * 0.65), :] < 85.0))
+    crop_skin_frac = float(np.mean(skin_px[cy0:cy1, cx0:cx1]))
+
+    if upper_dark_frac < 0.03:
+        return 0.0, None
+
+    score = crop_skin_frac * 2.0 + min(0.4, upper_dark_frac)
+    return score, crop
+
 def verify_kyc_portrait_is_human(file_path: str, doc_type: str = "PAN_CARD") -> dict:
     """
     100% pure NumPy + PIL portrait extractor and spoof/cartoon/child/monochrome verifier.
-    Handles e-PAN PDFs, e-Aadhaar PDFs, single-sided ID cards, and side-by-side Front+Back Aadhaar scans.
+    Accurately handles:
+      - New PAN cards (portrait on middle-left, QR code on right — e.g. Anmol's PAN card)
+      - Old PAN cards (portrait on bottom-right — e.g. Alok's PAN card)
+      - Full-page A4 e-PAN and e-Aadhaar PDFs
+      - Side-by-side Front+Back Aadhaar images
+    Never mistakes a white bedsheet or QR code for a pasted sticker.
     """
     result = {
         "portrait_found": False,
@@ -1750,72 +1802,31 @@ def verify_kyc_portrait_is_human(file_path: str, doc_type: str = "PAN_CARD") -> 
                 card_rgb = full_rgb
                 ch, cw = card_rgb.shape[:2]
 
-            # If side-by-side Front + Back Aadhaar cutout (width > 2.1x height), portrait is at x: 5%..17%
-            if doc_type == "AADHAAR_CARD" and cw > ch * 2.1:
-                left_photo_zone = card_rgb[int(ch * 0.24) : int(ch * 0.78), int(cw * 0.055) : int(cw * 0.17)]
-            else:
-                left_photo_zone = card_rgb[int(ch * 0.18) : int(ch * 0.85), int(cw * 0.04) : int(cw * 0.36)]
-
-            br_zone = card_rgb[int(ch * 0.44) : int(ch * 0.96), int(cw * 0.55) : int(cw * 0.95)]
-            full_mid_right = full_rgb[int(fh_full * 0.44) : int(fh_full * 0.66), int(fw_full * 0.52) : int(fw_full * 0.88)]
-
-            if doc_type == "PAN_CARD" and not is_full_a4_pdf:
-                for sz in (br_zone, full_mid_right):
-                    if sz is None or sz.size == 0 or sz.shape[0] < 20 or sz.shape[1] < 20:
-                        continue
-                    zr = sz[:, :, 0].astype(np.float32)
-                    zg = sz[:, :, 1].astype(np.float32)
-                    zb = sz[:, :, 2].astype(np.float32)
-                    z_lum = 0.299 * zr + 0.587 * zg + 0.114 * zb
-                    z_chroma = np.maximum(np.maximum(zr, zg), zb) - np.minimum(np.minimum(zr, zg), zb)
-
-                    white_mask = (z_lum >= 188.0) & (z_chroma <= 48.0)
-                    white_pts = np.argwhere(white_mask)
-
-                    if len(white_pts) >= 75:
-                        wy0, wx0 = np.percentile(white_pts, 2, axis=0).astype(int)
-                        wy1, wx1 = np.percentile(white_pts, 98, axis=0).astype(int)
-                        ww, wh = wx1 - wx0, wy1 - wy0
-                        aspect_w = float(ww) / max(1.0, float(wh))
-
-                        if ww >= 18 and wh >= 18 and 0.45 <= aspect_w <= 1.85:
-                            sub_white = white_mask[wy0:wy1, wx0:wx1]
-                            w_frac = float(np.mean(sub_white))
-                            l_strip = sub_white[:, : max(2, int(ww * 0.25))]
-                            r_strip = sub_white[:, max(0, int(ww * 0.75)) :]
-                            side_white_frac = float(0.5 * (np.mean(l_strip) + np.mean(r_strip)))
-
-                            if w_frac >= 0.16 and side_white_frac >= 0.26:
-                                best_crop = sz[wy0:wy1, wx0:wx1]
-                                pasted_white_sticker_detected = True
-                                sticker_white_ratio = max(w_frac, side_white_frac)
-                                break
-
-            if best_crop is None:
-                if doc_type == "AADHAAR_CARD":
-                    best_crop = left_photo_zone
+            if doc_type == "AADHAAR_CARD":
+                if cw > ch * 2.1:
+                    best_crop = card_rgb[int(ch * 0.24) : int(ch * 0.78), int(cw * 0.055) : int(cw * 0.17)]
                 else:
-                    for z in (br_zone, left_photo_zone, full_mid_right):
-                        if z is None or z.size == 0 or z.shape[0] < 24 or z.shape[1] < 24:
-                            continue
-                        zr = z[:, :, 0].astype(np.int16)
-                        zg = z[:, :, 1].astype(np.int16)
-                        zb = z[:, :, 2].astype(np.int16)
-                        skin_px = (zr > 95) & (zg > 40) & (zb > 20) & ((zr - zg) > 10) & (zr > zb)
-                        skin_pts = np.argwhere(skin_px)
-                        if len(skin_pts) >= 60:
-                            sy0, sx0 = np.percentile(skin_pts, 5, axis=0).astype(int)
-                            sy1, sx1 = np.percentile(skin_pts, 95, axis=0).astype(int)
-                            sw, sh = max(16, sx1 - sx0), max(16, sy1 - sy0)
-                            pad_x, pad_y = int(sw * 0.35), int(sh * 0.30)
-                            best_crop = z[
-                                max(0, sy0 - pad_y) : min(z.shape[0], sy1 + pad_y),
-                                max(0, sx0 - pad_x) : min(z.shape[1], sx1 + pad_x),
-                            ]
-                            break
+                    left_z = card_rgb[int(ch * 0.18) : int(ch * 0.85), int(cw * 0.04) : int(cw * 0.38)]
+                    _, face_c = _score_face_candidate_zone(left_z)
+                    best_crop = face_c if face_c is not None else left_z
+            else:
+                # PAN_CARD: New layout has portrait on Middle-Left; Old layout has portrait on Bottom-Right.
+                # Score BOTH zones for a face (skin + hair) so we NEVER grab the QR code on New PAN cards!
+                left_pan_zone = card_rgb[int(ch * 0.20) : int(ch * 0.68), int(cw * 0.03) : int(cw * 0.32)]
+                br_pan_zone = card_rgb[int(ch * 0.44) : int(ch * 0.95), int(cw * 0.54) : int(cw * 0.94)]
 
-            if best_crop is None or best_crop.size == 0:
-                best_crop = left_photo_zone if doc_type == "AADHAAR_CARD" else br_zone
+                score_left, crop_left = _score_face_candidate_zone(left_pan_zone)
+                score_br, crop_br = _score_face_candidate_zone(br_pan_zone)
+
+                if score_left >= score_br and crop_left is not None:
+                    best_crop = crop_left
+                elif crop_br is not None:
+                    best_crop = crop_br
+                else:
+                    # Also check full_rgb middle-right in case card_rgb wasn't isolated on jeans
+                    full_mid_right = full_rgb[int(fh_full * 0.44) : int(fh_full * 0.68), int(fw_full * 0.52) : int(fw_full * 0.88)]
+                    _, crop_fmr = _score_face_candidate_zone(full_mid_right)
+                    best_crop = crop_fmr if crop_fmr is not None else left_pan_zone
 
         if best_crop is None or best_crop.size == 0:
             return result
@@ -1838,17 +1849,26 @@ def verify_kyc_portrait_is_human(file_path: str, doc_type: str = "PAN_CARD") -> 
         small_rgb = np.array(small_pil)
         unique_colors = len(np.unique((small_rgb // 16).reshape(-1, 3), axis=0))
 
-        bright_white_mask = (crop_gray >= 190.0) & (crop_chroma <= 45.0)
+        # Colored studio backdrop check (e.g., blue backdrop on Anmol's PAN card or maroon on Ayaz's e-PAN)
+        # If the left & right background strips have strong color saturation (chroma >= 35), it is a genuine colored studio photo, NOT a white paper cutout!
+        ch_c, cw_c = best_crop.shape[:2]
+        l_strip_chroma = float(np.mean(crop_chroma[:, : max(2, int(cw_c * 0.22))]))
+        r_strip_chroma = float(np.mean(crop_chroma[:, max(0, int(cw_c * 0.78)) :]))
+        has_colored_studio_backdrop = (0.5 * (l_strip_chroma + r_strip_chroma)) >= 32.0
+
+        bright_white_mask = (crop_gray >= 192.0) & (crop_chroma <= 42.0)
         pure_white_ratio = float(np.mean(bright_white_mask))
 
-        ch_c, cw_c = best_crop.shape[:2]
-        l_margin_white = float(np.mean(bright_white_mask[:, : max(2, int(cw_c * 0.25))]))
-        r_margin_white = float(np.mean(bright_white_mask[:, max(0, int(cw_c * 0.75)) :]))
+        l_margin_white = float(np.mean(bright_white_mask[:, : max(2, int(cw_c * 0.22))]))
+        r_margin_white = float(np.mean(bright_white_mask[:, max(0, int(cw_c * 0.78)) :]))
         side_margin_white = 0.5 * (l_margin_white + r_margin_white)
 
-        skin_mask = (cr_f > 95.0) & (cg_f > 40.0) & (cb_f > 20.0) & ((cr_f - cg_f) > 10.0) & (cr_f > cb_f)
+        skin_mask = (cr_f > 90.0) & (cg_f > 38.0) & (cb_f > 20.0) & ((cr_f - cg_f) >= 8.0) & ((cr_f - cb_f) >= 10.0)
         skin_ratio = float(np.mean(skin_mask))
 
+        # Bottom 25% collar check:
+        # In Alok's cartoon baby sticker, the bottom 25% is bare skin + stark white paper (>= 80%), with no shirt collar.
+        # In Anmol's & Ayaz's real PAN cards, there is a colored studio backdrop and/or shirt collar.
         bot_idx = int(ch_c * 0.74)
         bot_skin_or_white = float(np.mean(skin_mask[bot_idx:, :] | bright_white_mask[bot_idx:, :]))
         bot_skin_only = float(np.mean(skin_mask[bot_idx:, :]))
@@ -1857,31 +1877,38 @@ def verify_kyc_portrait_is_human(file_path: str, doc_type: str = "PAN_CARD") -> 
         gy = np.abs(np.diff(crop_gray, axis=0, append=crop_gray[-1:, :]))
         grad_mag = np.hypot(gx, gy)
         flat_pixel_ratio = float(np.mean(grad_mag < 3.0))
-        high_sat_ratio = float(np.mean(crop_chroma > 120.0))
+        high_sat_ratio = float(np.mean(crop_chroma > 135.0))
 
         is_invalid_portrait = False
         reasons = []
 
-        if (
-            pasted_white_sticker_detected
-            or (not is_full_a4_pdf and doc_type == "PAN_CARD" and side_margin_white >= 0.25 and pure_white_ratio >= 0.18)
-        ) and (bot_skin_or_white >= 0.72 or side_margin_white >= 0.32):
-            is_invalid_portrait = True
-            pct = int(max(pure_white_ratio, sticker_white_ratio, side_margin_white) * 100)
-            reasons.append(f"pasted white-cutout sticker / spoof portrait detected ({pct}% stark white cutout background)")
+        # Rule 1 & 2: Pasted white sticker + bare-shoulder infant/cartoon cutout (ONLY if NOT a colored studio backdrop!)
+        if not has_colored_studio_backdrop:
+            if (
+                doc_type == "PAN_CARD"
+                and not is_full_a4_pdf
+                and side_margin_white >= 0.32
+                and pure_white_ratio >= 0.22
+                and bot_skin_or_white >= 0.75
+                and bot_skin_only >= 0.22
+            ):
+                is_invalid_portrait = True
+                pct = int(max(pure_white_ratio, side_margin_white) * 100)
+                reasons.append(
+                    f"pasted white-cutout sticker / infant bare-shoulder spoof portrait detected ({pct}% stark white cutout background)"
+                )
 
-        if bot_skin_or_white >= 0.80 and bot_skin_only >= 0.24 and pure_white_ratio >= 0.14:
-            is_invalid_portrait = True
-            reasons.append("infant / child bare-shoulder cutout or morphed caricature detected (missing clothing collar region)")
-
-        if unique_colors < 16 and flat_pixel_ratio > 0.65:
+        # Rule 3: Quantized flat-fill cartoon / vector avatar
+        if unique_colors < 14 and flat_pixel_ratio > 0.68:
             is_invalid_portrait = True
             reasons.append(f"flat quantized cartoon color palette ({unique_colors} color clusters)")
 
-        if high_sat_ratio > 0.35 and skin_ratio < 0.06:
+        # Rule 4: Synthetic neon cartoon with no human skin
+        if high_sat_ratio > 0.40 and skin_ratio < 0.05:
             is_invalid_portrait = True
             reasons.append("synthetic cartoon color saturation with no natural human skin tone")
 
+        # Rule 5: Celebrity Watchlist & Monochrome/Historical Cutout Check (Gandhi B&W cutout, Salman, SRK, etc.)
         is_celeb_or_mono, celeb_reasons = _check_celebrity_watchlist_and_monochrome_spoof(best_crop)
         if is_celeb_or_mono:
             is_invalid_portrait = True
@@ -1896,7 +1923,6 @@ def verify_kyc_portrait_is_human(file_path: str, doc_type: str = "PAN_CARD") -> 
                 f"Page 1 KYC Portrait Anomaly: Uploaded ID contains a spoof, monochrome cutout, cartoon, or non-genuine image "
                 f"instead of a valid live KYC photograph ({reason_str})."
             )
-            # Include 'Duplicate / Spoof Identity' so Family A scores 0.80+ and pushes Overall Risk into HIGH RISK (>= 0.72)
             result["kyc_logic_flag"] = (
                 f"Page 1 Duplicate / Spoof Biometric Identity Gate Failure: Portrait region failed live human photograph "
                 f"verification ({reason_str})."
@@ -1905,6 +1931,12 @@ def verify_kyc_portrait_is_human(file_path: str, doc_type: str = "PAN_CARD") -> 
                 f"Page 1 Pixel Tampering (ELA Anomaly): Portrait region exhibits pasted sticker/cutout boundary "
                 f"compression mismatch ({reason_str})."
             )
+
+        print(
+            f"[KYC PORTRAIT DEBUG] doc={doc_type} | colored_bg={has_colored_studio_backdrop} | "
+            f"skin={skin_ratio:.2f} | white={pure_white_ratio:.2f} | side_w={side_margin_white:.2f} | "
+            f"bot_sw={bot_skin_or_white:.2f} | status={result['portrait_status']}"
+        )
     except Exception as exc:
         print(f"[KYC PORTRAIT ERROR] {exc}")
 

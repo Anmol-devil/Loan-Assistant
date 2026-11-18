@@ -338,7 +338,39 @@ def scan_pdf_structure(file_path: str, ocr_engine=None) -> Dict[str, Any]:
                         os.remove(tmp_img)
 
             lines = _group_spans_into_lines(page_spans)
-
+            page_spans.sort(key=lambda s: (s["cy_points"], s["cx_points"]))
+            skip_sp = set()
+            stitched_spans = []
+            for idx_s, sp in enumerate(page_spans):
+                if idx_s in skip_sp:
+                    continue
+                t1 = sp["text"].strip()
+                # 1. Stitch wrapped date tails ('10/Apr/20' + '24' or '01/May/2' + '024')
+                if sp["cx_norm"] <= 0.35 and re.match(r"^\d{1,2}[/\-][A-Za-z]{3}[/\-]20?$", t1, re.I):
+                    for j_s in range(idx_s + 1, min(len(page_spans), idx_s + 12)):
+                        if j_s in skip_sp:
+                            continue
+                        sp2 = page_spans[j_s]
+                        if 0 < (sp2["cy_points"] - sp["cy_points"]) <= 16.0 and abs(sp2["cx_points"] - sp["cx_points"]) <= 24.0:
+                            t2 = sp2["text"].strip()
+                            if re.match(r"^\d{2,3}$", t2) and len(t1.split("/")[-1]) + len(t2) == 4:
+                                sp["text"] = t1 + t2
+                                skip_sp.add(j_s)
+                                break
+                # 2. Stitch wrapped monetary paise ('9,32,607.' + '00' or '10,11,062' + '.00')
+                elif sp["cx_norm"] >= 0.55 and re.match(r"^[+-]?(?:\d{1,3}(?:,\d{2,3})+|\d{3,})\.?$", t1):
+                    for j_s in range(idx_s + 1, min(len(page_spans), idx_s + 12)):
+                        if j_s in skip_sp:
+                            continue
+                        sp2 = page_spans[j_s]
+                        if 0 < (sp2["cy_points"] - sp["cy_points"]) <= 16.0 and abs(sp2["cx_points"] - sp["cx_points"]) <= 28.0:
+                            t2 = sp2["text"].strip()
+                            if (t1.endswith(".") and re.match(r"^\d{2}$", t2)) or ("," in t1 and re.match(r"^\.\d{2}$", t2)):
+                                sp["text"] = t1.rstrip(".") + "." + t2.lstrip(".")
+                                skip_sp.add(j_s)
+                                break
+                stitched_spans.append(sp)
+            page_spans = stitched_spans
             header_line_idx = None
             date_row_count = 0
             summary_lines: List[str] = []
