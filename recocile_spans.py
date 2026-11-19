@@ -29,14 +29,15 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
     if full_text:
         txt_summary = extract_summary_from_full_text(full_text)
         for k, vals in txt_summary.items():
-            for v in vals:
-                if v not in summary[k]:
-                    summary[k].append(v)
+            items = [vals] if isinstance(vals, str) else vals
+            target = summary.setdefault(k, [])
+            for v in items:
+                if v not in target:
+                    target.append(v)
 
     last_known_header_map = {}
     per_page_stats = []
     last_valid_sl_no = 0
-
     for page_idx, page_spans in enumerate(pages_spans, start=1):
         initial_rows = group_into_rows(page_spans, y_tolerance=y_tolerance)
         header_map = {}

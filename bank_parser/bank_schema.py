@@ -550,7 +550,23 @@ def _deterministic_blueprint_discovery(
             stated_summary["total_debits"] = abs(_parse_float_safe(m_axis_tot.group(1)) or 0.0)
             stated_summary["total_credits"] = abs(_parse_float_safe(m_axis_tot.group(2)) or 0.0)
             stated_summary["grounding_evidence"]["transaction_total"] = {"page": p_no, "label": "TRANSACTION TOTAL DR/CR"}
-
+        m_icici_tot = re.search(
+            r"Page\s+Total[\s\S]{0,60}?Opening\s+Bal\s*:\s*([+-]?[\d,]+\.\d{2})[\s\S]{0,60}?"
+            r"Withdrawls?\s*:\s*([\d,]+\.\d{2})[\s\S]{0,60}?Deposits?\s*:\s*([\d,]+\.\d{2})[\s\S]{0,60}?"
+            r"Closing\s+Bal\s*:\s*([+-]?[\d,]+\.\d{2})",
+            s_txt,
+            re.I,
+        )
+        if m_icici_tot:
+            stated_summary["summary_found_on_page"] = p_no
+            stated_summary["opening_balance"] = _parse_float_safe(m_icici_tot.group(1))
+            stated_summary["opening_balance_source"] = "EXTRACTED_FROM_STATEMENT"
+            stated_summary["total_debits"] = abs(_parse_float_safe(m_icici_tot.group(2)) or 0.0)
+            stated_summary["total_credits"] = abs(_parse_float_safe(m_icici_tot.group(3)) or 0.0)
+            stated_summary["closing_balance"] = _parse_float_safe(m_icici_tot.group(4))
+            stated_summary["grounding_evidence"]["summary_table"] = {"page": p_no, "label": "ICICI Page Total Summary"}
+            break
+        
         m_ob = re.search(r"OPENING\s+BAL(?:ANCE)?[\s\|:]+([+-]?\s*(?:INR|Rs\.?|₹)?\s*[\d,]+\.\d{2}(?:\s*\(?[CD]r\)?)?)", s_txt, re.I)
         if m_ob and stated_summary["opening_balance"] is None:
             stated_summary["opening_balance"] = _parse_float_safe(m_ob.group(1))

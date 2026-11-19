@@ -79,7 +79,7 @@ def _parse_monetary_token(text: str) -> Tuple[Optional[float], Optional[str]]:
         return None, None
     s_clean = re.sub(r"(?:INR|Rs\.?|₹|\$|\s)", "", s, flags=re.I)
     m = re.match(
-        r"^([+-]?(?:\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d{1,2})?|\.\d{2})(?:\(?([CD]r)\.?\)?)?([+-])?$",
+        r"^([+-]?(?:\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d{1,2})?)(?:\(?([CD]r)\.?\)?)?([+-])?$",
         s_clean,
         re.I,
     )
@@ -289,10 +289,6 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
                     continue
                 first_dated_idx = idx_l
                 break
-
-        # On Page 1 (or pages with a repeated table header), start right after the table header.
-        # On continuation pages without a table header (h_idx is None), start at line 0 so we NEVER
-        # slice off a top-of-page balance line whose date sits on the sub-line below it!
         if h_idx is not None:
             start_line = h_idx + 1
         else:
@@ -628,9 +624,15 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
                         debit_val = -abs(a_v) if is_neg_token else abs(a_v)
                     else:
                         credit_val = -abs(a_v) if is_neg_token else abs(a_v)
-                elif prev_b is not None and abs((prev_b - abs(a_v)) - bal_val) <= 1.0:
+                elif prev_b is not None and (
+                    abs((prev_b - abs(a_v)) - bal_val) <= 1.0
+                    or (prev_b < 0 and bal_val > 0 and abs((prev_b - abs(a_v)) - (-bal_val)) <= 1.0)
+                ):
                     debit_val = abs(a_v)
-                elif prev_b is not None and abs((prev_b + abs(a_v)) - bal_val) <= 1.0:
+                elif prev_b is not None and (
+                    abs((prev_b + abs(a_v)) - bal_val) <= 1.0
+                    or (prev_b < 0 and bal_val > 0 and abs((prev_b + abs(a_v)) - (-bal_val)) <= 1.0)
+                ):
                     credit_val = abs(a_v)
                 else:
                     if prev_b is not None and bal_val < prev_b:

@@ -345,27 +345,44 @@ def scan_pdf_structure(file_path: str, ocr_engine=None) -> Dict[str, Any]:
                 if idx_s in skip_sp:
                     continue
                 t1 = sp["text"].strip()
-                # 1. Stitch wrapped date tails ('10/Apr/20' + '24' or '01/May/2' + '024')
-                if sp["cx_norm"] <= 0.35 and re.match(r"^\d{1,2}[/\-][A-Za-z]{3}[/\-]20?$", t1, re.I):
-                    for j_s in range(idx_s + 1, min(len(page_spans), idx_s + 12)):
+                if sp["cx_norm"] <= 0.38 and re.match(r"^\d{1,2}[/\-][A-Za-z]{3}[/\-]20?[12]?$", t1, re.I):
+                    x0_1, x1_1 = sp["bbox_points"][0], sp["bbox_points"][2]
+                    tail_yr = re.split(r"[/\-]", t1)[-1]
+                    best_j, best_dx = None, 9999.0
+                    for j_s in range(idx_s + 1, min(len(page_spans), idx_s + 24)):
                         if j_s in skip_sp:
                             continue
                         sp2 = page_spans[j_s]
-                        if 0 < (sp2["cy_points"] - sp["cy_points"]) <= 16.0 and abs(sp2["cx_points"] - sp["cx_points"]) <= 24.0:
-                            t2 = sp2["text"].strip()
-                            if re.match(r"^\d{2,3}$", t2) and len(t1.split("/")[-1]) + len(t2) == 4:
-                                sp["text"] = t1 + t2
-                                skip_sp.add(j_s)
-                                break
-                # 2. Stitch wrapped monetary paise ('9,32,607.' + '00' or '10,11,062' + '.00')
-                elif sp["cx_norm"] >= 0.55 and re.match(r"^[+-]?(?:\d{1,3}(?:,\d{2,3})+|\d{3,})\.?$", t1):
-                    for j_s in range(idx_s + 1, min(len(page_spans), idx_s + 12)):
+                        dy = sp2["cy_points"] - sp["cy_points"]
+                        if dy <= 0 or dy > 22.0:
+                            continue
+                        x0_2, x1_2 = sp2["bbox_points"][0], sp2["bbox_points"][2]
+                        if x1_2 < (x0_1 - 2.0) or x0_2 > (x1_1 + 2.0):
+                            continue
+                        t2 = sp2["text"].strip()
+                        if re.match(r"^(?:02\d|2\d|\d)$", t2) and len(tail_yr) + len(t2) == 4 and (tail_yr + t2).startswith("202"):
+                            dx = abs(sp2["cx_points"] - sp["cx_points"])
+                            if dx < best_dx:
+                                best_dx = dx
+                                best_j = j_s
+                    if best_j is not None:
+                        sp["text"] = t1 + page_spans[best_j]["text"].strip()
+                        skip_sp.add(best_j)
+                # 2. Wrapped monetary paise ('9,32,607.' + '00' or '10,16,668' + '.85')
+                elif sp["cx_norm"] >= 0.52 and re.match(r"^[+-]?(?:\d{1,3}(?:,\d{2,3})+|\d{3,})\.?$", t1):
+                    for j_s in range(idx_s + 1, min(len(page_spans), idx_s + 18)):
                         if j_s in skip_sp:
                             continue
                         sp2 = page_spans[j_s]
-                        if 0 < (sp2["cy_points"] - sp["cy_points"]) <= 16.0 and abs(sp2["cx_points"] - sp["cx_points"]) <= 28.0:
+                        dy = sp2["cy_points"] - sp["cy_points"]
+                        dx_ok = (
+                            abs(sp2["cx_points"] - sp["cx_points"]) <= 45.0
+                            or abs(sp2["bbox_points"][0] - sp["bbox_points"][0]) <= 45.0
+                            or abs(sp2["bbox_points"][2] - sp["bbox_points"][2]) <= 45.0
+                        )
+                        if 0 < dy <= 22.0 and dx_ok:
                             t2 = sp2["text"].strip()
-                            if (t1.endswith(".") and re.match(r"^\d{2}$", t2)) or ("," in t1 and re.match(r"^\.\d{2}$", t2)):
+                            if (t1.endswith(".") and re.match(r"^\d{2}$", t2)) or ("," in t1 and re.match(r"^\.?\d{2}$", t2)):
                                 sp["text"] = t1.rstrip(".") + "." + t2.lstrip(".")
                                 skip_sp.add(j_s)
                                 break

@@ -371,7 +371,10 @@ def _slice_page1_pre_table(page1_text: str) -> str:
 
     for idx, ln in enumerate(lines):
         low_ln = ln.lower().strip(" |:-")
-        if low_ln in single_line_hdr_markers:
+        if low_ln in single_line_hdr_markers or low_ln.startswith(("cheque no/", "withdra", "tran id", "si no", "sl no")):
+            break
+        win_low = " ".join(lines[idx : min(len(lines), idx + 8)]).lower()
+        if ("value" in win_low and "date" in win_low and "balance" in win_low and ("withdra" in win_low or "deposit" in win_low)):
             break
         if ("date" in low_ln or "transactio" in low_ln) and any(
             k in low_ln for k in ("narration", "particular", "description", "remark", "withdrawal", "withdrawl", "deposit", "debit", "credit", "balance")
@@ -391,13 +394,33 @@ def _slice_page1_pre_table(page1_text: str) -> str:
 
     return "\n".join(pre_lines)
 
-
 def _extract_bank_strictly_from_header(
     pre_table_text: str,
     full_text: str,
     file_path: str = "",
     original_filename: str = "",
 ) -> str:
+    top_chunk = (full_text or "")[:1200]
+    ifsc_m = re.search(r"\bIFSC(?:\s+Code)?\s*[:\-]?\s*([A-Z]{4})0[A-Z0-9]{6}\b", top_chunk, re.I)
+    if ifsc_m:
+        ifsc_map = {
+            "ICIC": "ICICI Bank",
+            "HDFC": "HDFC Bank",
+            "SBIN": "State Bank of India",
+            "UTIB": "Axis Bank",
+            "KKBK": "Kotak Mahindra Bank",
+            "PUNB": "Punjab National Bank",
+            "BARB": "Bank of Baroda",
+            "CNRB": "Canara Bank",
+            "UBIN": "Union Bank of India",
+            "IDFB": "IDFC FIRST Bank",
+            "INDB": "IndusInd Bank",
+            "YESB": "Yes Bank",
+            "BKID": "Bank of India",
+        }
+        matched_bank = ifsc_map.get(ifsc_m.group(1).upper())
+        if matched_bank:
+            return matched_bank
     pre_up = (pre_table_text or "").upper()
     pre_nospace = re.sub(r"[ \t]+", "", pre_up)
 
@@ -585,7 +608,7 @@ def identify_document_and_entity(file_path: str, raw_report: dict = None) -> dic
             identity_info_acct_type = act_map.get(raw_act, raw_act)
         else:
             identity_info_acct_type = None
-
+    
         if not holder:
             for ln in pre_table_header.splitlines():
                 clean_ln = re.sub(r"^(?:Main\s*Account\s*Holder\s*Name|Account\s*Name|Name)\s*[:\|\-]+\s*", "", ln.strip(), flags=re.I)
@@ -995,18 +1018,36 @@ def build_module1_output(file_path, raw_report, tenant_id="default_lender", doc_
         f"Blueprint detection: "
         f"{raw_report.get('financial_reconciliation', {}).get('blueprint_metadata', {}).get('issuing_bank')}"
     )
+    # Override GST header card with exact subtype (REG-06 / GSTR-1 / GSTR-3B / GSTR-2B), Trade Name & Embedded PAN
+    _gst_fin = (raw_report or {}).get("financial_reconciliation") or {}
+    if _gst_fin.get("document_type") == "GST_CERTIFICATE":
+        legal_n = _gst_fin.get("legal_name")
+        trade_n = _gst_fin.get("trade_name")
+        form_lbl = _gst_fin.get("form_display_label") or "GST Document"
+        gst_form = _gst_fin.get("gst_form_type") or "GST"
+        display_holder = trade_n or legal_n or "Unknown"
+
+        identity_info["doc_category"] = form_lbl
+        identity_info["issuing_bank"] = f"GST PORTAL ({gst_form})"
+        identity_info["pan_number"] = _gst_fin.get("pan_number") or _gst_fin.get("embedded_pan")
+        identity_info["holder_name"] = display_holder
+        identity_info["display_title"] = f"{form_lbl} of {display_holder}"
     doc_code = identity_info.get("doc_code", "UNKNOWN_DOCUMENT")
     doc_label = identity_info.get("doc_category", "Unknown Document")
     bp_meta = raw_report.get("financial_reconciliation", {}).get("blueprint_metadata") or {}
     bp_bank = (bp_meta.get("issuing_bank") or "").strip()
     bp_holder = (bp_meta.get("holder_name") or "").strip()
-    if (
-        (not identity_info.get("issuing_bank") or identity_info.get("issuing_bank") == "UNKNOWN")
-        and bp_bank
-        and not bp_bank.lower().startswith("tmp")
-        and not bp_bank.lower().endswith((".pdf", ".docx", ".png", ".jpg", ".jpeg"))
-    ):
-        identity_info["issuing_bank"] = bp_bank
+    
+    if bp_bank and not bp_bank.lower().startswith("tmp") and not bp_bank.lower().endswith((".pdf", ".docx", ".png", ".jpg", ".jpeg")):
+        cur_b = (identity_info.get("issuing_bank") or "UNKNOWN").strip()
+        fn_check = ((raw_report or {}).get("original_filename") or file_path or "").lower()
+
+        if cur_b == "UNKNOWN" or (
+            bp_bank.lower().split()[0] in fn_check
+            and cur_b.lower().split()[0] not in fn_check
+        ):
+            identity_info["issuing_bank"] = bp_bank
+
     if bp_holder and bp_holder not in ("Unknown Holder", "") and identity_info.get("holder_name") in (None, "", "Unknown Holder"):
         clean_bp_h = _format_entity_name_clean(bp_holder)
         identity_info["holder_name"] = clean_bp_h

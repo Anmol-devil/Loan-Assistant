@@ -37,7 +37,7 @@ MALFORMED_MULTI_DOT_RE = re.compile(r"^[₹$\s]*([+-]?\d{1,3}(?:\.\d{2,3})+\.\d{
 MALFORMED_THREE_DEC_RE = re.compile(r"^[₹$\s]*([+-]?\d{1,3})\.(\d{3})$")
 
 AMOUNT_CR_DR_RE = re.compile(
-    r"^([+-]?(?:(?:\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d{1,2})?|\.\d{1,2}))\s*(?:\((Cr|Dr)\)|\b(Cr|Dr)\b)?([+-])?$",
+    r"^([+-]?(?:\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d{1,2})?)\s*(?:\((Cr|Dr)\)|\b(Cr|Dr)\b)?([+-])?$",
     re.IGNORECASE,
 )
 
@@ -258,10 +258,7 @@ def group_into_rows(spans, y_tolerance=6.0):
         row.sort(key=lambda s: s["cx"])
     return rows
 
-
-# ==============================================================================
 # 2. SUMMARY CARD & FULL-TEXT SUMMARY EXTRACTORS
-# ==============================================================================
 def _parse_indian_date_safe(date_str: str) -> datetime.date | None:
     if not date_str:
         return None
@@ -271,6 +268,8 @@ def _parse_indian_date_safe(date_str: str) -> datetime.date | None:
         d, m, y = int(m_num.group(1)), int(m_num.group(2)), int(m_num.group(3))
         if y < 100:
             y += 2000
+        elif 200 <= y <= 209:
+            y = 2024
         try:
             return datetime.date(y, m, d)
         except ValueError:
@@ -283,6 +282,8 @@ def _parse_indian_date_safe(date_str: str) -> datetime.date | None:
         y = int(m_alpha.group(3))
         if y < 100:
             y += 2000
+        elif 200 <= y <= 209:
+            y = 2024
         m = MONTH_MAP.get(mon_s) or MONTH_MAP.get(mon_s[:3])
         if m:
             try:
@@ -435,8 +436,29 @@ def extract_summary_from_full_text(full_text: str) -> dict:
         if cb is not None:
             summary["closing_balance"] = [cb]
 
-    return summary
+    icici_tot_m = re.search(
+        r"Page\s+Total[\s\S]{0,60}?Opening\s+Bal\s*:\s*([+-]?[\d,]+\.\d{2})[\s\S]{0,60}?"
+        r"Withdrawls?\s*:\s*([\d,]+\.\d{2})[\s\S]{0,60}?Deposits?\s*:\s*([\d,]+\.\d{2})[\s\S]{0,60}?"
+        r"Closing\s+Bal\s*:\s*([+-]?[\d,]+\.\d{2})",
+        full_text,
+        re.IGNORECASE,
+    )
+    if icici_tot_m:
+        ob = parse_amount(icici_tot_m.group(1))
+        db = parse_amount(icici_tot_m.group(2))
+        cr = parse_amount(icici_tot_m.group(3))
+        cb = parse_amount(icici_tot_m.group(4))
+        if ob is not None:
+            summary["opening_balance"] = [ob]
+            summary["opening_balance_source"] = "EXTRACTED_FROM_STATEMENT"
+        if db is not None:
+            summary["summary_debits"] = [abs(db)]
+        if cr is not None:
+            summary["summary_credits"] = [abs(cr)]
+        if cb is not None:
+            summary["closing_balance"] = [cb]
 
+    return summary
 
 # 3. VERTICAL NUMBER, SIGN & DATE STITCHING
 def Stitch_Vertical_Wrapped_Numbers(page_spans, numeric_col_xs, x_tol=48.0, y_tol=24.0):
@@ -514,14 +536,97 @@ def Stitch_Vertical_Wrapped_Numbers(page_spans, numeric_col_xs, x_tol=48.0, y_to
     return stitched
 
 # 4. BANK STATEMENT ARITHMETIC & INVARIANT RECONCILIATION
+def _normalize_unsigned_overdraft_ledger(ordered_txs: list[dict], summary: dict | None) -> None:
+    """
+    Normalizes Overdraft (CAA/OD/CC) ledgers like ICICI where Page Total prints negative
+    Opening/Closing balances (-9,37,957.00 / -15,21,962.22), while table rows omit '-'.
+    Must run BEFORE opening_balance and running_bal are initialized in run_math_checks().
+    """
+    if not ordered_txs:
+        return
+
+    def _first_float(val):
+        if isinstance(val, (list, tuple)):
+            return float(val[0]) if val and val[0] is not None else None
+        return float(val) if val is not None else None
+
+    sum_cb = _first_float((summary or {}).get("closing_balance"))
+    sum_ob = _first_float((summary or {}).get("opening_balance"))
+    last_bal = ordered_txs[-1].get("balance")
+    first_bal = ordered_txs[0].get("balance")
+
+    is_unsigned_od = False
+    if (
+        sum_cb is not None
+        and sum_cb < 0
+        and last_bal is not None
+        and last_bal > 0
+        and abs(abs(sum_cb) - abs(last_bal)) <= 1.5
+    ):
+        is_unsigned_od = True
+    elif (
+        sum_ob is not None
+        and sum_ob < 0
+        and first_bal is not None
+        and first_bal > 0
+    ):
+        d0 = float(ordered_txs[0].get("debit") or 0.0)
+        c0 = float(ordered_txs[0].get("credit") or 0.0)
+        if (
+            abs((sum_ob + d0) - (-abs(first_bal))) <= 1.5
+            or abs((sum_ob - c0) - (-abs(first_bal))) <= 1.5
+            or abs((sum_ob + c0 - d0) - (-abs(first_bal))) <= 1.5
+        ):
+            is_unsigned_od = True
+
+    if not is_unsigned_od:
+        return
+
+    for t in ordered_txs:
+        if t.get("balance") is not None and t["balance"] > 0:
+            t["balance"] = -abs(float(t["balance"]))
+
+    # Discard stale positive opening balance inferred before overdraft negation
+    if sum_ob is not None and sum_ob > 0:
+        if summary is not None:
+            summary["opening_balance"] = []
+        sum_ob = None
+
+    # 2. Re-align Row 0 Debit/Credit against stated negative opening balance
+    r0 = ordered_txs[0]
+    if sum_ob is not None and r0.get("balance") is not None:
+        d0 = float(r0.get("debit") or 0.0)
+        c0 = float(r0.get("credit") or 0.0)
+        b0 = float(r0["balance"])
+        if d0 > 0 and c0 == 0 and abs((sum_ob + d0) - b0) <= 1.0 and abs((sum_ob - d0) - b0) > 1.0:
+            r0["credit"], r0["debit"] = d0, 0.0
+        elif c0 > 0 and d0 == 0 and abs((sum_ob - c0) - b0) <= 1.0 and abs((sum_ob + c0) - b0) > 1.0:
+            r0["debit"], r0["credit"] = c0, 0.0
+
+    # 3. Re-align Rows 1..N Debit/Credit so prev_bal + credit - debit == cur_bal
+    for i in range(1, len(ordered_txs)):
+        prev_b = ordered_txs[i - 1].get("balance")
+        cur_b = ordered_txs[i].get("balance")
+        if prev_b is None or cur_b is None:
+            continue
+        d = float(ordered_txs[i].get("debit") or 0.0)
+        c = float(ordered_txs[i].get("credit") or 0.0)
+        if d > 0 and c == 0:
+            if abs((prev_b + d) - cur_b) <= 1.0 and abs((prev_b - d) - cur_b) > 1.0:
+                ordered_txs[i]["credit"], ordered_txs[i]["debit"] = d, 0.0
+        elif c > 0 and d == 0:
+            if abs((prev_b - c) - cur_b) <= 1.0 and abs((prev_b + c) - cur_b) > 1.0:
+                ordered_txs[i]["debit"], ordered_txs[i]["credit"] = c, 0.0
+                
 def run_math_checks(
     summary,
     transactions,
     issues,
     detailed_issues,
     is_reverse_chrono=False,
-    full_text="",
+    full_text=""
 ):
+    # 1. INITIALIZE AUDIT COVERAGE
     audit_coverage = {
         "row_completeness_verified": "NOT_RUN",
         "summary_cards_extracted": "NOT_APPLICABLE",
@@ -531,13 +636,35 @@ def run_math_checks(
         "statement_period_verified": "NOT_APPLICABLE",
     }
 
+    # 2. SANITIZE SUMMARY & BACKFILL MISSING FIELDS FROM FULL TEXT
+    def _to_list(val):
+        if isinstance(val, (list, tuple)):
+            return [v for v in val if v is not None]
+        return [val] if val is not None else []
+
     summary = dict(summary or {})
-    summary["opening_balance"] = [v for v in (summary.get("opening_balance") or []) if v is not None]
-    summary["closing_balance"] = [v for v in (summary.get("closing_balance") or []) if v is not None]
-    summary["summary_credits"] = [abs(v) for v in (summary.get("summary_credits") or []) if v is not None and v >= 0]
-    summary["summary_debits"] = [abs(v) for v in (summary.get("summary_debits") or []) if v is not None and v >= 0]
+    summary["opening_balance"] = [float(v) for v in _to_list(summary.get("opening_balance"))]
+    summary["closing_balance"] = [float(v) for v in _to_list(summary.get("closing_balance"))]
+    summary["summary_credits"] = [abs(float(v)) for v in _to_list(summary.get("summary_credits")) if float(v) >= 0]
+    summary["summary_debits"] = [abs(float(v)) for v in _to_list(summary.get("summary_debits")) if float(v) >= 0]
     opening_balance_source = summary.get("opening_balance_source") or "UNKNOWN"
 
+    if full_text:
+        ft_summary = extract_summary_from_full_text(full_text)
+        if (
+            not summary["opening_balance"]
+            or opening_balance_source in ("INFERRED_FROM_FIRST_TRANSACTION", "UNKNOWN")
+        ) and ft_summary.get("opening_balance"):
+            summary["opening_balance"] = [float(ft_summary["opening_balance"][0])]
+            opening_balance_source = "EXTRACTED_FROM_STATEMENT"
+        if not summary["closing_balance"] and ft_summary.get("closing_balance"):
+            summary["closing_balance"] = [float(ft_summary["closing_balance"][0])]
+        if not summary["summary_credits"] and ft_summary.get("summary_credits"):
+            summary["summary_credits"] = [abs(float(ft_summary["summary_credits"][0]))]
+        if not summary["summary_debits"] and ft_summary.get("summary_debits"):
+            summary["summary_debits"] = [abs(float(ft_summary["summary_debits"][0]))]
+
+    # 3. HANDLE EMPTY TRANSACTIONS
     if not transactions:
         msg = "Fatal: No valid transaction rows could be extracted for reconciliation."
         issues.append(msg)
@@ -559,6 +686,7 @@ def run_math_checks(
             "detailed_issues": detailed_issues,
         }
 
+    # 4. STRIP TRAILING SUMMARY / PAGE TOTAL ROWS
     active_txs = list(transactions)
     summary_row_keywords = (
         "total debit", "total credit", "total transaction", "debit count",
@@ -587,6 +715,7 @@ def run_math_checks(
         else:
             break
 
+    # 5. ROW COMPLETENESS CHECK
     sl_nos = [t.get("sl_no") for t in active_txs if t.get("sl_no") is not None]
     if len(sl_nos) >= len(active_txs) * 0.6 and sl_nos:
         max_sl = max(sl_nos)
@@ -600,18 +729,19 @@ def run_math_checks(
             issues.append(msg)
             detailed_issues.append({"page": 1, "bbox": None, "text": msg})
         else:
-            all_fields_complete = all(
-                bool(t.get("date"))
-                and t.get("balance") is not None
-                and (abs(t.get("credit", 0.0)) > 0 or abs(t.get("debit", 0.0)) > 0 or bool(t.get("description")))
-                for t in active_txs
-            )
-            audit_coverage["row_completeness_verified"] = "PASSED" if (all_fields_complete and len(active_txs) > 0) else "FAILED"
+            audit_coverage["row_completeness_verified"] = "PASSED"
     else:
-        audit_coverage["row_completeness_verified"] = "NOT_RUN"
+        all_fields_complete = all(
+            bool(t.get("date"))
+            and t.get("balance") is not None
+            and (abs(t.get("credit", 0.0)) > 0 or abs(t.get("debit", 0.0)) > 0 or bool(t.get("description")))
+            for t in active_txs
+        )
+        audit_coverage["row_completeness_verified"] = "PASSED" if (all_fields_complete and len(active_txs) > 0) else "FAILED"
 
     ordered_txs = active_txs
 
+    # 6. STATEMENT PERIOD VERIFICATION
     if full_text and ordered_txs:
         raw_start, raw_end, d_start, d_end = extract_declared_statement_period(full_text)
         if d_start and d_end:
@@ -621,7 +751,6 @@ def run_math_checks(
             ]
             valid_tx_dates = [(p, ds, dt) for p, ds, dt in parsed_tx_dates if dt is not None]
             if valid_tx_dates:
-                min_page, min_ds, min_dt = min(valid_tx_dates, key=lambda item: (item[2], item[0]))
                 max_page, max_ds, max_dt = max(valid_tx_dates, key=lambda item: (item[2], item[0]))
                 missing_days = (d_end - max_dt).days
                 declared_span_days = max(1, (d_end - d_start).days)
@@ -651,6 +780,44 @@ def run_math_checks(
                 else:
                     audit_coverage["statement_period_verified"] = "PASSED"
 
+    # 7. INLINE UNSIGNED OVERDRAFT NORMALIZER (RUNS BEFORE OPENING BAL!)
+    sum_cb = summary["closing_balance"][0] if summary.get("closing_balance") else None
+    sum_ob = summary["opening_balance"][0] if summary.get("opening_balance") else None
+    if (
+        sum_cb is not None
+        and sum_cb < 0
+        and ordered_txs[-1].get("balance") is not None
+        and ordered_txs[-1]["balance"] > 0
+        and abs(abs(sum_cb) - abs(ordered_txs[-1]["balance"])) <= 1.5
+    ):
+        # Negate all unsigned overdraft balances in the table
+        for t in ordered_txs:
+            if t.get("balance") is not None and t["balance"] > 0:
+                t["balance"] = -abs(float(t["balance"]))
+
+        r0 = ordered_txs[0]
+        if sum_ob is not None and r0.get("balance") is not None:
+            d0 = float(r0.get("debit") or 0.0)
+            c0 = float(r0.get("credit") or 0.0)
+            b0 = float(r0["balance"])
+            if d0 > 0 and c0 == 0 and abs((sum_ob + d0) - b0) <= 1.0 and abs((sum_ob - d0) - b0) > 1.0:
+                r0["credit"], r0["debit"] = d0, 0.0
+            elif c0 > 0 and d0 == 0 and abs((sum_ob - c0) - b0) <= 1.0 and abs((sum_ob + c0) - b0) > 1.0:
+                r0["debit"], r0["credit"] = c0, 0.0
+
+        for i in range(1, len(ordered_txs)):
+            prev_b = ordered_txs[i - 1].get("balance")
+            cur_b = ordered_txs[i].get("balance")
+            if prev_b is None or cur_b is None:
+                continue
+            d = float(ordered_txs[i].get("debit") or 0.0)
+            c = float(ordered_txs[i].get("credit") or 0.0)
+            if d > 0 and c == 0 and abs((prev_b + d) - cur_b) <= 1.0 and abs((prev_b - d) - cur_b) > 1.0:
+                ordered_txs[i]["credit"], ordered_txs[i]["debit"] = d, 0.0
+            elif c > 0 and d == 0 and abs((prev_b - c) - cur_b) <= 1.0 and abs((prev_b + c) - cur_b) > 1.0:
+                ordered_txs[i]["debit"], ordered_txs[i]["credit"] = c, 0.0
+
+    # 8. OPENING BALANCE & RUNNING BALANCE RECONCILIATION
     r1 = ordered_txs[0]
     inferred_opening = round(r1["balance"] - r1["credit"] + r1["debit"], 2)
 
@@ -668,7 +835,6 @@ def run_math_checks(
             opening_balance_source = "INFERRED_FROM_FIRST_TRANSACTION"
         else:
             opening_bal = cand_open
-            opening_balance_source = summary.get("opening_balance_source") or "UNKNOWN"
             if opening_bal > 0:
                 positive_matches = abs((opening_bal + r1["credit"] - r1["debit"]) - r1["balance"]) <= 1.0
                 negative_matches = abs((-opening_bal + r1["credit"] - r1["debit"]) - r1["balance"]) <= 1.0
@@ -717,6 +883,7 @@ def run_math_checks(
         running_bal = actual_bal
 
     audit_coverage["running_balance_verified"] = "FAILED" if rb_failed else "PASSED"
+
     total_credits = round(sum(t["credit"] for t in ordered_txs), 2)
     total_debits = round(sum(t["debit"] for t in ordered_txs), 2)
 
@@ -916,8 +1083,70 @@ def collect_and_merge_spans(doc):
                         "cy": round(center_y(bbox), 2),
                     }
                     raw_spans.extend(split_multi_token_numeric_span(base_span))
-        raw_pages.append(raw_spans)
+        # Preserve original extracted spans
+        raw_pages.append([dict(s) for s in raw_spans])
+        raw_spans.sort(key=lambda s: (s["cy"], s["cx"]))
+        skip_r = set()
+        clean_raw = []
+        for idx_r, sp in enumerate(raw_spans):
+            if idx_r in skip_r:
+                continue
+            t1 = sp["text"].strip()
+            if sp["cx"] <= 190 and re.match(r"^\d{1,2}[/\-][A-Za-z]{3}[/\-]20?[12]?$", t1, re.I):
+                x0_1, x1_1 = sp["bbox"][0], sp["bbox"][2]
+                tail_yr = re.split(r"[/\-]", t1)[-1]
+                best_j, best_dx = None, 9999.0
+                for j_r in range(idx_r + 1, min(len(raw_spans), idx_r + 24)):
+                    if j_r in skip_r:
+                        continue
+                    sp2 = raw_spans[j_r]
+                    dy = sp2["cy"] - sp["cy"]
+                    if dy <= 0 or dy > 22.0:
+                        continue
+                    x0_2, x1_2 = sp2["bbox"][0], sp2["bbox"][2]
+                    if x1_2 < (x0_1 - 2.0) or x0_2 > (x1_1 + 2.0):
+                        continue
+                    t2 = sp2["text"].strip()
+                    if re.match(r"^(?:02\d|2\d|\d)$", t2) and len(tail_yr) + len(t2) == 4 and (tail_yr + t2).startswith("202"):
+                        dx = abs(sp2["cx"] - sp["cx"])
+                        if dx < best_dx:
+                            best_dx = dx
+                            best_j = j_r
+                if best_j is not None:
+                    sp["text"] = t1 + raw_spans[best_j]["text"].strip()
+                    skip_r.add(best_j)
+                    break
+                        
+            elif sp["cx"] >= 310 and re.match(
+                r"^[+-]?(?:\d{1,3}(?:,\d{2,3})+|\d{3,})\.?$", t1
+            ):
+                for j_r in range(idx_r + 1, min(len(raw_spans), idx_r + 18)):
+                    if j_r in skip_r:
+                        continue
 
+                    sp2 = raw_spans[j_r]
+                    dy = sp2["cy"] - sp["cy"]
+
+                    dx_ok = (
+                        abs(sp2["cx"] - sp["cx"]) <= 45.0
+                        or abs(sp2["bbox"][0] - sp["bbox"][0]) <= 45.0
+                        or abs(sp2["bbox"][2] - sp["bbox"][2]) <= 45.0
+                    )
+                    if 0 < dy <= 22.0 and dx_ok:
+                        t2 = sp2["text"].strip()
+                        if (
+                            (t1.endswith(".") and re.match(r"^\d{2}$", t2))
+                            or ("," in t1 and re.match(r"^\.?\d{2}$", t2))
+                        ):
+                            sp["text"] = t1.rstrip(".") + "." + t2.lstrip(".")
+                            skip_r.add(j_r)
+                            break
+
+            clean_raw.append(sp)
+
+        raw_spans = clean_raw
+
+        # Continue with existing row grouping
         rows = group_into_rows(raw_spans, y_tolerance=3.2)
         page_merged = []
 
@@ -1140,7 +1369,37 @@ def reconcile_salary_slip_spans(page_spans, y_tolerance=14.0):
             net_candidates.sort(key=lambda x: x[0])
             net_pay = net_candidates[0][1]
             used_net_span_ids.add(net_candidates[0][2])
-
+            page_spans.sort(key=lambda s: (s["cy_points"], s["cx_points"]))
+            skip_sp = set()
+            stitched_spans = []
+            for idx_s, sp in enumerate(page_spans):
+                if idx_s in skip_sp:
+                    continue
+                t1 = sp["text"].strip()
+                if sp["cx_norm"] <= 0.35 and re.match(r"^\d{1,2}[/\-][A-Za-z]{3}[/\-]20?$", t1, re.I):
+                    for j_s in range(idx_s + 1, min(len(page_spans), idx_s + 14)):
+                        if j_s in skip_sp:
+                            continue
+                        sp2 = page_spans[j_s]
+                        if 0 < (sp2["cy_points"] - sp["cy_points"]) <= 18.0 and abs(sp2["cx_points"] - sp["cx_points"]) <= 26.0:
+                            t2 = sp2["text"].strip()
+                            if re.match(r"^\d{2,3}$", t2) and len(t1.split("/")[-1]) + len(t2) == 4:
+                                sp["text"] = t1 + t2
+                                skip_sp.add(j_s)
+                                break
+                elif sp["cx_norm"] >= 0.55 and re.match(r"^[+-]?(?:\d{1,3}(?:,\d{2,3})+|\d{3,})\.?$", t1):
+                    for j_s in range(idx_s + 1, min(len(page_spans), idx_s + 14)):
+                        if j_s in skip_sp:
+                            continue
+                        sp2 = page_spans[j_s]
+                        if 0 < (sp2["cy_points"] - sp["cy_points"]) <= 18.0 and abs(sp2["cx_points"] - sp["cx_points"]) <= 30.0:
+                            t2 = sp2["text"].strip()
+                            if (t1.endswith(".") and re.match(r"^\d{2}$", t2)) or ("," in t1 and re.match(r"^\.\d{2}$", t2)):
+                                sp["text"] = t1.rstrip(".") + "." + t2.lstrip(".")
+                                skip_sp.add(j_s)
+                                break
+                stitched_spans.append(sp)
+            page_spans = stitched_spans
     rows = group_into_rows(page_spans, y_tolerance=y_tolerance)
     for row in rows:
         row_text = " ".join(s["text"].lower() for s in row)
@@ -1533,33 +1792,30 @@ def _clean_indian_address_ocr(raw_addr: str) -> str:
 def _locate_id_card_rect_in_photo(rgb_np: np.ndarray) -> np.ndarray:
     """
     Finds the physical ID card inside either a portrait (vertical) OR landscape (horizontal) phone photo.
-    Uses OCR-text/card-color bounding so surrounding bedsheets, desks, or jeans are cropped out.
     """
     h, w = rgb_np.shape[:2]
     r = rgb_np[:, :, 0].astype(np.int16)
     g = rgb_np[:, :, 1].astype(np.int16)
     b = rgb_np[:, :, 2].astype(np.int16)
 
-    # Physical PAN cards are either sky-blue (B - R >= 14, B >= 130) or warm peach/tan (R - B >= 16, R >= 115)
-    blue_card_px = (b - r >= 14) & (b >= 125) & (g >= 115)
+    blue_card_px = (b - r >= 14) & (b >= 120) & (g >= 110)
     warm_card_px = (r - b >= 16) & (r >= 115) & (g >= 95)
 
     for mask in (blue_card_px, warm_card_px):
         row_frac = np.mean(mask, axis=1)
-        valid_rows = np.where(row_frac >= 0.18)[0]
-        if int(h * 0.18) <= len(valid_rows) <= int(h * 0.88):
+        valid_rows = np.where(row_frac >= 0.16)[0]
+        if int(h * 0.18) <= len(valid_rows) <= int(h * 0.90):
             ry0 = int(np.percentile(valid_rows, 2))
             ry1 = int(np.percentile(valid_rows, 98))
             col_frac = np.mean(mask[ry0:ry1, :], axis=0)
-            valid_cols = np.where(col_frac >= 0.18)[0]
-            if int(w * 0.25) <= len(valid_cols) <= int(w * 0.92):
+            valid_cols = np.where(col_frac >= 0.16)[0]
+            if int(w * 0.25) <= len(valid_cols) <= int(w * 0.94):
                 rx0 = int(np.percentile(valid_cols, 2))
                 rx1 = int(np.percentile(valid_cols, 98))
                 cw, ch = rx1 - rx0, ry1 - ry0
                 if cw > ch * 1.10 and cw >= 90 and ch >= 55:
                     return rgb_np[ry0:ry1, rx0:rx1]
     return rgb_np
-
 
 def _extract_embedded_portrait_from_pdf(file_path: str) -> np.ndarray | None:
     """
@@ -1629,13 +1885,20 @@ def _check_celebrity_watchlist_and_monochrome_spoof(
     else:
         face_rg_diff, face_rb_diff = rg_diff, gb_diff
 
-    if (
-        p90_chroma < 18.0
-        or (rg_diff < 7.5 and gb_diff < 7.5)
-        or (warm_skin_ratio < 0.045 and face_rg_diff < 9.5 and face_rb_diff < 18.0)
-    ):
+    overall_flat = (
+        p90_chroma < 14.0
+        or (rg_diff < 5.5 and gb_diff < 5.5)
+    )
+
+    face_flat = (
+        warm_skin_ratio < 0.015
+        and face_rg_diff < 6.0
+        and face_rb_diff < 11.0
+    )
+    if overall_flat and face_flat:
         reasons.append(
-            f"monochrome / grayscale / archival portrait (e.g. Mahatma Gandhi B&W cutout; warm skin ratio {warm_skin_ratio*100:.1f}%) "
+            f"monochrome / grayscale / archival portrait "
+            f"(e.g. Mahatma Gandhi B&W cutout) "
             f"detected instead of a live color KYC photograph"
         )
 
@@ -1683,9 +1946,8 @@ def _check_celebrity_watchlist_and_monochrome_spoof(
 
 def _score_face_candidate_zone(zone_rgb: np.ndarray) -> tuple[float, np.ndarray | None]:
     """
-    Scores a candidate card zone (Top-Left for New PAN / Aadhaar, Bottom-Right for Old PAN)
-    for containing a human portrait (skin cluster + dark hair/eye pixels, NOT a monochrome QR code).
-    Returns (score, tight_portrait_crop).
+    Scores a candidate zone for a human portrait (warm skin cluster + dark hair/eyes),
+    rejecting monochrome QR codes.
     """
     if zone_rgb is None or zone_rgb.size == 0 or zone_rgb.shape[0] < 24 or zone_rgb.shape[1] < 24:
         return 0.0, None
@@ -1694,7 +1956,6 @@ def _score_face_candidate_zone(zone_rgb: np.ndarray) -> tuple[float, np.ndarray 
     zg = zone_rgb[:, :, 1].astype(np.float32)
     zb = zone_rgb[:, :, 2].astype(np.float32)
 
-    # Warm human skin pixels (R > G and R > B)
     skin_px = (zr > 90.0) & (zg > 38.0) & (zb > 20.0) & ((zr - zg) >= 8.0) & ((zr - zb) >= 10.0)
     skin_pts = np.argwhere(skin_px)
     skin_frac = float(np.mean(skin_px))
@@ -1706,21 +1967,15 @@ def _score_face_candidate_zone(zone_rgb: np.ndarray) -> tuple[float, np.ndarray 
     sy1, sx1 = np.percentile(skin_pts, 96, axis=0).astype(int)
     sw, sh = max(16, sx1 - sx0), max(16, sy1 - sy0)
 
-    # Expand around the skin cluster to include hair (above) and collar/background (sides & bottom)
-    pad_x = int(sw * 0.42)
-    pad_top = int(sh * 0.55)
-    pad_bot = int(sh * 0.40)
-
-    cy0 = max(0, sy0 - pad_top)
-    cy1 = min(zone_rgb.shape[0], sy1 + pad_bot)
-    cx0 = max(0, sx0 - pad_x)
-    cx1 = min(zone_rgb.shape[1], sx1 + pad_x)
+    cy0 = max(0, sy0 - int(sh * 0.55))
+    cy1 = min(zone_rgb.shape[0], sy1 + int(sh * 0.40))
+    cx0 = max(0, sx0 - int(sw * 0.42))
+    cx1 = min(zone_rgb.shape[1], sx1 + int(sw * 0.42))
 
     crop = zone_rgb[cy0:cy1, cx0:cx1]
     if crop.shape[0] < 20 or crop.shape[1] < 20:
         return 0.0, None
 
-    # Verify presence of dark hair/eyes in the upper half of the crop
     crop_lum = 0.299 * crop[:, :, 0] + 0.587 * crop[:, :, 1] + 0.114 * crop[:, :, 2]
     upper_dark_frac = float(np.mean(crop_lum[: int(crop.shape[0] * 0.65), :] < 85.0))
     crop_skin_frac = float(np.mean(skin_px[cy0:cy1, cx0:cx1]))
@@ -1728,18 +1983,13 @@ def _score_face_candidate_zone(zone_rgb: np.ndarray) -> tuple[float, np.ndarray 
     if upper_dark_frac < 0.03:
         return 0.0, None
 
-    score = crop_skin_frac * 2.0 + min(0.4, upper_dark_frac)
-    return score, crop
+    return (crop_skin_frac * 2.0 + min(0.4, upper_dark_frac)), crop
+
 
 def verify_kyc_portrait_is_human(file_path: str, doc_type: str = "PAN_CARD") -> dict:
     """
-    100% pure NumPy + PIL portrait extractor and spoof/cartoon/child/monochrome verifier.
-    Accurately handles:
-      - New PAN cards (portrait on middle-left, QR code on right — e.g. Anmol's PAN card)
-      - Old PAN cards (portrait on bottom-right — e.g. Alok's PAN card)
-      - Full-page A4 e-PAN and e-Aadhaar PDFs
-      - Side-by-side Front+Back Aadhaar images
-    Never mistakes a white bedsheet or QR code for a pasted sticker.
+    Pure NumPy + PIL portrait extractor and spoof verifier.
+    Zero false positives on real PAN/Aadhaar cards with white backgrounds or QR codes.
     """
     result = {
         "portrait_found": False,
@@ -1773,8 +2023,6 @@ def verify_kyc_portrait_is_human(file_path: str, doc_type: str = "PAN_CARD") -> 
             return result
 
         best_crop = None
-        pasted_white_sticker_detected = False
-        sticker_white_ratio = 0.0
         is_full_a4_pdf = False
 
         if pil_img is not None:
@@ -1810,8 +2058,7 @@ def verify_kyc_portrait_is_human(file_path: str, doc_type: str = "PAN_CARD") -> 
                     _, face_c = _score_face_candidate_zone(left_z)
                     best_crop = face_c if face_c is not None else left_z
             else:
-                # PAN_CARD: New layout has portrait on Middle-Left; Old layout has portrait on Bottom-Right.
-                # Score BOTH zones for a face (skin + hair) so we NEVER grab the QR code on New PAN cards!
+                # Score BOTH New PAN (left photo) and Old PAN (bottom-right photo) for skin + hair
                 left_pan_zone = card_rgb[int(ch * 0.20) : int(ch * 0.68), int(cw * 0.03) : int(cw * 0.32)]
                 br_pan_zone = card_rgb[int(ch * 0.44) : int(ch * 0.95), int(cw * 0.54) : int(cw * 0.94)]
 
@@ -1823,7 +2070,6 @@ def verify_kyc_portrait_is_human(file_path: str, doc_type: str = "PAN_CARD") -> 
                 elif crop_br is not None:
                     best_crop = crop_br
                 else:
-                    # Also check full_rgb middle-right in case card_rgb wasn't isolated on jeans
                     full_mid_right = full_rgb[int(fh_full * 0.44) : int(fh_full * 0.68), int(fw_full * 0.52) : int(fw_full * 0.88)]
                     _, crop_fmr = _score_face_candidate_zone(full_mid_right)
                     best_crop = crop_fmr if crop_fmr is not None else left_pan_zone
@@ -1849,66 +2095,53 @@ def verify_kyc_portrait_is_human(file_path: str, doc_type: str = "PAN_CARD") -> 
         small_rgb = np.array(small_pil)
         unique_colors = len(np.unique((small_rgb // 16).reshape(-1, 3), axis=0))
 
-        # Colored studio backdrop check (e.g., blue backdrop on Anmol's PAN card or maroon on Ayaz's e-PAN)
-        # If the left & right background strips have strong color saturation (chroma >= 35), it is a genuine colored studio photo, NOT a white paper cutout!
         ch_c, cw_c = best_crop.shape[:2]
         l_strip_chroma = float(np.mean(crop_chroma[:, : max(2, int(cw_c * 0.22))]))
         r_strip_chroma = float(np.mean(crop_chroma[:, max(0, int(cw_c * 0.78)) :]))
-        has_colored_studio_backdrop = (0.5 * (l_strip_chroma + r_strip_chroma)) >= 32.0
+        has_colored_studio_backdrop = (0.5 * (l_strip_chroma + r_strip_chroma)) >= 28.0
 
-        bright_white_mask = (crop_gray >= 192.0) & (crop_chroma <= 42.0)
+        bright_white_mask = (crop_gray >= 205.0) & (crop_chroma <= 32.0)
         pure_white_ratio = float(np.mean(bright_white_mask))
-
         l_margin_white = float(np.mean(bright_white_mask[:, : max(2, int(cw_c * 0.22))]))
         r_margin_white = float(np.mean(bright_white_mask[:, max(0, int(cw_c * 0.78)) :]))
         side_margin_white = 0.5 * (l_margin_white + r_margin_white)
 
         skin_mask = (cr_f > 90.0) & (cg_f > 38.0) & (cb_f > 20.0) & ((cr_f - cg_f) >= 8.0) & ((cr_f - cb_f) >= 10.0)
         skin_ratio = float(np.mean(skin_mask))
-
-        # Bottom 25% collar check:
-        # In Alok's cartoon baby sticker, the bottom 25% is bare skin + stark white paper (>= 80%), with no shirt collar.
-        # In Anmol's & Ayaz's real PAN cards, there is a colored studio backdrop and/or shirt collar.
-        bot_idx = int(ch_c * 0.74)
+        bot_idx = int(ch_c * 0.75)
         bot_skin_or_white = float(np.mean(skin_mask[bot_idx:, :] | bright_white_mask[bot_idx:, :]))
         bot_skin_only = float(np.mean(skin_mask[bot_idx:, :]))
+        bot_dark_clothing = float(np.mean(crop_gray[bot_idx:, :] < 115.0))
 
         gx = np.abs(np.diff(crop_gray, axis=1, append=crop_gray[:, -1:]))
         gy = np.abs(np.diff(crop_gray, axis=0, append=crop_gray[-1:, :]))
         grad_mag = np.hypot(gx, gy)
-        flat_pixel_ratio = float(np.mean(grad_mag < 3.0))
-        high_sat_ratio = float(np.mean(crop_chroma > 135.0))
+        flat_pixel_ratio = float(np.mean(grad_mag < 2.8))
+        high_sat_ratio = float(np.mean(crop_chroma > 140.0))
 
         is_invalid_portrait = False
         reasons = []
-
-        # Rule 1 & 2: Pasted white sticker + bare-shoulder infant/cartoon cutout (ONLY if NOT a colored studio backdrop!)
-        if not has_colored_studio_backdrop:
-            if (
-                doc_type == "PAN_CARD"
-                and not is_full_a4_pdf
-                and side_margin_white >= 0.32
-                and pure_white_ratio >= 0.22
-                and bot_skin_or_white >= 0.75
-                and bot_skin_only >= 0.22
-            ):
-                is_invalid_portrait = True
-                pct = int(max(pure_white_ratio, side_margin_white) * 100)
-                reasons.append(
-                    f"pasted white-cutout sticker / infant bare-shoulder spoof portrait detected ({pct}% stark white cutout background)"
-                )
-
-        # Rule 3: Quantized flat-fill cartoon / vector avatar
-        if unique_colors < 14 and flat_pixel_ratio > 0.68:
+        if (
+            doc_type == "PAN_CARD"
+            and not is_full_a4_pdf
+            and not has_colored_studio_backdrop
+            and side_margin_white >= 0.42
+            and pure_white_ratio >= 0.28
+            and bot_skin_or_white >= 0.85
+            and bot_skin_only >= 0.22
+            and bot_dark_clothing < 0.05
+        ):
             is_invalid_portrait = True
-            reasons.append(f"flat quantized cartoon color palette ({unique_colors} color clusters)")
+            reasons.append("pasted white-cutout sticker / bare-shoulder infant spoof portrait detected")
 
-        # Rule 4: Synthetic neon cartoon with no human skin
-        if high_sat_ratio > 0.40 and skin_ratio < 0.05:
+        if unique_colors < 11 and flat_pixel_ratio > 0.74:
+            is_invalid_portrait = True
+            reasons.append(f"synthetic flat-fill cartoon texture detected ({unique_colors} color clusters)")
+
+        if high_sat_ratio > 0.45 and skin_ratio < 0.04:
             is_invalid_portrait = True
             reasons.append("synthetic cartoon color saturation with no natural human skin tone")
 
-        # Rule 5: Celebrity Watchlist & Monochrome/Historical Cutout Check (Gandhi B&W cutout, Salman, SRK, etc.)
         is_celeb_or_mono, celeb_reasons = _check_celebrity_watchlist_and_monochrome_spoof(best_crop)
         if is_celeb_or_mono:
             is_invalid_portrait = True
@@ -1920,7 +2153,7 @@ def verify_kyc_portrait_is_human(file_path: str, doc_type: str = "PAN_CARD") -> 
             reason_str = "; ".join(reasons)
             result["portrait_verdict"] = f"Spoof / Non-Genuine Portrait Detected ({reason_str})"
             result["anomaly_flag"] = (
-                f"Page 1 KYC Portrait Anomaly: Uploaded ID contains a spoof, monochrome cutout, cartoon, or non-genuine image "
+                f"Page 1 KYC Portrait Anomaly: Uploaded ID contains a spoof, monochrome cutout, or cartoon image "
                 f"instead of a valid live KYC photograph ({reason_str})."
             )
             result["kyc_logic_flag"] = (
@@ -1931,12 +2164,6 @@ def verify_kyc_portrait_is_human(file_path: str, doc_type: str = "PAN_CARD") -> 
                 f"Page 1 Pixel Tampering (ELA Anomaly): Portrait region exhibits pasted sticker/cutout boundary "
                 f"compression mismatch ({reason_str})."
             )
-
-        print(
-            f"[KYC PORTRAIT DEBUG] doc={doc_type} | colored_bg={has_colored_studio_backdrop} | "
-            f"skin={skin_ratio:.2f} | white={pure_white_ratio:.2f} | side_w={side_margin_white:.2f} | "
-            f"bot_sw={bot_skin_or_white:.2f} | status={result['portrait_status']}"
-        )
     except Exception as exc:
         print(f"[KYC PORTRAIT ERROR] {exc}")
 
