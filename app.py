@@ -20,7 +20,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-glm_api_key = st.secrets["GLM_API_KEY"]
+# glm_api_key = st.secrets["GLM_API_KEY"]
 
 # MINIMAL ENTERPRISE SAAS STYLING (MATCHING REFERENCE UI)
 st.markdown("""

@@ -1,0 +1,74 @@
+version: 1.0
+
+jobs:
+  loan-assistant-build:
+    steps:
+      - echo "Starting Loan Assistant Python 3.13 Build"
+
+      - echo "Installing system dependencies"
+      - apt-get update
+      - apt-get install -y curl ca-certificates libgomp1 libglib2.0-0 libgl1
+
+      - echo "Installing UV"
+      - sh -c 'for attempt in 1 2 3 4 5; do if curl -fL --connect-timeout 30 --max-time 180 https://astral.sh/uv/install.sh -o /tmp/uv-install.sh; then exit 0; fi; echo "UV download failed; retrying"; sleep 5; done; exit 1'
+      - test -s /tmp/uv-install.sh
+      - test -s /tmp/uv-install.sh
+      - env UV_INSTALL_DIR=/tmp/uv-bin sh /tmp/uv-install.sh
+
+      - echo "Installing Python 3.13"
+      - /tmp/uv-bin/uv python install 3.13
+      - /tmp/uv-bin/uv venv --python 3.13 --seed .venv
+
+      - echo "Checking Python version"
+      - .venv/bin/python --version
+      - .venv/bin/python -c "import sys; assert sys.version_info[:2] == (3, 13); print('Python 3.13 verified')"
+
+      - echo "Installing Loan Assistant requirements for testing"
+      - .venv/bin/python -m pip install --upgrade pip
+      - .venv/bin/python -m pip install --no-cache-dir -r requirements.txt
+
+      - echo "Checking dependency compatibility"
+      - .venv/bin/python -m pip check
+
+      - echo "Checking project syntax"
+      - .venv/bin/python -m compileall -q app.py multiformated_reconciliation.py module_aggregator.py corporate_kyc_engines.py cross_document_verifier.py forensic_aggregator.py recocile_spans.py bank_parser
+
+      - echo "Testing OCR and ONNX dependencies"
+      - .venv/bin/python -c "import cv2, onnxruntime; from rapidocr import RapidOCR; from ocr_compat import ocr_engine; print('RapidOCR and ONNX imports successful')"
+
+      - echo "Testing application imports"
+      - .venv/bin/python -c "import multiformated_reconciliation, module_aggregator, corporate_kyc_engines, cross_document_verifier, forensic_aggregator; print('Loan Assistant modules imported successfully')"
+
+      - echo "Preparing AppSail build directory"
+      - rm -rf appsail_build
+      - mkdir -p appsail_build
+
+      - echo "Copying application source files"
+      - tar --exclude='./.git' --exclude='./.venv' --exclude='./venv' --exclude='./appsail_build' --exclude='./.env' --exclude='./.env.*' --exclude='./.catalystrc' --exclude='./__pycache__' --exclude='./app-config.json' --exclude='./catalyst.json' --exclude='./catalyst-pipelines.yml' -czf /tmp/loan-assistant-source.tar.gz .
+      - tar -xzf /tmp/loan-assistant-source.tar.gz -C appsail_build
+
+      - echo "Installing dependencies into AppSail vendor directory"
+      - .venv/bin/python -m pip install --no-cache-dir --no-compile --target appsail_build/vendor -r requirements.txt
+
+      - echo "Verifying AppSail build files"
+      - test -f appsail_build/app.py
+      - test -f appsail_build/ocr_compat.py
+      - test -d appsail_build/bank_parser
+      - test -d appsail_build/vendor/streamlit
+
+      - echo "Testing imports from the AppSail package"
+      - PYTHONPATH="$PWD/appsail_build/vendor:$PWD/appsail_build" .venv/bin/python -c "import streamlit, cv2, onnxruntime; from rapidocr import RapidOCR; from ocr_compat import ocr_engine; import multiformated_reconciliation, module_aggregator, corporate_kyc_engines, cross_document_verifier, forensic_aggregator; print('AppSail package checks passed')"
+
+      - echo "Measuring AppSail package"
+      - du -sh appsail_build
+      - du -sh appsail_build/vendor
+
+      - echo "Largest files and directories in AppSail package"
+      - du -ah appsail_build | sort -h | tail -30
+
+      - echo "AppSail package measurement completed"
+
+stages:
+  - name: build-and-deploy
+    jobs:
+      - loan-assistant-build

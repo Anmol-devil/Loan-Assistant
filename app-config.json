@@ -1,8 +1,6 @@
 {
-    "command": "sh -c 'export PYTHONPATH=\"$PWD/vendor${PYTHONPATH:+:$PYTHONPATH}\"; python3 -m streamlit run app.py --server.address 0.0.0.0 --server.port \"$X_ZOHO_CATALYST_LISTEN_PORT\" --server.headless true --browser.gatherUsageStats false'",
-    "build_path": "./appsail_build",
-    "stack": "python_3_13",
-    "env_variables": {},
-    "memory": 2048,
-    "scripts": {}
+  "command": "sh -c 'streamlit run app.py --server.port=${X_ZOHO_CATALYST_LISTEN_PORT:-9000} --server.address=0.0.0.0 --server.enableCORS=false --server.enableXsrfProtection=false'",
+  "build_path": ".",
+  "stack": "python_3_9",
+  "type": "web"
 }
