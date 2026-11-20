@@ -1,24 +1,33 @@
+import os
+import subprocess
+import sys
 import time
 from typing import Any
 
 
 class LegacyRapidOCRAdapter:
-    """
-    Lazy-loads RapidOCR on first use and adapts its output
-    to the (box, text, confidence) tuple format.
-    """
-
     def __init__(self):
         self.engine = None
 
     def _get_engine(self):
         if self.engine is None:
+            ocr_dir = "/tmp/ocr_libs"
+            if os.path.isdir(ocr_dir) and ocr_dir not in sys.path:
+                sys.path.insert(0, ocr_dir)
             try:
                 from rapidocr import RapidOCR
-                self.engine = RapidOCR()
             except ImportError:
-                from rapidocr_onnxruntime import RapidOCR
-                self.engine = RapidOCR()
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                ocr_req = os.path.join(base_dir, "requirements-ocr.txt")
+                os.makedirs(ocr_dir, exist_ok=True)
+                subprocess.check_call([
+                    sys.executable, "-m", "pip", "install",
+                    "--no-cache-dir", "--target", ocr_dir, "-r", ocr_req,
+                ])
+                if ocr_dir not in sys.path:
+                    sys.path.insert(0, ocr_dir)
+                from rapidocr import RapidOCR
+            self.engine = RapidOCR()
         return self.engine
 
     def __call__(self, image: Any):
@@ -28,23 +37,6 @@ class LegacyRapidOCRAdapter:
         if result is None:
             return [], time.perf_counter() - start_time
 
-        # Support rapidocr-onnxruntime tuple output: (rows, elapsed)
-        if isinstance(result, tuple) and len(result) == 2:
-            rows_raw, elapsed = result
-            if not rows_raw:
-                return [], float(elapsed or (time.perf_counter() - start_time))
-            rows = [
-                (
-                    box.tolist() if hasattr(box, "tolist") else list(box),
-                    str(text),
-                    float(score),
-                )
-                for box, text, score in rows_raw
-                if text is not None and str(text).strip()
-            ]
-            return rows, float(elapsed or (time.perf_counter() - start_time))
-
-        # Support rapidocr >= 2.x / 3.x object output
         boxes = getattr(result, "boxes", None)
         texts = getattr(result, "txts", None)
         scores = getattr(result, "scores", None)
@@ -72,5 +64,4 @@ class LegacyRapidOCRAdapter:
         return rows, float(elapsed)
 
 
-# One shared lazy-loaded OCR engine for the application
 ocr_engine = LegacyRapidOCRAdapter()
