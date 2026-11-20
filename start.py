@@ -52,6 +52,9 @@ cmd = [
     "--server.enableCORS=false",
     "--server.enableXsrfProtection=false",
     "--server.enableWebsocketCompression=false",
+    "--browser.serverPort=443",
+    "--browser.gatherUsageStats=false",
+    "--logger.level=debug",
 ]
 
 sys.exit(subprocess.call(cmd, env=env))
