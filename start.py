@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import sys
 
@@ -17,11 +18,19 @@ if sys.platform.startswith("linux"):
     done_flag = os.path.join(heavy_dir, ".done")
     if os.path.isfile(heavy_req) and not os.path.isfile(done_flag):
         os.makedirs(heavy_dir, exist_ok=True)
-        install_script = (
-            "import subprocess, sys; "
-            f"subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--no-cache-dir', '--target', {heavy_dir!r}, '-r', {heavy_req!r}]); "
-            f"open({done_flag!r}, 'w').close()"
-        )
+        install_script = f"""
+import os, shutil, subprocess, sys
+heavy_dir = {heavy_dir!r}
+subprocess.check_call([
+    sys.executable, "-m", "pip", "install",
+    "--no-cache-dir", "--no-compile", "--target", heavy_dir, "-r", {heavy_req!r}
+])
+for name in os.listdir(heavy_dir):
+    full = os.path.join(heavy_dir, name)
+    if name.endswith(".dist-info") or name in ("numpy", "numpy.libs", "PIL", "pillow.libs", "bin"):
+        shutil.rmtree(full, ignore_errors=True)
+open({done_flag!r}, "w").close()
+"""
         subprocess.Popen([sys.executable, "-c", install_script])
 
 env = os.environ.copy()
