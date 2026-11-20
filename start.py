@@ -1,5 +1,4 @@
 import os
-import shutil
 import subprocess
 import sys
 
@@ -34,6 +33,7 @@ open({done_flag!r}, "w").close()
         subprocess.Popen([sys.executable, "-c", install_script])
 
 env = os.environ.copy()
+env["STREAMLIT_GLOBAL_DEVELOPMENT_MODE"] = "false"
 if sys.platform.startswith("linux"):
     existing_pp = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{vendor_dir}:{heavy_dir}:{base_dir}:{existing_pp}".rstrip(":")
@@ -44,6 +44,7 @@ cmd = [
     "streamlit",
     "run",
     os.path.join(base_dir, "app.py"),
+    "--global.developmentMode=false",
     f"--server.port={port}",
     "--server.address=0.0.0.0",
     "--server.headless=true",
