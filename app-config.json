@@ -1,6 +1,6 @@
 {
   "command": "sh -c 'streamlit run app.py --server.port=${X_ZOHO_CATALYST_LISTEN_PORT:-9000} --server.address=0.0.0.0 --server.enableCORS=false --server.enableXsrfProtection=false'",
-  "build_path": ".",
-  "stack": "python_3_9",
+  "build_path": "./",
+  "stack": "python_3_13",
   "type": "web"
 }
