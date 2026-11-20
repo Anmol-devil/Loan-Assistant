@@ -34,6 +34,7 @@ open({done_flag!r}, "w").close()
 
 env = os.environ.copy()
 env["STREAMLIT_GLOBAL_DEVELOPMENT_MODE"] = "false"
+env["STREAMLIT_SERVER_ENABLE_WEBSOCKET_COMPRESSION"] = "false"
 if sys.platform.startswith("linux"):
     existing_pp = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{vendor_dir}:{heavy_dir}:{base_dir}:{existing_pp}".rstrip(":")
@@ -50,6 +51,7 @@ cmd = [
     "--server.headless=true",
     "--server.enableCORS=false",
     "--server.enableXsrfProtection=false",
+    "--server.enableWebsocketCompression=false",
 ]
 
 sys.exit(subprocess.call(cmd, env=env))
