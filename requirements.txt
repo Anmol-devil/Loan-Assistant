@@ -5,7 +5,7 @@ numpy
 PyMuPDF
 Pillow
 python-docx
-rapidocr==3.10.0
+rapidocr
 onnxruntime
 opencv-python-headless
 python-dotenv
