@@ -2,9 +2,7 @@
 streamlit
 pandas
 numpy
-PyMuPDF
 Pillow
 python-docx
-opencv-python-headless
 python-dotenv
 openai

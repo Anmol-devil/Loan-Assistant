@@ -1,0 +1,4 @@
+PyMuPDF
+opencv-python-headless
+rapidocr
+onnxruntime
