@@ -7,4 +7,4 @@ PyMuPDF>=1.24.0
 python-docx
 python-dotenv
 openai
-opencv-python
+opencv-python-headless
