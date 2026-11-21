@@ -1,8 +1,10 @@
 # Dependencies reflected by the imports in the shared Module 1 code
+numpy
 streamlit
 pandas
-numpy
 Pillow
+PyMuPDF>=1.24.0
 python-docx
 python-dotenv
 openai
+opencv-python

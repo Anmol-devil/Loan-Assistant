@@ -21,7 +21,6 @@ def detect_copy_move_forgery(image_path, min_matches=18):
 
     cloned_pairs = []
     for m in matches:
-        # Ignore self-matches; look for identical feature descriptors at different coordinates
         pt1 = np.array(keypoints[m.queryIdx].pt)
         pt2 = np.array(keypoints[m.trainIdx].pt)
         spatial_dist = np.linalg.norm(pt1 - pt2)
