@@ -1,6 +1,0 @@
-{
-  "command": "python3 start.py",
-  "build_path": "./",
-  "stack": "python_3_13",
-  "type": "web"
-}
