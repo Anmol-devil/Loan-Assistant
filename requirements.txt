@@ -8,3 +8,5 @@ python-docx
 python-dotenv
 openai
 opencv-python-headless
+rapidocr
+onnxruntime
