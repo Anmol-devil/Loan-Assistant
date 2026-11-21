@@ -8,5 +8,5 @@ python-docx
 python-dotenv
 openai
 opencv-python-headless
-rapidocr
-onnxruntime
+rapidocr>=2.0.0
+onnxruntime>=1.18.0,<1.22.0

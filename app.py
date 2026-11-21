@@ -12,6 +12,9 @@ from multiformated_reconciliation import analyze_document as verify_any_file
 from cross_document_verifier import verify_application_pack
 from forensic_aggregator import detect_copy_move_forgery
 from module_aggregator import build_module1_output
+import json
+from openai import OpenAI
+from universal_doc_extractor import extract_universal_document
 
 st.set_page_config(
     page_title="AI Loan Assistant | Module 1: Document Checker",
@@ -20,7 +23,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-glm_api_key = st.secrets["GLM_API_KEY"]
+for _k in ("GLM_API_KEY", "ZAI_API_KEY", "ZAI_BASE_URL", "ZAI_MODEL", "OPENAI_API_KEY", "GROQ_API_KEY"):
+    if _k in st.secrets and st.secrets[_k]:
+        os.environ[_k] = str(st.secrets[_k]).strip()
 
 # MINIMAL ENTERPRISE SAAS STYLING (MATCHING REFERENCE UI)
 st.markdown("""
@@ -582,12 +587,28 @@ with st.sidebar:
             <div class="sb-sub">Loan Intelligence Platform</div>
         </div>
     </div>
-    <div class="sb-nav-item">🏠 Home</div>
-    <div class="sb-nav-item sb-nav-active">📄 Document Checker</div>
-    <div class="sb-nav-item">🗂️ Knowledge Base</div>
-    <div class="sb-nav-item">🤖 AI Assistant</div>
-    <div class="sb-nav-item">📊 Analytics</div>
-    <div class="sb-nav-item">⚙️ Settings</div>
+    """, unsafe_allow_html=True)
+
+    if st.session_state.get("active_page") not in ("Document Checker", "Document Extractor"):
+        st.session_state["active_page"] = "Document Checker"
+
+    if st.button(
+        "📄 Document Checker",
+        width="stretch",
+        type="primary" if st.session_state["active_page"] == "Document Checker" else "secondary",
+    ):
+        st.session_state["active_page"] = "Document Checker"
+        st.rerun()
+
+    if st.button(
+        "🧾 Document Extractor",
+        width="stretch",
+        type="primary" if st.session_state["active_page"] == "Document Extractor" else "secondary",
+    ):
+        st.session_state["active_page"] = "Document Extractor"
+        st.rerun()
+
+    st.markdown("""
     <hr style="border-color:#1e293b; margin:14px 0;">
     <div style="font-size:11.5px; font-weight:700; color:#94a3b8 !important; margin-bottom:8px; text-transform:uppercase;">Modules</div>
     <div class="sb-mod-card sb-mod-active">
@@ -599,31 +620,270 @@ with st.sidebar:
     </div>
     <div class="sb-mod-card">
         <div>
-            <div style="font-size:13px; font-weight:600; color:#cbd5e1 !important;">2 &nbsp; Loan Intelligence</div>
-            <div style="font-size:11px; color:#64748b !important;">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;(RAG & Insights)</div>
+            <div style="font-size:13px; font-weight:600; color:#cbd5e1 !important;">2 &nbsp; Document Extractor</div>
+            <div style="font-size:11px; color:#64748b !important;">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;(DocVortex & Q&A)</div>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
-    inspection_mode = st.radio(
-        "Inspection Mode",
-        ["Single Document Audit", "Multi-Document Pack (Family D)"],
-        index=0
+    inspection_mode = "Single Document Audit"
+    tenant_choice = "default_lender"
+    if st.session_state["active_page"] == "Document Checker":
+        st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+        inspection_mode = st.radio(
+            "Inspection Mode",
+            ["Single Document Audit", "Multi-Document Pack (Family D)"],
+            index=0,
+            key="inspection_mode_radio",
+        )
+        tenant_choice = st.selectbox(
+            "Risk Calibration Profile",
+            ["default_lender", "conservative_bank", "high_velocity_fintech"],
+            key="tenant_choice_select",
+        )
+
+def _format_llm_style_summary(doc_code: str, id_card: dict, fin_rec: dict, ext_meta: dict) -> str:
+    """Formats an LLM-style structured brief tailored to Bank Statement, Aadhaar, PAN, or other docs."""
+    if doc_code == "BANK_STATEMENT":
+        bank_name = id_card.get("issuing_bank") or ext_meta.get("bank_name") or "Not Found"
+        acct_no = id_card.get("account_number") or ext_meta.get("account_number") or "Not Found"
+        ifsc = id_card.get("ifsc_code") or ext_meta.get("ifsc_code") or "Not Found"
+        holder = id_card.get("holder_name") or ext_meta.get("account_holder") or "Not Found"
+        branch = id_card.get("branch_name") or ext_meta.get("branch") or "Not Found"
+
+        op_list = (fin_rec.get("summary") or {}).get("opening_balance") or []
+        opening = op_list[0] if op_list else fin_rec.get("opening_balance_used")
+        credits = float(fin_rec.get("total_credits") or 0.0)
+        debits = float(fin_rec.get("total_debits") or 0.0)
+        closing = float(fin_rec.get("closing_balance") or 0.0)
+        net_flow = round(credits - debits, 2)
+        tx_count = len(fin_rec.get("transactions") or [])
+
+        if opening is not None:
+            expected_closing = round(float(opening) + credits - debits, 2)
+            diff = round(abs(expected_closing - closing), 2)
+            math_verdict = "✅ Matched" if diff <= 1.5 else f"⚠️ Mismatch of ₹ {diff:,.2f}"
+            op_str = f"₹ {float(opening):,.2f}"
+            eq_str = f"`{float(opening):,.2f} + {credits:,.2f} - {debits:,.2f} = {expected_closing:,.2f}` (Actual: `₹ {closing:,.2f}` → **{math_verdict}**)"
+        else:
+            op_str = "Not Found"
+            eq_str = "Opening balance unavailable to verify equation."
+
+        return (
+            f"### 🏦 Bank Statement Summary\n"
+            f"- **Bank Name** = `{bank_name}`\n"
+            f"- **Account Holder Name** = `{holder}`\n"
+            f"- **Account No.** = `{acct_no}`\n"
+            f"- **IFSC Code** = `{ifsc}`\n"
+            f"- **Branch** = `{branch}`\n"
+            f"- **Transactions Extracted** = `{tx_count}`\n\n"
+            f"#### 🧮 Math & Ledger Calculation\n"
+            f"- **Opening Balance** = `{op_str}`\n"
+            f"- **Total Credits (+)** = `₹ {credits:,.2f}`\n"
+            f"- **Total Debits (-)** = `₹ {debits:,.2f}`\n"
+            f"- **Net Cash Flow (Credits − Debits)** = `₹ {net_flow:,.2f}`\n"
+            f"- **Closing Balance** = `₹ {closing:,.2f}`\n"
+            f"- **Reconciliation Check** = {eq_str}\n"
+        )
+
+    if doc_code == "AADHAAR_CARD":
+        return (
+            f"### 🛡️ Aadhaar Card Summary\n"
+            f"- **Aadhaar No.** = `{fin_rec.get('aadhaar_number_display') or '[Aadhaar Redacted]'}`\n"
+            f"- **Name** = `{fin_rec.get('legal_name') or id_card.get('holder_name') or 'Not Found'}`\n"
+            f"- **Father / Care-Of Name** = `{fin_rec.get('father_name') or 'Not Found'}`\n"
+            f"- **Date of Birth / YOB** = `{fin_rec.get('date_of_birth') or 'Not Found'}`\n"
+            f"- **Gender** = `{fin_rec.get('gender') or 'Not Found'}`\n"
+            f"- **Address** = `{fin_rec.get('address') or 'Not Found'}`\n"
+            f"- **Issue Date** = `{fin_rec.get('issue_date') or 'Not Found'}`\n"
+            f"- **Portrait Check** = `{fin_rec.get('portrait_verification') or 'Verified'}`\n"
+        )
+
+    if doc_code == "PAN_CARD":
+        return (
+            f"### 🪪 PAN Card Summary\n"
+            f"- **PAN No.** = `{fin_rec.get('pan_number') or id_card.get('pan_number') or ext_meta.get('pan') or 'Not Found'}`\n"
+            f"- **Holder Name** = `{fin_rec.get('legal_name') or id_card.get('holder_name') or 'Not Found'}`\n"
+            f"- **Father's Name** = `{fin_rec.get('father_name') or 'Not Found'}`\n"
+            f"- **Date of Birth** = `{fin_rec.get('date_of_birth') or 'Not Found'}`\n"
+            f"- **Entity Category** = `{fin_rec.get('entity_category') or 'Not Found'}`\n"
+            f"- **Portrait Check** = `{fin_rec.get('portrait_verification') or 'Verified'}`\n"
+        )
+
+    lines = [f"### 📄 {id_card.get('doc_category', 'Document')} Summary"]
+    for k, v in ext_meta.items():
+        lines.append(f"- **{k.replace('_', ' ').title()}** = `{v}`")
+    for k, v in fin_rec.items():
+        if not isinstance(v, (list, dict)) and k not in ("document_type", "portrait_base64") and "aadhaar" not in k.lower():
+            lines.append(f"- **{k.replace('_', ' ').title()}** = `{v}`")
+    return "\n".join(lines)
+
+
+def _ask_assistant_llm(question: str, context_summary: str, markdown_excerpt: str) -> str:
+    api_key = (
+        os.environ.get("ZAI_API_KEY")
+        or os.environ.get("GLM_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("GROQ_API_KEY")
+        or ""
+    ).strip()
+    if not api_key:
+        return "⚠️ No LLM API key found in `.streamlit/secrets.toml` or `.env`. Add `GLM_API_KEY` (or `OPENAI_API_KEY` / `GROQ_API_KEY`) to enable chat answers."
+
+    base_url = os.environ.get("ZAI_BASE_URL") or (
+        "https://api.groq.com/openai/v1" if api_key.startswith("gsk_")
+        else ("https://api.openai.com/v1" if api_key.startswith("sk-") and "." not in api_key else "https://api.z.ai/api/paas/v4/")
     )
-    tenant_choice = st.selectbox(
-        "Risk Calibration Profile",
-        ["default_lender", "conservative_bank", "high_velocity_fintech"]
+    model = os.environ.get("ZAI_MODEL") or (
+        "llama-3.3-70b-versatile" if api_key.startswith("gsk_")
+        else ("gpt-4o-mini" if api_key.startswith("sk-") and "." not in api_key else "glm-4.5-flash")
     )
 
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=30.0)
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=0.1,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an Indian financial and KYC document assistant. Answer concisely using ONLY the provided "
+                    "extracted summary and document text. Show calculations clearly in ₹ (INR) when asked about totals or balances."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"STRUCTURED SUMMARY:\n{context_summary}\n\nEXTRACTED DOCUMENT TEXT:\n{markdown_excerpt[:10000]}\n\nQUESTION: {question}",
+            },
+        ],
+    )
+    return resp.choices[0].message.content or "No response returned."
+
+if st.session_state.get("active_page") == "Document Extractor":
     st.markdown("""
-    <div class="sb-local-badge">
-        <div style="font-weight:700; color:#34d399 !important;">🔒 100% Local Processing</div>
-        <div style="color:#a7f3d0 !important; font-size:11px;">No data leaves your system</div>
+    <div class="top-bar">
+        <div class="top-pill">🧾 Module 2: Universal Document Extractor</div>
+        <div class="top-secure-pill">🛡️ DocVortex • RapidOCR • Structured Summary</div>
+    </div>
+    <div class="page-hdr">
+        <h2>🧾 Document Extractor</h2>
+        <p>Upload any Bank Statement, Aadhaar Card, PAN Card, DOCX, or spreadsheet to get structured fields, math calculations, extracted tables, and Q&A.</p>
     </div>
     """, unsafe_allow_html=True)
 
+    c_up, c_cfg = st.columns([2.3, 1.0])
+    with c_up:
+        ai_file = st.file_uploader(
+            "Upload Document (PDF, PNG, JPG, JPEG, DOCX, XLSX, CSV)",
+            type=["pdf", "png", "jpg", "jpeg", "webp", "docx", "xlsx", "xls", "csv"],
+            key="ai_assistant_uploader",
+        )
+    with c_cfg:
+        st.markdown("<div class='saas-card'>", unsafe_allow_html=True)
+        use_glm_ocr = st.toggle("Use Local Ollama GLM-OCR", value=False)
+        st.caption("Off = DocVortex (native) + RapidOCR (scans). On = Local Ollama `glm-ocr:q8_0` for scans.")
+        st.markdown("</div>", unsafe_allow_html=True)
 
+    if ai_file:
+        file_sig = f"{ai_file.name}_{len(ai_file.getvalue())}_{use_glm_ocr}"
+        if st.session_state.get("ai_last_sig") != file_sig:
+            suffix = os.path.splitext(ai_file.name)[1].lower()
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(ai_file.getbuffer())
+                tmp_path = tmp.name
+            try:
+                with st.spinner("Extracting document with Universal Extractor & running financial/KYC engine..."):
+                    ext_res = extract_universal_document(tmp_path, use_glm_ocr=use_glm_ocr)
+                    fin_rec, id_card, doc_code = {}, {}, "UNKNOWN_DOCUMENT"
+                    if suffix in (".pdf", ".png", ".jpg", ".jpeg", ".docx"):
+                        raw_rep = verify_any_file(tmp_path, original_filename=ai_file.name, use_llm=True)
+                        raw_rep["original_filename"] = ai_file.name
+                        m1_data = build_module1_output(tmp_path, raw_rep, tenant_id="default_lender")
+                        id_card = m1_data.get("identity_card") or {}
+                        fin_rec = raw_rep.get("financial_reconciliation") or {}
+                        doc_code = fin_rec.get("document_type") or id_card.get("doc_code", "UNKNOWN_DOCUMENT")
+
+                    summary_md = _format_llm_style_summary(
+                        doc_code, id_card, fin_rec, ext_res.get("financial_metadata") or {}
+                    )
+                    st.session_state["ai_last_sig"] = file_sig
+                    st.session_state["ai_payload"] = {
+                        "ext_res": ext_res,
+                        "doc_code": doc_code,
+                        "id_card": id_card,
+                        "fin_rec": fin_rec,
+                        "summary_md": summary_md,
+                    }
+                    st.session_state["ai_chat_history"] = [{"role": "assistant", "content": summary_md}]
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+
+        data = st.session_state["ai_payload"]
+        ext_res = data["ext_res"]
+        ver = ext_res.get("verification") or {}
+
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            render_kpi_card("📄", "Detected Type", data["id_card"].get("doc_category") or data["doc_code"])
+        with k2:
+            render_kpi_card("⚙️", "Extractor Engine", ext_res.get("extraction_engine", "N/A"))
+        with k3:
+            render_kpi_card("📊", "Tables Found", f"{ver.get('total_tables', 0)} ({ver.get('total_rows', 0)} rows)")
+        with k4:
+            render_kpi_card("⏱️", "Extraction Time", f"{ext_res.get('processing_time_sec', 0):.2f} s")
+
+        st.markdown("<div style='height:10px;'></div>", unsafe_allow_html=True)
+
+        tab_chat, tab_tables, tab_md, tab_json = st.tabs([
+            "🤖 AI Summary & Q&A",
+            f"⊞ Extracted Tables ({len(ext_res.get('tables') or [])})",
+            "📝 Clean Markdown",
+            "<> Full JSON",
+        ])
+
+        with tab_chat:
+            for msg in st.session_state.get("ai_chat_history", []):
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+
+            user_q = st.chat_input("Ask anything about this document (e.g. 'What is the highest debit?' or 'Summarize account details')")
+            if user_q:
+                st.session_state["ai_chat_history"].append({"role": "user", "content": user_q})
+                with st.chat_message("user"):
+                    st.markdown(user_q)
+                with st.chat_message("assistant"):
+                    with st.spinner("Thinking..."):
+                        reply = _ask_assistant_llm(user_q, data["summary_md"], ext_res.get("markdown_content") or "")
+                        st.markdown(reply)
+                st.session_state["ai_chat_history"].append({"role": "assistant", "content": reply})
+
+        with tab_tables:
+            tables = ext_res.get("tables") or []
+            if not tables:
+                st.info("No Markdown/HTML tables detected in this document.")
+            else:
+                for tbl in tables:
+                    t_no = tbl.get("table_number", 1)
+                    st.markdown(f"**Table {t_no}** ({tbl.get('row_count', 0)} rows × {tbl.get('column_count', 0)} cols)")
+                    df_t = pd.DataFrame(tbl.get("data", []))
+                    st.dataframe(df_t, width='stretch')
+
+        with tab_md:
+            md_content = ext_res.get("markdown_content") or ""
+            st.download_button(
+                "⬇️ Download Markdown (.md)",
+                data=md_content.encode("utf-8"),
+                file_name=f"{os.path.splitext(ai_file.name)[0]}.md",
+                mime="text/markdown",
+            )
+            st.markdown(md_content)
+
+        with tab_json:
+            st.json({"structured_summary_fields": data["fin_rec"], "universal_extractor": ext_res})
+
+    st.stop()
+    
 # TOP MINIMAL HEADER BAR & PAGE TITLE
 st.markdown("""
 <div class="top-bar">

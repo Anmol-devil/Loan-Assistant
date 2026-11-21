@@ -12,7 +12,7 @@ import pymupdf
 import numpy as np
 from PIL import Image, ImageChops, ExifTags
 import docx
-from ocr_compat import ocr_engine
+from ocr_compat import _OCR_INSTANCE, get_ocr_engine, run_ocr_normalized
 from corporate_kyc_engines import (
     classify_financial_document,
     verify_gst_certificate,
@@ -22,8 +22,11 @@ from corporate_kyc_engines import (
     verify_tax_audit_report,
 )
 from recocile_spans import reconcile_spans
+from universal_doc_extractor import extract_universal_document
+    
+from ocr_compat import run_ocr_normalized
 
-# ocr_engine = RapidOCR()
+ocr_engine = run_ocr_normalized
 
 # 1. UNIVERSAL REGEXES & OCR-RESILIENT CURRENCY / DATE PARSERS
 DATE_RE = re.compile(
@@ -1599,13 +1602,13 @@ def _select_best_bank_reconciliation(hybrid_check, legacy_check, hybrid_error=No
         "final_reconciled_rows": len(financial_check.get("transactions") or []),
         "pages_recovered_by_secondary_path": pages_recovered,
     }
-    financial_check.pop("bank_parser_error", None)
+    if hybrid_error:
+        financial_check["bank_parser_error"] = hybrid_error
+        print(f"[BANK_PARSER ERROR] {hybrid_error}", flush=True)
     return financial_check
 
 
-# ==============================================================================
-# 6. PURE NUMPY + PIL KYC PORTRAIT & DOCUMENT VERIFIERS (NO HAAR CASCADE DEPENDENCY)
-# ==============================================================================
+# 6. PURE NUMPY + PIL KYC PORTRAIT & DOCUMENT VERIFIERS 
 def preprocess_id_card_image_for_ocr(image_path: str) -> str:
     img_bgr = cv2.imread(image_path)
     if img_bgr is None:
@@ -1852,15 +1855,73 @@ def _extract_embedded_portrait_from_pdf(file_path: str) -> np.ndarray | None:
         pass
     return None
 
+_FACE_MODELS_CACHE = {"loaded": False, "detector": None, "recognizer": None}
+_WATCHLIST_EMBEDDING_CACHE = {}
+
+
+def _get_opencv_face_models():
+    if _FACE_MODELS_CACHE["loaded"]:
+        return _FACE_MODELS_CACHE["detector"], _FACE_MODELS_CACHE["recognizer"]
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    yunet_path = os.path.join(base_dir, "models", "face_detection_yunet_2023mar.onnx")
+    sface_path = os.path.join(base_dir, "models", "face_recognition_sface_2021dec.onnx")
+
+    if os.path.isfile(yunet_path) and os.path.isfile(sface_path):
+        try:
+            detector = cv2.FaceDetectorYN.create(
+                yunet_path, "", (320, 320), score_threshold=0.55, nms_threshold=0.3, top_k=5000
+            )
+            recognizer = cv2.FaceRecognizerSF.create(sface_path, "")
+            _FACE_MODELS_CACHE["detector"] = detector
+            _FACE_MODELS_CACHE["recognizer"] = recognizer
+        except Exception as exc:
+            print(f"[KYC FACE MODEL WARNING] Could not load YuNet/SFace: {exc}")
+
+    _FACE_MODELS_CACHE["loaded"] = True
+    return _FACE_MODELS_CACHE["detector"], _FACE_MODELS_CACHE["recognizer"]
+
+
+def _extract_sface_embedding(rgb_img: np.ndarray, detector, recognizer):
+    if rgb_img is None or rgb_img.size == 0:
+        return None
+    bgr = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
+    h, w = bgr.shape[:2]
+
+    # Upscale tiny ID portrait crops so YuNet can reliably find landmarks
+    if min(h, w) < 120:
+        scale = 160.0 / float(max(1, min(h, w)))
+        bgr = cv2.resize(bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+        h, w = bgr.shape[:2]
+
+    # Add small border padding so tight crops don't clip chin/forehead landmarks
+    pad = int(min(h, w) * 0.15)
+    bgr_padded = cv2.copyMakeBorder(bgr, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
+    ph, pw = bgr_padded.shape[:2]
+
+    detector.setInputSize((pw, ph))
+    _, faces = detector.detect(bgr_padded)
+    if faces is None or len(faces) == 0:
+        return None
+
+    # Pick highest-confidence detected face
+    best_face = faces[int(np.argmax(faces[:, -1]))]
+    aligned = recognizer.alignCrop(bgr_padded, best_face)
+    # .copy() is required because OpenCV reuses the internal Mat buffer across calls
+    return recognizer.feature(aligned).copy()
+
+
 def _check_celebrity_watchlist_and_monochrome_spoof(
     best_crop: np.ndarray,
     holder_name_hint: str = "",
     watchlist_dir: str = "kyc_spoof_watchlist",
+    cosine_threshold: float = 0.46,
 ) -> tuple[bool, list[str]]:
     reasons = []
     if best_crop is None or best_crop.size == 0:
         return False, reasons
 
+    # 1. Existing monochrome / grayscale / archival cutout check
     cr = best_crop[:, :, 0].astype(np.float32)
     cg = best_crop[:, :, 1].astype(np.float32)
     cb = best_crop[:, :, 2].astype(np.float32)
@@ -1885,62 +1946,97 @@ def _check_celebrity_watchlist_and_monochrome_spoof(
     else:
         face_rg_diff, face_rb_diff = rg_diff, gb_diff
 
-    overall_flat = (
-        p90_chroma < 14.0
-        or (rg_diff < 5.5 and gb_diff < 5.5)
-    )
-
-    face_flat = (
-        warm_skin_ratio < 0.015
-        and face_rg_diff < 6.0
-        and face_rb_diff < 11.0
-    )
+    overall_flat = p90_chroma < 14.0 or (rg_diff < 5.5 and gb_diff < 5.5)
+    face_flat = warm_skin_ratio < 0.015 and face_rg_diff < 6.0 and face_rb_diff < 11.0
     if overall_flat and face_flat:
         reasons.append(
-            f"monochrome / grayscale / archival portrait "
-            f"(e.g. Mahatma Gandhi B&W cutout) "
-            f"detected instead of a live color KYC photograph"
+            "monochrome / grayscale / archival portrait "
+            "(e.g. Mahatma Gandhi B&W cutout) detected instead of a live color KYC photograph"
         )
 
+    # 2. Celebrity / Public-Figure Watchlist Verification
     base_dir = os.path.dirname(os.path.abspath(__file__))
     wl_path = os.path.join(base_dir, watchlist_dir)
+    if not os.path.isdir(wl_path):
+        return (len(reasons) > 0), reasons
 
-    if os.path.isdir(wl_path):
-        crop_pil_gray = Image.fromarray(best_crop).convert("L")
-        dhash_arr = np.array(crop_pil_gray.resize((9, 8), Image.Resampling.BILINEAR), dtype=np.int16)
-        crop_dhash = (dhash_arr[:, 1:] > dhash_arr[:, :-1]).flatten()
+    detector, recognizer = _get_opencv_face_models()
+    if detector is not None and recognizer is not None:
+        query_feat = _extract_sface_embedding(best_crop, detector, recognizer)
+        if query_feat is not None:
+            best_score = -1.0
+            best_label = None
+            for fname in os.listdir(wl_path):
+                if not fname.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
+                    continue
+                fpath = os.path.join(wl_path, fname)
+                try:
+                    mtime = os.path.getmtime(fpath)
+                    cache_entry = _WATCHLIST_EMBEDDING_CACHE.get(fpath)
+                    if cache_entry and cache_entry[0] == mtime:
+                        ref_feat = cache_entry[1]
+                    else:
+                        ref_rgb = np.array(Image.open(fpath).convert("RGB"))
+                        ref_feat = _extract_sface_embedding(ref_rgb, detector, recognizer)
+                        _WATCHLIST_EMBEDDING_CACHE[fpath] = (mtime, ref_feat)
 
-        patch_32 = np.array(crop_pil_gray.resize((32, 32), Image.Resampling.BILINEAR), dtype=np.float32)
-        patch_32 = (patch_32 - np.mean(patch_32)) / (np.std(patch_32) + 1e-5)
+                    if ref_feat is None:
+                        continue
 
-        inner_crop = best_crop[iy0:iy1, ix0:ix1]
-        inner_pil_gray = Image.fromarray(inner_crop).convert("L") if inner_crop.size > 0 else crop_pil_gray
-        inner_32 = np.array(inner_pil_gray.resize((32, 32), Image.Resampling.BILINEAR), dtype=np.float32)
-        inner_32 = (inner_32 - np.mean(inner_32)) / (np.std(inner_32) + 1e-5)
+                    cos_sim = float(recognizer.match(query_feat, ref_feat, cv2.FaceRecognizerSF_FR_COSINE))
+                    if cos_sim > best_score:
+                        best_score = cos_sim
+                        best_label = os.path.splitext(fname)[0].replace("_", " ").replace("-", " ").title()
+                except Exception:
+                    continue
 
-        for fname in os.listdir(wl_path):
-            if not fname.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
-                continue
-            fpath = os.path.join(wl_path, fname)
-            try:
-                ref_pil = Image.open(fpath).convert("L")
-                ref_dhash_arr = np.array(ref_pil.resize((9, 8), Image.Resampling.BILINEAR), dtype=np.int16)
-                ref_dhash = (ref_dhash_arr[:, 1:] > ref_dhash_arr[:, :-1]).flatten()
-                hamming_dist = int(np.sum(crop_dhash != ref_dhash))
+            if best_label and best_score >= cosine_threshold:
+                reasons.append(
+                    f"public-figure / celebrity spoof match detected against watchlist identity '{best_label}' "
+                    f"(SFace cosine={best_score:.2f})"
+                )
+        return (len(reasons) > 0), reasons
 
-                ref_32 = np.array(ref_pil.resize((32, 32), Image.Resampling.BILINEAR), dtype=np.float32)
-                ref_32 = (ref_32 - np.mean(ref_32)) / (np.std(ref_32) + 1e-5)
+    # 3. Hardened Fallback (only if ONNX files are missing)
+    crop_pil = Image.fromarray(best_crop)
+    crop_gray = crop_pil.convert("L")
+    dhash_arr = np.array(crop_gray.resize((9, 8), Image.Resampling.BILINEAR), dtype=np.int16)
+    crop_dhash = (dhash_arr[:, 1:] > dhash_arr[:, :-1]).flatten()
 
-                ncc_score = max(float(np.mean(patch_32 * ref_32)), float(np.mean(inner_32 * ref_32)))
-                if hamming_dist <= 14 or ncc_score >= 0.72:
-                    celeb_label = os.path.splitext(fname)[0].replace("_", " ").replace("-", " ").title()
-                    reasons.append(
-                        f"public-figure / celebrity spoof match detected against watchlist identity '{celeb_label}' "
-                        f"(similarity={max(ncc_score, 1.0 - hamming_dist / 64.0):.2f})"
-                    )
-                    break
-            except Exception:
-                continue
+    patch_32 = np.array(crop_gray.resize((32, 32), Image.Resampling.BILINEAR), dtype=np.float32)
+    patch_32 = (patch_32 - np.mean(patch_32)) / (np.std(patch_32) + 1e-5)
+
+    rgb_32 = np.array(crop_pil.resize((32, 32), Image.Resampling.BILINEAR), dtype=np.float32)
+    rgb_32 = (rgb_32 - np.mean(rgb_32)) / (np.std(rgb_32) + 1e-5)
+
+    for fname in os.listdir(wl_path):
+        if not fname.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
+            continue
+        fpath = os.path.join(wl_path, fname)
+        try:
+            ref_pil = Image.open(fpath).convert("RGB")
+            ref_gray = ref_pil.convert("L")
+            ref_dhash_arr = np.array(ref_gray.resize((9, 8), Image.Resampling.BILINEAR), dtype=np.int16)
+            ref_dhash = (ref_dhash_arr[:, 1:] > ref_dhash_arr[:, :-1]).flatten()
+            hamming_dist = int(np.sum(crop_dhash != ref_dhash))
+
+            ref_32 = np.array(ref_gray.resize((32, 32), Image.Resampling.BILINEAR), dtype=np.float32)
+            ref_32 = (ref_32 - np.mean(ref_32)) / (np.std(ref_32) + 1e-5)
+            ncc_score = float(np.mean(patch_32 * ref_32))
+
+            ref_rgb_32 = np.array(ref_pil.resize((32, 32), Image.Resampling.BILINEAR), dtype=np.float32)
+            ref_rgb_32 = (ref_rgb_32 - np.mean(ref_rgb_32)) / (np.std(ref_rgb_32) + 1e-5)
+            rgb_ncc = float(np.mean(rgb_32 * ref_rgb_32))
+
+            if hamming_dist <= 8 and ncc_score >= 0.84 and rgb_ncc >= 0.80:
+                celeb_label = os.path.splitext(fname)[0].replace("_", " ").replace("-", " ").title()
+                reasons.append(
+                    f"public-figure / celebrity spoof match detected against watchlist identity '{celeb_label}' "
+                    f"(similarity={ncc_score:.2f})"
+                )
+                break
+        except Exception:
+            continue
 
     return (len(reasons) > 0), reasons
 
@@ -2654,17 +2750,14 @@ def route_specialized_document(full_text, page_spans, y_tol=12.0, filename="", f
         return _enrich_specialized_with_llm_and_telemetry(res, full_text, page_spans)
     return None
 
-
-# ==============================================================================
 # 7. MAIN ENTRYPOINTS: IMAGE, DOCX, AND PDF ANALYZERS
-# ==============================================================================
 def analyze_image(image_path, original_filename=None):
     page_spans = []
     text_parts = []
 
     fast_img_path = preprocess_id_card_image_for_ocr(image_path)
     try:
-        ocr_res, _ = ocr_engine(fast_img_path)
+        ocr_res = run_ocr_normalized(fast_img_path)
         if ocr_res:
             for box, text, conf in ocr_res:
                 t_clean = text.strip()
@@ -2852,7 +2945,7 @@ def analyze_document(file_path, original_filename=None, use_llm=True):
                     pix.save(temp_img)
                     fast_temp_img = preprocess_id_card_image_for_ocr(temp_img)
                     try:
-                        ocr_res, _ = ocr_engine(fast_temp_img)
+                        ocr_res = run_ocr_normalized(fast_temp_img)
                         p_spans = []
                         if ocr_res:
                             for box, text, conf in ocr_res:

@@ -5,7 +5,9 @@ import uuid
 import numpy as np
 import pymupdf
 import docx
-from ocr_compat import ocr_engine as ocr_reader
+
+from ocr_compat import _OCR_INSTANCE, run_ocr_normalized, get_ocr_engine
+ocr_engine = run_ocr_normalized
 from corporate_kyc_engines import classify_financial_document
 from recocile_spans import reconcile_spans
 
@@ -158,7 +160,7 @@ def extract_raw_text_from_file(file_path: str) -> str:
                     tmp_img = f"{file_path}_p{p_idx + 1}_id_tmp.png"
                     pix.save(tmp_img)
                     try:
-                        res, _ = ocr_reader(tmp_img)
+                        res = run_ocr_normalized(tmp_img)
                         ocr_txt = "\n".join(r[1] for r in res) if res else ""
                         page_texts.append(ocr_txt)
                     finally:
@@ -171,7 +173,7 @@ def extract_raw_text_from_file(file_path: str) -> str:
         t_txt = "\n".join(c.text for t in d.tables for r in t.rows for c in r.cells)
         return f"{p_txt}\n{t_txt}"
     elif ext in (".png", ".jpg", ".jpeg"):
-        res, _ = ocr_reader(file_path)
+        res = run_ocr_normalized(file_path)
         return "\n".join(r[1] for r in res) if res else ""
     return ""
 

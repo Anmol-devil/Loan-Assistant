@@ -4,6 +4,7 @@ from typing import Dict, List, Any, Tuple
 import numpy as np
 import pymupdf
 import docx
+from ocr_compat import run_ocr_normalized
 
 DATE_TOKEN_RE = re.compile(
     r"^(?:(0?[1-9]|[12]\d|3[01])[-/\s\.]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|[A-Za-z]{3,9})[-/\s\.,]*\d{2,4}"
@@ -306,7 +307,7 @@ def scan_pdf_structure(file_path: str, ocr_engine=None) -> Dict[str, Any]:
                 tmp_img = f"{file_path}_p{page_num}_scan.png"
                 pix.save(tmp_img)
                 try:
-                    ocr_res, _ = ocr_engine(tmp_img)
+                    ocr_res = run_ocr_normalized(tmp_img)
                     if ocr_res:
                         for box, txt_ocr, conf in ocr_res:
                             txt = txt_ocr.strip()
@@ -337,7 +338,6 @@ def scan_pdf_structure(file_path: str, ocr_engine=None) -> Dict[str, Any]:
                     if os.path.exists(tmp_img):
                         os.remove(tmp_img)
 
-            lines = _group_spans_into_lines(page_spans)
             page_spans.sort(key=lambda s: (s["cy_points"], s["cx_points"]))
             skip_sp = set()
             stitched_spans = []
@@ -388,6 +388,7 @@ def scan_pdf_structure(file_path: str, ocr_engine=None) -> Dict[str, Any]:
                                 break
                 stitched_spans.append(sp)
             page_spans = stitched_spans
+            lines = _group_spans_into_lines(page_spans)
             header_line_idx = None
             date_row_count = 0
             summary_lines: List[str] = []
