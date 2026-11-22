@@ -701,7 +701,7 @@ def _format_llm_style_summary(doc_code: str, id_card: dict, fin_rec: dict, ext_m
             if v is None:
                 continue
             s = str(v).strip()
-            if s and s.lower() not in ("not found", "n/a", "none", "unknown", "unknown holder", "unknown bank"):
+            if s and s.lower() not in ("not found", "n/a", "none", "unknown", "unknown holder", "unknown bank", "detail"):
                 return s
         return default
     if doc_code == "BANK_STATEMENT":
@@ -771,7 +771,20 @@ def _format_llm_style_summary(doc_code: str, id_card: dict, fin_rec: dict, ext_m
         )
         
     if doc_code == "UNKNOWN_DOCUMENT" and markdown_content.strip():
-        return _summarize_unknown_doc_with_llm(markdown_content, filename)
+        return _ask_assistant_llm(
+            (
+                f"Identify the uploaded document ('{filename}') and present a clean, structured summary of its real content "
+                "(document type, person/entity details, IDs/roll numbers, dates, key table values, and final totals/results). "
+                "Do NOT mention internal parser engines, status codes, or system metadata."
+            ),
+            f"Document filename: {filename}",
+            markdown_content,
+        )
+    INTERNAL_KEYS = {
+        "document_type", "portrait_base64", "status", "parser_engine_used",
+        "discovery_source", "total_pages_processed", "schema_confidence",
+        "llm_self_score", "bank_parser_error", "llm_processing_time_sec",
+    }
     
     lines = [f"### 📄 {id_card.get('doc_category', 'Document')} Summary"]
     for k, v in ext_meta.items():
@@ -781,8 +794,12 @@ def _format_llm_style_summary(doc_code: str, id_card: dict, fin_rec: dict, ext_m
             lines.append(f"- **{k.replace('_', ' ').title()}** = `{v}`")
     return "\n".join(lines)
 
-
-def _ask_assistant_llm(question: str, context_summary: str, markdown_excerpt: str) -> str:
+def _ask_assistant_llm(
+    question: str,
+    context_summary: str,
+    markdown_excerpt: str,
+    chat_history: list | None = None,
+) -> str:
     api_key = (
         os.environ.get("ZAI_API_KEY")
         or os.environ.get("GLM_API_KEY")
@@ -802,25 +819,48 @@ def _ask_assistant_llm(question: str, context_summary: str, markdown_excerpt: st
         else ("gpt-4o-mini" if api_key.startswith("sk-") and "." not in api_key else "glm-4.5-flash")
     )
 
+    system_prompt = (
+        "You are a helpful, clear, and polite Indian financial and document assistant.\n"
+        "RULES FOR WRITING ANSWERS:\n"
+        "1. Always respond in natural, complete, human-readable sentences — NEVER reply with bare 'Field = Value' snippets.\n"
+        "2. Add helpful context from the document naturally (for example: 'The account number listed on the Standard Chartered Bank statement for M/S Do Wide Associates is **80405128582**.').\n"
+        "3. Bold key figures, names, dates, and IDs so they are easy to scan at a glance.\n"
+        "4. For calculations or transaction questions, show the math cleanly in ₹ (INR) and give a plain-English takeaway.\n"
+        "5. For broad requests like 'summarize', write a short friendly overview paragraph followed by clean bullet points.\n"
+        "6. Use ONLY facts present in the provided document. If a detail is not printed on the document, state that clearly in a polite sentence."
+        "7. NEVER mention internal system/parser metadata (such as REVIEW_REQUIRED, BANK_PARSER_HYBRID_V2, or discovery sources) unless the user specifically asks about pipeline diagnostics.\n"
+        "8. When reading multi-column tables (such as marksheets, invoices, or ledgers), verify column alignment using arithmetic before answering (e.g., verify Theory + Practical/Internal = Total, and verify the sum of subject totals equals the Aggregate). Never confuse Full Marks (e.g., 500) with Marks Obtained (e.g., 368)."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": (
+                f"Here is the uploaded document data to reference for all questions:\n\n"
+                f"STRUCTURED SUMMARY:\n{context_summary}\n\n"
+                f"EXTRACTED DOCUMENT TEXT:\n{markdown_excerpt[:12000]}"
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": "Got it. I have reviewed the document and I am ready to answer your questions clearly.",
+        },
+    ]
+    if chat_history:
+        for turn in chat_history[1:][-6:]:
+            if turn.get("role") in ("user", "assistant") and turn.get("content"):
+                messages.append({"role": turn["role"], "content": turn["content"]})
+
+    messages.append({"role": "user", "content": question})
+
     client = OpenAI(api_key=api_key, base_url=base_url, timeout=30.0)
     resp = client.chat.completions.create(
         model=model,
-        temperature=0.1,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are an Indian financial and KYC document assistant. Answer concisely using ONLY the provided "
-                    "extracted summary and document text. Show calculations clearly in ₹ (INR) when asked about totals or balances."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"STRUCTURED SUMMARY:\n{context_summary}\n\nEXTRACTED DOCUMENT TEXT:\n{markdown_excerpt[:10000]}\n\nQUESTION: {question}",
-            },
-        ],
+        temperature=0.25,
+        messages=messages,
     )
-    return resp.choices[0].message.content or "No response returned."
+    return resp.choices[0].message.content or "I could not generate a response for that question."
 
 if st.session_state.get("active_page") == "Document Extractor":
     st.markdown("""
@@ -855,7 +895,7 @@ if st.session_state.get("active_page") == "Document Extractor":
                 tmp.write(ai_file.getbuffer())
                 tmp_path = tmp.name
             try:
-                with st.spinner("Extracting document with Universal Extractor & running financial/KYC engine..."):
+                with st.spinner("Extracting Uploaded document & running financial/KYC engine..."):
                     ext_res = extract_universal_document(tmp_path, use_glm_ocr=use_glm_ocr)
                     fin_rec, id_card, doc_code = {}, {}, "UNKNOWN_DOCUMENT"
                     if suffix in (".pdf", ".png", ".jpg", ".jpeg", ".docx"):
@@ -912,12 +952,18 @@ if st.session_state.get("active_page") == "Document Extractor":
 
             user_q = st.chat_input("Ask anything about this document (e.g. 'What is the highest debit?' or 'Summarize account details')")
             if user_q:
+                prev_history = list(st.session_state.get("ai_chat_history", []))
                 st.session_state["ai_chat_history"].append({"role": "user", "content": user_q})
                 with st.chat_message("user"):
                     st.markdown(user_q)
                 with st.chat_message("assistant"):
                     with st.spinner("Thinking..."):
-                        reply = _ask_assistant_llm(user_q, data["summary_md"], ext_res.get("markdown_content") or "")
+                        reply = _ask_assistant_llm(
+                            user_q,
+                            data["summary_md"],
+                            ext_res.get("markdown_content") or "",
+                            chat_history=prev_history,
+                        )
                         st.markdown(reply)
                 st.session_state["ai_chat_history"].append({"role": "assistant", "content": reply})
 

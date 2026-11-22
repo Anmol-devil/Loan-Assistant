@@ -573,16 +573,31 @@ def identify_document_and_entity(file_path: str, raw_report: dict = None) -> dic
     account_number = None
 
     if doc_code == "BANK_STATEMENT":
+        BAD_BRANCH_WORDS = {
+            "details", "detail", "info", "information", "summary", "name",
+            "code", "address", "ifsc", "micr", "phone", "email", "contact",
+            "manager", "office", "number", "no", "id", "n/a", "na", "none",
+        }
         m_br = re.search(
-            r"(?:Branch\s*Name|Account\s*Branch|Home\s*Branch|\bBranch\b(?!\s*(?:Code|Address|GSTN|IFSC|Phone|Email)))[\s:\|\-]+([A-Za-z][A-Za-z0-9 \t,\.\-&]{2,45})",
+            r"\b(?:Branch\s*Name|Home\s*Branch|Account\s*Branch|Base\s*Branch)\b[\s:\|\-]+([A-Za-z][A-Za-z0-9 \t,\.\-&/]{2,50})",
             pre_table_header,  # use `strict_pre_hdr` in bank_schema.py
             re.IGNORECASE,
         )
+        if not m_br:
+            m_br = re.search(
+                r"\bBranch\b\s*[:\|\-]+[\s:\|\-]*([A-Za-z][A-Za-z0-9 \t,\.\-&/]{2,50})",
+                pre_table_header,  # use `strict_pre_hdr` in bank_schema.py
+                re.IGNORECASE,
+            )
         if m_br:
             cand_br = re.sub(r"[ \t]+", " ", m_br.group(1).splitlines()[0].split("|")[0]).strip(" :-|.,")
-            if cand_br and not any(
-                k in cand_br.lower()
-                for k in ("account type", "account no", "currency", "statement date", "ifsc", "micr")
+            if (
+                cand_br
+                and cand_br.lower() not in BAD_BRANCH_WORDS
+                and not any(
+                    k in cand_br.lower()
+                    for k in ("account type", "account no", "account number", "currency", "statement date", "ifsc", "micr")
+                )
             ):
                 branch_name = cand_br.upper()
 

@@ -388,13 +388,33 @@ def _deterministic_blueprint_discovery(
     account_number = None
     customer_id = None
 
+    BAD_BRANCH_WORDS = {
+            "details", "detail", "info", "information", "summary", "name",
+            "code", "address", "ifsc", "micr", "phone", "email", "contact",
+            "manager", "office", "number", "no", "id", "n/a", "na", "none",
+        }
     m_br = re.search(
-        r"(?:Branch\s*Name|Account\s*Branch|Home\s*Branch)[\s:\|\-]+([A-Za-z0-9][A-Za-z0-9 \t,\.\-&]{2,40})",
-        strict_pre_hdr,
-        re.I,
+        r"\b(?:Branch\s*Name|Home\s*Branch|Account\s*Branch|Base\s*Branch)\b[\s:\|\-]+([A-Za-z][A-Za-z0-9 \t,\.\-&/]{2,50})",
+        strict_pre_hdr,  # use `strict_pre_hdr` in bank_schema.py
+        re.IGNORECASE,
     )
+    if not m_br:
+        m_br = re.search(
+            r"\bBranch\b\s*[:\|\-]+[\s:\|\-]*([A-Za-z][A-Za-z0-9 \t,\.\-&/]{2,50})",
+            strict_pre_hdr,  # use `strict_pre_hdr` in bank_schema.py
+            re.IGNORECASE,
+        )
     if m_br:
-        branch_name = re.sub(r"[ \t]+", " ", m_br.group(1).splitlines()[0].split("|")[0]).strip(" :-|.,").upper()
+        cand_br = re.sub(r"[ \t]+", " ", m_br.group(1).splitlines()[0].split("|")[0]).strip(" :-|.,")
+        if (
+            cand_br
+            and cand_br.lower() not in BAD_BRANCH_WORDS
+            and not any(
+                k in cand_br.lower()
+                for k in ("account type", "account no", "account number", "currency", "statement date", "ifsc", "micr")
+            )
+        ):
+            branch_name = cand_br.upper()
 
     m_ac = re.search(r"(?:Account\s*(?:No\.?|Number)|A/C\s*No\.?)[\s:\|\-]+([A-Z0-9X\*]{6,22})", strict_pre_hdr, re.I)
     if m_ac and sum(1 for ch in m_ac.group(1) if ch.isdigit() or ch in "X*") >= 3:

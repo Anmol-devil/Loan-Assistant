@@ -30,7 +30,7 @@ FIELD_LABELS = {
     "ifsc_code": ["ifsc", "ifsc code", "rtgs/neft ifsc"],
     "pan": ["pan", "pan no", "pan number", "pan card"],
     "bank_name": ["bank name", "bank"],
-    "branch": ["branch", "branch name"],
+    "branch": ["branch name", "home branch", "account branch", "branch"],
     "statement_period": ["statement period", "statement date", "period", "transaction date from"],
 }
 
@@ -438,7 +438,10 @@ def extract_financial_metadata(
                     return bank
             return v if 3 <= len(v) <= 60 else None
         if field == "branch":
-            if any(bad in v.lower() for bad in ("account type", "account number", "currency", "statement date")):
+            low_v = v.lower().strip()
+            if low_v in {"details", "detail", "info", "information", "summary", "name", "code", "address", "contact", "n/a", "na", "none"}:
+                return None
+            if any(bad in low_v for bad in ("account type", "account number", "currency", "statement date")):
                 return None
             return v if 2 <= len(re.findall(r"[A-Za-z]", v)) and len(v) <= 60 else None
         if field == "account_holder":
@@ -486,6 +489,10 @@ def extract_financial_metadata(
                         break
             if not matched:
                 for field, labels in FIELD_LABELS.items():
+                    if field == "branch" and any(
+                        w in k_low for w in ("address", "code", "phone", "mobile", "email", "fax", "ifsc", "micr", "pin", "gst", "contact", "details", "timing", "hours")
+                    ):
+                        continue
                     if any(re.search(rf"\b{re.escape(lbl)}\b", k_low) for lbl in labels):
                         if _add(field, v, 0.84 if visual_p1 else 0.80):
                             break
