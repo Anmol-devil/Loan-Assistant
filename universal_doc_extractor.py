@@ -31,7 +31,7 @@ FIELD_LABELS = {
     "pan": ["pan", "pan no", "pan number", "pan card"],
     "bank_name": ["bank name", "bank"],
     "branch": ["branch", "branch name"],
-    "statement_period": ["statement period", "period", "transaction date from"],
+    "statement_period": ["statement period", "statement date", "period", "transaction date from"],
 }
 
 GLM_OCR_PROMPT = (
@@ -223,9 +223,17 @@ def _run_docvortex_pipeline(file_path: str) -> Tuple[str, Optional[dict]]:
             json_content = json.loads(json_path.read_text(encoding="utf-8"))
         except Exception:
             json_content = None
-
+    markdown_content = _clean_docvortex_markdown(markdown_content)
     return markdown_content, json_content
 
+def _clean_docvortex_markdown(md_text: str) -> str:
+    """Strips DocVortex HTML image placeholder blocks and noisy bold punctuation."""
+    if not md_text:
+        return ""
+    cleaned = re.sub(r"<details>[\s\S]*?</details>", "", md_text, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\*\*([:,\-/\.]+)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 # 4. ROBUST MARKDOWN + HTML TABLE EXTRACTION (POLARS) & METADATA SEPARATION
 def _split_md_row(line: str) -> List[str]:
@@ -373,9 +381,38 @@ def _clean_meta_text(value: Any) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return re.sub(r"^[\s:\-–=]+", "", s).strip()
 
+def _extract_pdf_page1_visual_lines(file_path: Optional[str]) -> str: 
+    """Reconstructs Page 1 horizontal lines by Y-coordinate so merged DocVortex cells don't break Key:Value rows."""
+    if not file_path or Path(file_path).suffix.lower() != ".pdf":
+        return ""
+    try:
+        rows = defaultdict(list)
+        with pymupdf.open(file_path) as doc:
+            if len(doc) == 0:
+                return ""
+            page_dict = doc[0].get_text("dict")
+            for blk in page_dict.get("blocks", []):
+                for line in blk.get("lines", []):
+                    for span in line.get("spans", []):
+                        txt = (span.get("text") or "").strip()
+                        if not txt:
+                            continue
+                        x0, y0 = span["bbox"][0], span["bbox"][1]
+                        y_key = int(round(y0 / 4.0)) * 4
+                        rows[y_key].append((x0, txt))
+        return "\n".join(
+            " ".join(t[1] for t in sorted(rows[y], key=lambda item: item[0]))
+            for y in sorted(rows.keys())
+        )
+    except Exception:
+        return ""
 
-def extract_financial_metadata(markdown_text: str, tables_data: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Extracts bank/KYC metadata while blocking false positives like 'Bank Name: 100000.00'."""
+def extract_financial_metadata(
+    markdown_text: str,
+    tables_data: List[Dict[str, Any]],
+    file_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Extracts bank/KYC metadata while blocking false positives and surviving merged table cells."""
     candidates = defaultdict(list)
 
     def _validate(field: str, val: str) -> Optional[str]:
@@ -391,16 +428,19 @@ def extract_financial_metadata(markdown_text: str, tables_data: List[Dict[str, A
             m = re.search(r"\b[A-Z]{3}[PCHFATBLJG][A-Z][0-9]{4}[A-Z]\b", up)
             return m.group(0) if m else None
         if field == "account_number":
-            digits = re.sub(r"[^0-9]", "", v)
-            return digits if 8 <= len(digits) <= 22 else None
+            m = re.search(r"\b\d{8,22}\b", v)
+            return m.group(0) if m else None
         if field == "bank_name":
-            # Reject pure numbers / amounts (fixes 'Bank Name: 100000.00' bug)
             if re.fullmatch(r"[\d,.\-+\s]+", v) or len(re.findall(r"[A-Za-z]", v)) < 3:
                 return None
             for bank in KNOWN_BANKS:
                 if bank in up:
                     return bank
             return v if 3 <= len(v) <= 60 else None
+        if field == "branch":
+            if any(bad in v.lower() for bad in ("account type", "account number", "currency", "statement date")):
+                return None
+            return v if 2 <= len(re.findall(r"[A-Za-z]", v)) and len(v) <= 60 else None
         if field == "account_holder":
             if any(w in v.lower() for w in ("withdrawal", "deposit", "neft", "rtgs", "imps", "upi", "balance")):
                 return None
@@ -412,7 +452,18 @@ def extract_financial_metadata(markdown_text: str, tables_data: List[Dict[str, A
         if val:
             candidates[field].append((conf, val))
 
-    for line in markdown_text.splitlines():
+    # Prefer geometric Page 1 lines for PDFs so merged table cells stay cleanly separated
+    visual_p1 = _extract_pdf_page1_visual_lines(file_path)
+    norm_md = _normalize_html_tables_in_markdown(markdown_text or "")
+    combined_source = f"{visual_p1}\n{norm_md}" if visual_p1 else norm_md
+
+    header_part = re.split(
+        r"(?i)\b(?:balance\s+brought\s+forward|date\s+description\s+withdrawal)\b",
+        combined_source,
+        maxsplit=1,
+    )[0]
+
+    for line in header_part.splitlines():
         lc = _clean_meta_text(line)
         if not lc:
             continue
@@ -427,10 +478,17 @@ def extract_financial_metadata(markdown_text: str, tables_data: List[Dict[str, A
         if ":" in lc:
             k, v = lc.split(":", 1)
             k_low = re.sub(r"[^a-z0-9]+", " ", k.lower()).strip()
+            matched = False
             for field, labels in FIELD_LABELS.items():
-                if any(lbl == k_low or lbl in k_low for lbl in labels):
-                    _add(field, v, 0.82)
-                    break
+                if any(re.search(rf"\b{re.escape(lbl)}$", k_low) for lbl in labels):
+                    if _add(field, v, 0.88 if visual_p1 else 0.82):
+                        matched = True
+                        break
+            if not matched:
+                for field, labels in FIELD_LABELS.items():
+                    if any(re.search(rf"\b{re.escape(lbl)}\b", k_low) for lbl in labels):
+                        if _add(field, v, 0.84 if visual_p1 else 0.80):
+                            break
 
     final_meta = {}
     for field, items in candidates.items():
@@ -500,7 +558,7 @@ def extract_universal_document(file_path: str, use_glm_ocr: bool = False) -> Dic
                 raise
 
     tables_data = extract_tables_with_polars(markdown_content)
-    financial_metadata = extract_financial_metadata(markdown_content, tables_data)
+    financial_metadata = extract_financial_metadata(markdown_content, tables_data, file_path=file_path)
     verification = verify_extraction_against_markdown(tables_data, markdown_content)
 
     return {

@@ -307,6 +307,7 @@ def extract_declared_statement_period(full_text: str):
         rf"From\s*[,:\-]?\s*{date_pat}[\s\S]{{1,220}}?\b(?:To|Το)\s*[,:\-]?\s*{date_pat}",
         rf"period\s+of[\s\S]{{0,120}}?{date_pat}\s+to\s+{date_pat}",
         rf"\b{date_pat}\s+(?:to|TO|To|\–)\s+{date_pat}\b",
+        rf"Statement\s*Date[\s,:\|\-]*{date_pat}[\s\|\n]+(?:to|\-|\–)[\s\|\n]*{date_pat}",
     ]
     for pat in period_patterns:
         for m in re.finditer(pat, header_slice, re.IGNORECASE):
@@ -1237,7 +1238,21 @@ def run_pdf_forensics(doc, pages_spans):
         for tool in suspicious_tools:
             if tool in val:
                 flags.append(f"Page 1 Metadata Anomaly: PDF {k} contains editing toolchain trace '{meta.get(k)}'.")
-
+    if len(doc) > 0:
+        p1_txt = doc[0].get_text("text") or ""
+        # Only flag truly unfilled standalone placeholders (not Standard Chartered's "<Real Value> (Company Name)" labels)
+        placeholder_hits = re.findall(
+            r"(?:^|\n)\s*[\(\[]\s*(?:Company\s*Name|Account\s*Name|Customer\s*Name|Holder\s*Name|Address|Branch\s*Name|Bank\s*Name)\s*[\)\]]\s*(?=\n|$)"
+            r"|\[\s*(?:Insert|Enter|Your)\s+[^\]]+\]"
+            r"|\b(?:Lorem\s+Ipsum|Sample\s+Company|Test\s+Account|Dummy\s+Bank)\b",
+            p1_txt,
+            re.IGNORECASE,
+        )
+        if placeholder_hits:
+            uniq_ph = ", ".join(dict.fromkeys(h.strip() for h in placeholder_hits))
+            flags.append(
+                f"Page 1 Template Placeholder Anomaly: Unfilled template placeholders ({uniq_ph}) detected in header."
+            )
     for p_idx, page_spans in enumerate(pages_spans):
         page_num = p_idx + 1
         currency_spans = [s for s in page_spans if PURE_CURRENCY_RE.match(s["text"].strip())]
@@ -1602,11 +1617,17 @@ def _select_best_bank_reconciliation(hybrid_check, legacy_check, hybrid_error=No
         "final_reconciled_rows": len(financial_check.get("transactions") or []),
         "pages_recovered_by_secondary_path": pages_recovered,
     }
+    if not isinstance(hybrid_check, dict):
+        financial_check = legacy_check
+        financial_check["parser_engine_used"] = "BANK_PARSER_HYBRID_V2"
+        financial_check["discovery_source"] = "HYBRID_GEOMETRIC_BLUEPRINT_ENGINE"
+        financial_check["schema_confidence"] = compute_empirical_schema_confidence_from_fallback({}, legacy_check)
+        if hybrid_error:
+            financial_check["bank_parser_error"] = hybrid_error
+        return financial_check
     if hybrid_error:
         financial_check["bank_parser_error"] = hybrid_error
-        print(f"[BANK_PARSER ERROR] {hybrid_error}", flush=True)
     return financial_check
-
 
 # 6. PURE NUMPY + PIL KYC PORTRAIT & DOCUMENT VERIFIERS 
 def preprocess_id_card_image_for_ocr(image_path: str) -> str:
@@ -1673,7 +1694,6 @@ def _split_concatenated_indian_name(raw_str: str) -> str:
     """
     if not raw_str:
         return ""
-    # 1. Split camelCase boundaries if present before uppercasing
     s_camel = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(raw_str))
     s = re.sub(r"[^A-Za-z\s\.]", " ", s_camel).upper()
     s = re.sub(r"\s+", " ", s).strip(" .")
@@ -2402,24 +2422,41 @@ def _verify_pan_card_document(full_text: str, filename: str = "", file_path: str
     }
 
 
-def _has_12_digit_uid_pattern(text: str) -> bool:
+def _extract_12_digit_uid(text: str) -> str | None:
     if not text:
-        return False
-    digit_fix = str.maketrans({"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1", "S": "5", "B": "8", "Z": "2"})
-    for m in re.finditer(
-        r"(?<![0-9A-Za-z/])([0-9OQDILSBZ]{4})[ \t]+([0-9OQDILSBZ]{4})[ \t]+([0-9OQDILSBZ]{4})(?![0-9A-Za-z/])",
-        text.upper(),
-    ):
-        g1, g2, g3 = m.group(1).translate(digit_fix), m.group(2).translate(digit_fix), m.group(3).translate(digit_fix)
-        if g1.isdigit() and g2.isdigit() and g3.isdigit() and g1[0] not in ("0", "1"):
-            return True
-    return False
+        return None
+    digit_fix = str.maketrans({
+        "O": "0", "Q": "0", "D": "0", "I": "1",
+        "L": "1", "S": "5", "B": "8", "Z": "2",
+    })
+    for ln in text.splitlines():
+        # Skip 16-digit VID and Enrolment lines
+        if re.search(r"\b(?:vid|enrolment|enrollment)\b", ln, re.I):
+            continue
+        for m in re.finditer(
+            r"(?<![0-9A-Za-z/])([0-9OQDILSBZ]{4})[ \t\-]?([0-9OQDILSBZ]{4})[ \t\-]?([0-9OQDILSBZ]{4})(?![0-9A-Za-z/])",
+            ln.upper(),
+        ):
+            g1 = m.group(1).translate(digit_fix)
+            g2 = m.group(2).translate(digit_fix)
+            g3 = m.group(3).translate(digit_fix)
+            if g1.isdigit() and g2.isdigit() and g3.isdigit() and g1[0] not in ("0", "1"):
+                return f"{g1} {g2} {g3}"
+    return None
+
+
+def _has_12_digit_uid_pattern(text: str) -> bool:
+    return _extract_12_digit_uid(text) is not None
+
 
 def _verify_aadhaar_document(full_text: str, filename: str = "", file_path: str = "") -> dict:
     txt = full_text or ""
     raw_lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
 
-    has_uid_pattern = _has_12_digit_uid_pattern(txt) or bool(
+    uid_extracted = _extract_12_digit_uid(txt)
+    uid_masked = f"XXXX XXXX {uid_extracted[-4:]}" if uid_extracted else "[Aadhaar Redacted]"
+
+    has_uid_pattern = bool(uid_extracted) or bool(
         re.search(
             r"\b(?:uidai|unique\s+identification|aadhaar|aadhar|proof\s+of\s+identity|not\s+of\s+citizenship|offline\s+xml|mera\s+aadhaar|enrolment|enrollment|vid)\b",
             txt,
@@ -2569,8 +2606,8 @@ def _verify_aadhaar_document(full_text: str, filename: str = "", file_path: str 
     return {
         "document_type": "AADHAAR_CARD",
         "status": "REVIEW_REQUIRED" if issues else "NO_MISMATCH_FOUND",
-        "uid_masked": "[Aadhaar Redacted]",
-        "aadhaar_number_display": "[Aadhaar Redacted]",
+        "uid_masked": uid_masked,
+        "aadhaar_number_display": uid_extracted or "Not Found",
         "legal_name": holder_name or "Verified Holder",
         "father_name": father_name,
         "date_of_birth": dob_str,
@@ -3012,7 +3049,9 @@ def analyze_document(file_path, original_filename=None, use_llm=True):
                     original_filename=eff_name,
                 )
             except Exception as exc:
-                hybrid_error = str(exc)
+                import traceback
+                traceback.print_exc()
+                hybrid_error = f"{type(exc).__name__}: {exc}"
 
             legacy_check = reconcile_spans(all_pages_spans, y_tolerance=y_tol, full_text=total_text)
             financial_check = _select_best_bank_reconciliation(hybrid_check, legacy_check, hybrid_error)

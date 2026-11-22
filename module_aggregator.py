@@ -574,12 +574,17 @@ def identify_document_and_entity(file_path: str, raw_report: dict = None) -> dic
 
     if doc_code == "BANK_STATEMENT":
         m_br = re.search(
-            r"(?:Branch\s*Name|Account\s*Branch|Home\s*Branch)\s*[:\|\-\n]+\s*([A-Za-z0-9][A-Za-z0-9 \t,\.\-&]{2,40})",
-            pre_table_header,
+            r"(?:Branch\s*Name|Account\s*Branch|Home\s*Branch|\bBranch\b(?!\s*(?:Code|Address|GSTN|IFSC|Phone|Email)))[\s:\|\-]+([A-Za-z][A-Za-z0-9 \t,\.\-&]{2,45})",
+            pre_table_header,  # use `strict_pre_hdr` in bank_schema.py
             re.IGNORECASE,
         )
         if m_br:
-            branch_name = re.sub(r"[ \t]+", " ", m_br.group(1).splitlines()[0].split("|")[0]).strip(" :-|.,").upper()
+            cand_br = re.sub(r"[ \t]+", " ", m_br.group(1).splitlines()[0].split("|")[0]).strip(" :-|.,")
+            if cand_br and not any(
+                k in cand_br.lower()
+                for k in ("account type", "account no", "currency", "statement date", "ifsc", "micr")
+            ):
+                branch_name = cand_br.upper()
 
         m_ifsc = re.search(r"IFSC(?:\s*Code)?[\s:\|\-]*([A-Z]{4})[0O]([A-Z0-9]{6})\b", pre_table_header.upper())
         if m_ifsc:
@@ -1040,7 +1045,13 @@ def build_module1_output(file_path, raw_report, tenant_id="default_lender", doc_
     bp_bank = (bp_meta.get("issuing_bank") or "").strip()
     bp_holder = (bp_meta.get("holder_name") or "").strip()
     
-    if bp_bank and not bp_bank.lower().startswith("tmp") and not bp_bank.lower().endswith((".pdf", ".docx", ".png", ".jpg", ".jpeg")):
+    if (
+        bp_bank
+            and not bp_bank.lower().startswith("tmp")
+            and "statement" not in bp_bank.lower()
+            and "_" not in bp_bank
+            and not bp_bank.lower().endswith((".pdf", ".docx", ".png", ".jpg", ".jpeg"))
+        ):
         cur_b = (identity_info.get("issuing_bank") or "UNKNOWN").strip()
         fn_check = ((raw_report or {}).get("original_filename") or file_path or "").lower()
 

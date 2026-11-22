@@ -10,4 +10,7 @@ openai
 opencv-python-headless
 rapidocr>=2.0.0
 onnxruntime
+pypdfium2
+docvortex
+polars
 # onnxruntime>=1.18.0,<1.22.0

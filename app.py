@@ -66,6 +66,35 @@ st.markdown("""
     section[data-testid="stSidebar"] div[data-baseweb="select"] * {
         color: #0f172a !important;
     }
+    
+    /* Fix washed-out whitish buttons inside the dark navy sidebar */
+    section[data-testid="stSidebar"] button[data-testid="stBaseButton-secondary"],
+    section[data-testid="stSidebar"] button[kind="secondary"] {
+        background-color: #1e293b !important;
+        border: 1px solid #334155 !important;
+        color: #e2e8f0 !important;
+        border-radius: 9px !important;
+        font-weight: 600 !important;
+    }
+    section[data-testid="stSidebar"] button[data-testid="stBaseButton-secondary"]:hover,
+    section[data-testid="stSidebar"] button[kind="secondary"]:hover {
+        background-color: #334155 !important;
+        border-color: #6366f1 !important;
+        color: #ffffff !important;
+    }
+    section[data-testid="stSidebar"] button[data-testid="stBaseButton-primary"],
+    section[data-testid="stSidebar"] button[kind="primary"] {
+        background: linear-gradient(90deg, #4f46e5 0%, #4338ca 100%) !important;
+        border: 1px solid #6366f1 !important;
+        color: #ffffff !important;
+        border-radius: 9px !important;
+        font-weight: 700 !important;
+        box-shadow: 0 4px 12px rgba(79, 70, 229, 0.35) !important;
+    }
+    section[data-testid="stSidebar"] button[data-testid="stBaseButton-primary"] *,
+    section[data-testid="stSidebar"] button[data-testid="stBaseButton-secondary"] * {
+        color: #ffffff !important;
+    }
 
     .sb-brand {
         display: flex;
@@ -592,37 +621,50 @@ with st.sidebar:
     if st.session_state.get("active_page") not in ("Document Checker", "Document Extractor"):
         st.session_state["active_page"] = "Document Checker"
 
-    if st.button(
+    def _switch_page(target_page: str):
+        st.session_state["active_page"] = target_page
+
+    cur_page = st.session_state["active_page"]
+
+    st.button(
         "📄 Document Checker",
+        key="nav_btn_checker",
         width="stretch",
-        type="primary" if st.session_state["active_page"] == "Document Checker" else "secondary",
-    ):
-        st.session_state["active_page"] = "Document Checker"
-        st.rerun()
+        type="primary" if cur_page == "Document Checker" else "secondary",
+        on_click=_switch_page,
+        args=("Document Checker",),
+    )
 
-    if st.button(
+    st.button(
         "🧾 Document Extractor",
+        key="nav_btn_extractor",
         width="stretch",
-        type="primary" if st.session_state["active_page"] == "Document Extractor" else "secondary",
-    ):
-        st.session_state["active_page"] = "Document Extractor"
-        st.rerun()
+        type="primary" if cur_page == "Document Extractor" else "secondary",
+        on_click=_switch_page,
+        args=("Document Extractor",),
+    )
 
-    st.markdown("""
+    m1_cls = "sb-mod-card sb-mod-active" if cur_page == "Document Checker" else "sb-mod-card"
+    m2_cls = "sb-mod-card sb-mod-active" if cur_page == "Document Extractor" else "sb-mod-card"
+    m1_chk = '<span style="color:#4ade80 !important; font-weight:800;">✓</span>' if cur_page == "Document Checker" else ""
+    m2_chk = '<span style="color:#4ade80 !important; font-weight:800;">✓</span>' if cur_page == "Document Extractor" else ""
+
+    st.markdown(f"""
     <hr style="border-color:#1e293b; margin:14px 0;">
     <div style="font-size:11.5px; font-weight:700; color:#94a3b8 !important; margin-bottom:8px; text-transform:uppercase;">Modules</div>
-    <div class="sb-mod-card sb-mod-active">
+    <div class="{m1_cls}">
         <div>
             <div style="font-size:13px; font-weight:700; color:#ffffff !important;">1 &nbsp; Document Checker</div>
             <div style="font-size:11px; color:#94a3b8 !important;">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;(Fraud & Risk)</div>
         </div>
-        <span style="color:#4ade80 !important; font-weight:800;">✓</span>
+        {m1_chk}
     </div>
-    <div class="sb-mod-card">
+    <div class="{m2_cls}">
         <div>
-            <div style="font-size:13px; font-weight:600; color:#cbd5e1 !important;">2 &nbsp; Document Extractor</div>
-            <div style="font-size:11px; color:#64748b !important;">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;(DocVortex & Q&A)</div>
+            <div style="font-size:13px; font-weight:700; color:#ffffff !important;">2 &nbsp; Document Extractor</div>
+            <div style="font-size:11px; color:#94a3b8 !important;">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;(DocVortex & Q&A)</div>
         </div>
+        {m2_chk}
     </div>
     """, unsafe_allow_html=True)
 
@@ -642,12 +684,30 @@ with st.sidebar:
             key="tenant_choice_select",
         )
 
-def _format_llm_style_summary(doc_code: str, id_card: dict, fin_rec: dict, ext_meta: dict) -> str:
+def _summarize_unknown_doc_with_llm(markdown_text: str, filename: str) -> str:
+    prompt = (
+        f"Identify this document ('{filename}') and extract its most important fields in clean bullet format:\n"
+        f"### 📄 <Detected Document Type> Summary\n"
+        f"- **Field Name** = `Exact Value`\n\n"
+        f"Include key parties/names, ID/reference numbers, dates, addresses, and any monetary amounts/totals. "
+        f"If there are numeric totals, verify the math briefly. Only state facts present in the text."
+    )
+    return _ask_assistant_llm(prompt, "Unknown document — infer schema dynamically.", markdown_text)
+
+def _format_llm_style_summary(doc_code: str, id_card: dict, fin_rec: dict, ext_meta: dict, markdown_content: str = "",filename: str = "document",) -> str:
     """Formats an LLM-style structured brief tailored to Bank Statement, Aadhaar, PAN, or other docs."""
+    def _pick(*vals, default="Not Found"):
+        for v in vals:
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s and s.lower() not in ("not found", "n/a", "none", "unknown", "unknown holder", "unknown bank"):
+                return s
+        return default
     if doc_code == "BANK_STATEMENT":
         bank_name = id_card.get("issuing_bank") or ext_meta.get("bank_name") or "Not Found"
         acct_no = id_card.get("account_number") or ext_meta.get("account_number") or "Not Found"
-        ifsc = id_card.get("ifsc_code") or ext_meta.get("ifsc_code") or "Not Found"
+        ifsc = id_card.get("ifsc_code") or ext_meta.get("ifsc_code") or "Not Printed on Statement"
         holder = id_card.get("holder_name") or ext_meta.get("account_holder") or "Not Found"
         branch = id_card.get("branch_name") or ext_meta.get("branch") or "Not Found"
 
@@ -709,7 +769,10 @@ def _format_llm_style_summary(doc_code: str, id_card: dict, fin_rec: dict, ext_m
             f"- **Entity Category** = `{fin_rec.get('entity_category') or 'Not Found'}`\n"
             f"- **Portrait Check** = `{fin_rec.get('portrait_verification') or 'Verified'}`\n"
         )
-
+        
+    if doc_code == "UNKNOWN_DOCUMENT" and markdown_content.strip():
+        return _summarize_unknown_doc_with_llm(markdown_content, filename)
+    
     lines = [f"### 📄 {id_card.get('doc_category', 'Document')} Summary"]
     for k, v in ext_meta.items():
         lines.append(f"- **{k.replace('_', ' ').title()}** = `{v}`")

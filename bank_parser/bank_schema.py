@@ -211,8 +211,13 @@ def _normalize_issuing_bank_name(raw_val: Optional[str], fallback_bank: Optional
         return "South Indian Bank"
     if "standard chartered" in low:
         return "Standard Chartered Bank"
-
-    if "bank" in low and not low.startswith("tmp") and "detected" not in low:
+    if (
+        "bank" in low
+        and not low.startswith("tmp")
+        and "detected" not in low
+        and not any(w in low for w in ("statement", "fy_", "fy-", "acct_stmt", "passbook", "transaction"))
+        and "_" not in s_clean
+    ):
         return s_clean.title()
     return fallback_bank
 
@@ -418,19 +423,26 @@ def _deterministic_blueprint_discovery(
                 break
 
     bank_re = re.compile(
-        r"\b(Bank\s+of\s+Baroda|bob\s+World|bob\s+Internet|Bank\s+of\s+Maharashtra|"
-        r"RBL\s*BANK|Jammu\s*(?:&|and)\s*Kashmir\s*Bank|J\s*&\s*K\s*Bank|HDFC\s*Bank|ICICI\s*Bank|Axis\s*Bank|"
-        r"Yes\s*Bank|Kotak\s+Mahindra\s+Bank|IndusInd\s*Bank|State\s+Bank\s+of\s+India|"
-        r"Ujjivan\s+Small\s+Finance\s+Bank|AU\s+Small\s+Finance\s+Bank|Punjab\s+National\s+Bank|"
-        r"Canara\s+Bank|Union\s+Bank\s+of\s+India|IDFC\s+First\s+Bank|"
-        r"Federal\s+Bank|Bandhan\s+Bank|IDBI\s+Bank|Indian\s+Bank|Bank\s+of\s+India|Central\s+Bank\s+of\s+India)\b",
+        r"\b("
+        r"Standard\s+Chartered(?:\s+Bank)?"
+        r"|Bank\s+of\s+Baroda|bob\s+World|bob\s+Internet"
+        r"|Bank\s+of\s+Maharashtra|RBL\s*BANK"
+        r"|Jammu\s*(?:&|and)\s*Kashmir\s*Bank|J\s*&\s*K\s*Bank"
+        r"|HDFC\s*Bank|ICICI\s*Bank|Axis\s*Bank|Yes\s*Bank"
+        r"|Kotak\s+Mahindra\s+Bank|IndusInd\s*Bank|State\s+Bank\s+of\s+India"
+        r"|Ujjivan\s+Small\s+Finance\s+Bank|AU\s+Small\s+Finance\s+Bank"
+        r"|Punjab\s+National\s+Bank|Canara\s+Bank|Union\s+Bank\s+of\s+India"
+        r"|IDFC\s+First\s+Bank|Federal\s+Bank|Bandhan\s+Bank|IDBI\s+Bank"
+        r"|Indian\s+Bank|Bank\s+of\s+India|Central\s+Bank\s+of\s+India"
+        r")\b",
         re.I,
     )
     if not issuing_bank:
+        header_flat = re.sub(r"\s+", " ", header_blob)
         if re.search(r"\bbob\b", strict_pre_hdr, re.I) or "बड़ौदा" in strict_pre_hdr:
             issuing_bank = "Bank of Baroda"
         else:
-            m_b = bank_re.search(strict_pre_hdr)
+            m_b = bank_re.search(header_flat)
             if m_b:
                 issuing_bank = _normalize_issuing_bank_name(m_b.group(1))
 
