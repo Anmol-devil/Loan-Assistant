@@ -9,4 +9,5 @@ python-dotenv
 openai
 opencv-python-headless
 rapidocr>=2.0.0
-onnxruntime>=1.18.0,<1.22.0
+onnxruntime
+# onnxruntime>=1.18.0,<1.22.0
