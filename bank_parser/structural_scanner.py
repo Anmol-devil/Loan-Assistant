@@ -385,7 +385,6 @@ def scan_pdf_structure(file_path: str, ocr_engine=None) -> Dict[str, Any]:
                             if (t1.endswith(".") and re.match(r"^\d{2}$", t2)) or ("," in t1 and re.match(r"^\.?\d{2}$", t2)):
                                 sp["text"] = t1.rstrip(".") + "." + t2.lstrip(".")
                                 skip_sp.add(j_s)
-                                break
                 stitched_spans.append(sp)
             page_spans = stitched_spans
             lines = _group_spans_into_lines(page_spans)
@@ -421,7 +420,7 @@ def scan_pdf_structure(file_path: str, ocr_engine=None) -> Dict[str, Any]:
                         hk in joined_low
                         for hk in ("from date", "statement period", "for the period", "as on", "open date", "expiry date")
                     ):
-                        if any(re.search(r"\d+\.\d{2}", s["text"]) for s in ln) or header_line_idx is not None:
+                        if any(re.search(r"(?:\d+\.\d{2}|(?<![A-Za-z0-9])\.\d{2})", s["text"]) for s in ln) or header_line_idx is not None:
                             date_row_count += 1
 
             numeric_clusters = _compute_numeric_x_clusters(page_spans, date_row_count=date_row_count)

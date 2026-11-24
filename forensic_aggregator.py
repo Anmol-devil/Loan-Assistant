@@ -36,7 +36,7 @@ def detect_copy_move_forgery(image_path, min_matches=18):
     return []
 
 
-def compute_weighted_risk_score(report):
+def compute_weighted_risk_score(report, cross_doc_result=None):
     """
     Implements Section 4.2 Weighted Evidence Aggregator.
     Distinguishes 'CHECKED_AND_CLEAN', 'FLAGGED', 'INCOMPLETE', and 'NOT_APPLICABLE'.
@@ -90,8 +90,21 @@ def compute_weighted_risk_score(report):
     else:
         fam_c_state = "NOT_APPLICABLE (BORN_DIGITAL)"
         fam_c_score = 0
+        
+    # 4. Family D: Cross-Document Verification (Weight: up to 50 points — escalates to HIGH RISK on critical mismatch)
+    if cross_doc_result and cross_doc_result.get("status") != "NOT_RUN":
+        fam_d_findings = cross_doc_result.get("structured_findings") or cross_doc_result.get("findings") or []
+        if fam_d_findings:
+            fam_d_state = "FLAGGED"
+            fam_d_score = int(cross_doc_result.get("risk_score_contribution", 35))
+        else:
+            fam_d_state = "CHECKED_AND_CLEAN"
+            fam_d_score = 0
+    else:
+        fam_d_state = "NOT_RUN (SINGLE_DOC)"
+        fam_d_score = 0
 
-    total_risk = min(100, fam_a_score + fam_b_score + fam_c_score)
+    total_risk = min(100, fam_a_score + fam_b_score + fam_c_score + fam_d_score)
 
     if total_risk >= 40:
         risk_tier = "HIGH RISK (REJECT / MANUAL AUDIT)"
@@ -107,5 +120,6 @@ def compute_weighted_risk_score(report):
             {"Family": "Family A: Arithmetic & Logic", "State": fam_a_state, "Risk Contribution": f"+{fam_a_score} pts"},
             {"Family": "Family B: File Structure & Fonts", "State": fam_b_state, "Risk Contribution": f"+{fam_b_score} pts"},
             {"Family": "Family C: Pixel ELA & Copy-Move", "State": fam_c_state, "Risk Contribution": f"+{fam_c_score} pts"},
+            {"Family": "Family D: Cross-Document Dossier", "State": fam_d_state, "Risk Contribution": f"+{fam_d_score} pts"}
         ]
     }

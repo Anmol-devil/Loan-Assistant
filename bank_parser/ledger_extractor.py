@@ -3,7 +3,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from .structural_scanner import DATE_TOKEN_RE
 
 INLINE_DEC_RE = re.compile(
-    r"(?<![A-Za-z0-9\./\-])([+-]?(?:\d{1,3}(?:,\d{2,3})+|\d{1,9})[\.,:\-]\d{2}(?:\s*\(?[CD]r\.?\)?)?)(?![A-Za-z0-9\./\-])",
+    r"(?<![A-Za-z0-9\./\-])([+-]?(?:(?:\d{1,3}(?:,\d{2,3})+|\d{1,9})[\.,:\-]\d{2}|\.\d{2})(?:\s*\(?[CD]r\.?\)?)?)(?![A-Za-z0-9\./\-])",
     re.I,
 )
 
@@ -70,7 +70,6 @@ def _clean_ocr_number(raw_str: str) -> str:
         s = m_dots.group(1).replace(".", ",") + "." + m_dots.group(2)
     return s
 
-
 def _parse_monetary_token(text: str) -> Tuple[Optional[float], Optional[str]]:
     if not text:
         return None, None
@@ -79,7 +78,7 @@ def _parse_monetary_token(text: str) -> Tuple[Optional[float], Optional[str]]:
         return None, None
     s_clean = re.sub(r"(?:INR|Rs\.?|₹|\$|\s)", "", s, flags=re.I)
     m = re.match(
-        r"^([+-]?(?:\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d{1,2})?)(?:\(?([CD]r)\.?\)?)?([+-])?$",
+        r"^([+-]?(?:(?:\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d{1,2})?|\.\d{2}))(?:\(?([CD]r)\.?\)?)?([+-])?$",
         s_clean,
         re.I,
     )
@@ -88,12 +87,15 @@ def _parse_monetary_token(text: str) -> Tuple[Optional[float], Optional[str]]:
     num_part = m.group(1).replace(",", "")
     if num_part.startswith("."):
         num_part = "0" + num_part
+    elif num_part.startswith("-."):
+        num_part = "-0." + num_part[2:]
+    elif num_part.startswith("+."):
+        num_part = "0." + num_part[2:]
     ind = m.group(2).upper() if m.group(2) else ("DR" if m.group(3) == "-" else None)
     try:
         return round(float(num_part), 2), ind
     except ValueError:
         return None, None
-
 
 def _is_left_date_span(sp: Dict[str, Any]) -> bool:
     if not isinstance(sp, dict):
@@ -141,7 +143,7 @@ def _adapt_columns_to_page(
             if h_idx + k_off < len(lines):
                 nxt = lines[h_idx + k_off]
                 if any(
-                    DATE_TOKEN_RE.match(s.get("text", "")) or re.search(r"\d+\.\d{2}", s.get("text", ""))
+                    DATE_TOKEN_RE.match(s.get("text", "")) or re.search(r"(?:\d+\.\d{2}|(?<![A-Za-z0-9])\.\d{2})", s.get("text", ""))
                     for s in nxt
                 ):
                     break
@@ -339,7 +341,7 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
             ):
                 continue
 
-            if not any(re.search(r"\d+\.\d{2}", s.get("text", "")) for s in ln):
+            if not any(re.search(r"(?:\d+\.\d{2}|(?<![A-Za-z0-9])\.\d{2})", s.get("text", "")) for s in ln):
                 if (
                     any(
                         h_w in joined_low
@@ -526,7 +528,12 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
                     continue
 
                 val, ind = _parse_monetary_token(txt)
-                if val is not None and ("." in _clean_ocr_number(txt) or "," in txt):
+                is_int_amt_in_col = (
+                    val is not None
+                    and re.fullmatch(r"\d{1,3}", txt) is not None
+                    and min(abs(sp["cx_norm"] - deb_cx_norm), abs(sp["cx_norm"] - cred_cx_norm)) <= 0.055
+                )
+                if val is not None and ("." in _clean_ocr_number(txt) or "," in txt or is_int_amt_in_col):
                     total_numeric_spans += 1
                     row_monetary_tokens.append((sp["cx_norm"], sp["bbox_norm"][2], val, ind, txt))
                 elif " " in txt and INLINE_DEC_RE.search(txt):
@@ -581,6 +588,10 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
             aligned_numeric_hits += 1
             eff_b_ind = b_ind or bal_dr_cr_ind
             bal_val = -abs(b_v) if (eff_b_ind == "DR" or b_txt.startswith("-")) else b_v
+            non_bal_tokens = [
+                t for t in row_monetary_tokens[:-1]
+                if abs(t[0] - bal_cx_norm) > 0.06 and t[1] < bal_x1_norm - 0.04
+            ]
 
             debit_val = 0.0
             credit_val = 0.0
@@ -687,7 +698,10 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
         abs_delta = abs(delta)
         curr_net = round(tx["credit"] - tx["debit"], 2)
 
-        if abs_delta > 0 and abs(curr_net - delta) > 1.0:
+        if abs_delta > 0 and (
+            abs(curr_net - delta) > 1.0
+            or (tx["credit"] == 0.0 and tx["debit"] == 0.0 and abs_delta >= 0.01)
+        ):
             p_curr = tx["page"]
             row_cy = (tx["bbox"][1] + tx["bbox"][3]) / 2.0
             found_on_page = False
@@ -710,30 +724,34 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
                     tx["credit"], tx["debit"] = round(abs_delta, 2), 0.0
                 else:
                     tx["debit"], tx["credit"] = round(abs_delta, 2), 0.0
-
-    for i in range(1, len(transactions) - 1):
-        prev_b = transactions[i - 1]["balance"]
-        curr_t = transactions[i]
-        next_t = transactions[i + 1]
-        if curr_t["debit"] < 0 or curr_t["credit"] < 0 or next_t["debit"] < 0 or next_t["credit"] < 0:
-            continue
-        amt1 = max(abs(curr_t["debit"]), abs(curr_t["credit"]))
-        amt2 = max(abs(next_t["debit"]), abs(next_t["credit"]))
-        if amt1 > 0 and amt2 > 0:
-            curr_ok = abs((prev_b + curr_t["credit"] - curr_t["debit"]) - curr_t["balance"]) <= 1.0
-            if not curr_ok:
-                for s1 in (-1, 1):
-                    for s2 in (-1, 1):
-                        if abs((prev_b + s1 * amt1 + s2 * amt2) - next_t["balance"]) <= 1.5:
-                            if s1 < 0:
-                                curr_t["debit"], curr_t["credit"] = amt1, 0.0
-                            else:
-                                curr_t["credit"], curr_t["debit"] = amt1, 0.0
-                            if s2 < 0:
-                                next_t["debit"], next_t["credit"] = amt2, 0.0
-                            else:
-                                next_t["credit"], next_t["debit"] = amt2, 0.0
-                            break
+    is_od_summary = (
+        (stated_sum_dict.get("opening_balance") is not None and stated_sum_dict["opening_balance"] < 0)
+        or (stated_sum_dict.get("closing_balance") is not None and stated_sum_dict["closing_balance"] < 0)
+    )
+    if not is_od_summary:
+        for i in range(1, len(transactions) - 1):
+            prev_b = transactions[i - 1]["balance"]
+            curr_t = transactions[i]
+            next_t = transactions[i + 1]
+            if curr_t["debit"] < 0 or curr_t["credit"] < 0 or next_t["debit"] < 0 or next_t["credit"] < 0:
+                continue
+            amt1 = max(abs(curr_t["debit"]), abs(curr_t["credit"]))
+            amt2 = max(abs(next_t["debit"]), abs(next_t["credit"]))
+            if amt1 > 0 and amt2 > 0:
+                curr_ok = abs((prev_b + curr_t["credit"] - curr_t["debit"]) - curr_t["balance"]) <= 1.0
+                if not curr_ok:
+                    for s1 in (-1, 1):
+                        for s2 in (-1, 1):
+                            if abs((prev_b + s1 * amt1 + s2 * amt2) - next_t["balance"]) <= 1.5:
+                                if s1 < 0:
+                                    curr_t["debit"], curr_t["credit"] = amt1, 0.0
+                                else:
+                                    curr_t["credit"], curr_t["debit"] = amt1, 0.0
+                                if s2 < 0:
+                                    next_t["debit"], next_t["credit"] = amt2, 0.0
+                                else:
+                                    next_t["credit"], next_t["debit"] = amt2, 0.0
+                                break
 
     if len(transactions) >= 2 and stated_sum_dict.get("opening_balance") is None:
         r1 = transactions[0]

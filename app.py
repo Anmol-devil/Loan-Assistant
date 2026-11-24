@@ -1,33 +1,35 @@
 import os
 import re
 import html
+import json
 import datetime
 import tempfile
 import streamlit as st
 import pandas as pd
 from PIL import Image, ImageDraw
 import pymupdf
+from openai import OpenAI
 
 from multiformated_reconciliation import analyze_document as verify_any_file
-from cross_document_verifier import verify_application_pack
-from forensic_aggregator import detect_copy_move_forgery
 from module_aggregator import build_module1_output
-import json
-from openai import OpenAI
 from universal_doc_extractor import extract_universal_document
+from cross_document_verifier import verify_loan_dossier
 
 st.set_page_config(
     page_title="AI Loan Assistant | Module 1: Document Checker",
     page_icon="🛡️",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-for _k in ("GLM_API_KEY", "ZAI_API_KEY", "ZAI_BASE_URL", "ZAI_MODEL", "OPENAI_API_KEY", "GROQ_API_KEY"):
-    if _k in st.secrets and st.secrets[_k]:
-        os.environ[_k] = str(st.secrets[_k]).strip()
+try:
+    for _k in ("GLM_API_KEY", "ZAI_API_KEY", "ZAI_BASE_URL", "ZAI_MODEL", "OPENAI_API_KEY", "GROQ_API_KEY"):
+        if _k in st.secrets and st.secrets[_k]:
+            os.environ[_k] = str(st.secrets[_k]).strip()
+except Exception:
+    pass
 
-# MINIMAL ENTERPRISE SAAS STYLING (MATCHING REFERENCE UI)
+# MINIMAL ENTERPRISE SAAS STYLING
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
@@ -36,7 +38,6 @@ st.markdown("""
         font-family: 'Plus Jakarta Sans', sans-serif;
     }
 
-    /* Hide default Streamlit header/footer clutter */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header[data-testid="stHeader"] {
@@ -66,8 +67,7 @@ st.markdown("""
     section[data-testid="stSidebar"] div[data-baseweb="select"] * {
         color: #0f172a !important;
     }
-    
-    /* Fix washed-out whitish buttons inside the dark navy sidebar */
+
     section[data-testid="stSidebar"] button[data-testid="stBaseButton-secondary"],
     section[data-testid="stSidebar"] button[kind="secondary"] {
         background-color: #1e293b !important;
@@ -128,24 +128,6 @@ st.markdown("""
         color: #94a3b8 !important;
     }
 
-    .sb-nav-item {
-        padding: 9px 12px;
-        border-radius: 9px;
-        font-size: 13.5px;
-        font-weight: 500;
-        color: #cbd5e1 !important;
-        margin-bottom: 4px;
-        display: flex;
-        align-items: center;
-        gap: 10px;
-    }
-    .sb-nav-active {
-        background: linear-gradient(90deg, #4f46e5 0%, #4338ca 100%);
-        color: #ffffff !important;
-        font-weight: 600;
-        box-shadow: 0 4px 12px rgba(79, 70, 229, 0.28);
-    }
-
     .sb-mod-card {
         background: rgba(30, 41, 59, 0.65);
         border: 1px solid #334155;
@@ -159,15 +141,6 @@ st.markdown("""
     .sb-mod-active {
         background: rgba(79, 70, 229, 0.18);
         border: 1.5px solid #6366f1;
-    }
-
-    .sb-local-badge {
-        background: rgba(6, 78, 59, 0.45);
-        border: 1px solid #10b981;
-        border-radius: 10px;
-        padding: 10px 12px;
-        margin-top: 18px;
-        font-size: 12px;
     }
 
     /* Top Minimal Header Bar */
@@ -419,7 +392,7 @@ st.markdown("""
         padding-left: 18px;
     }
 
-    /* 5-Card KPI Strip */
+    /* KPI Strip */
     .kpi-card {
         background: #ffffff;
         border: 1px solid #e2e8f0;
@@ -551,7 +524,7 @@ def render_kpi_card(icon: str, label: str, value: str, style_cls: str = ""):
     """, unsafe_allow_html=True)
 
 
-def render_coverage_matrix_html(cov_rows: list):
+def render_coverage_matrix_html(cov_rows: list, title: str = "📄 Reconciliation & Detector Coverage Matrix"):
     tr_html = ""
     for r in cov_rows:
         chk = html.escape(str(r["Check"]))
@@ -566,7 +539,7 @@ def render_coverage_matrix_html(cov_rows: list):
 
     st.markdown(f"""
     <div class="saas-card">
-        <div class="saas-card-title">📄 Reconciliation & Detector Coverage Matrix</div>
+        <div class="saas-card-title">{html.escape(title)}</div>
         <div class="clean-table-wrap">
             <table class="clean-table">
                 <thead><tr><th>Check</th><th>Status</th></tr></thead>
@@ -605,8 +578,7 @@ def draw_visual_findings_on_image(image_path, forensic_flags):
                 pass
     return img
 
-
-# SIDEBAR (EXACT MATCH TO MOCKUP)
+# SIDEBAR NAVIGATION
 with st.sidebar:
     st.markdown("""
     <div class="sb-brand">
@@ -684,32 +656,112 @@ with st.sidebar:
             key="tenant_choice_select",
         )
 
-def _summarize_unknown_doc_with_llm(markdown_text: str, filename: str) -> str:
-    prompt = (
-        f"Identify this document ('{filename}') and extract its most important fields in clean bullet format:\n"
-        f"### 📄 <Detected Document Type> Summary\n"
-        f"- **Field Name** = `Exact Value`\n\n"
-        f"Include key parties/names, ID/reference numbers, dates, addresses, and any monetary amounts/totals. "
-        f"If there are numeric totals, verify the math briefly. Only state facts present in the text."
-    )
-    return _ask_assistant_llm(prompt, "Unknown document — infer schema dynamically.", markdown_text)
+# MODULE 2 HELPERS: STRUCTURED SUMMARY & CONVERSATIONAL LLM Q&A
+def _ask_assistant_llm(
+    question: str,
+    context_summary: str,
+    markdown_excerpt: str,
+    chat_history: list | None = None,
+) -> str:
+    api_key = (
+        os.environ.get("ZAI_API_KEY")
+        or os.environ.get("GLM_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("GROQ_API_KEY")
+        or ""
+    ).strip()
+    if not api_key:
+        return "⚠️ No LLM API key found in `.streamlit/secrets.toml` or `.env`. Add `GLM_API_KEY` (or `OPENAI_API_KEY` / `GROQ_API_KEY`) to enable chat answers."
 
-def _format_llm_style_summary(doc_code: str, id_card: dict, fin_rec: dict, ext_meta: dict, markdown_content: str = "",filename: str = "document",) -> str:
-    """Formats an LLM-style structured brief tailored to Bank Statement, Aadhaar, PAN, or other docs."""
+    base_url = os.environ.get("ZAI_BASE_URL") or (
+        "https://api.groq.com/openai/v1" if api_key.startswith("gsk_")
+        else ("https://api.openai.com/v1" if api_key.startswith("sk-") and "." not in api_key else "https://api.z.ai/api/paas/v4/")
+    )
+    model = os.environ.get("ZAI_MODEL") or (
+        "llama-3.3-70b-versatile" if api_key.startswith("gsk_")
+        else ("gpt-4o-mini" if api_key.startswith("sk-") and "." not in api_key else "glm-4.5-flash")
+    )
+
+    system_prompt = (
+        "You are a helpful, clear, and polite Indian financial and document assistant.\n"
+        "RULES FOR WRITING ANSWERS:\n"
+        "1. Always respond in natural, complete, human-readable sentences — NEVER reply with bare 'Field = Value' snippets.\n"
+        "2. Add helpful context from the document naturally (for example: 'The account number listed on the Standard Chartered Bank statement for M/S Do Wide Associates is **80405128582**.').\n"
+        "3. Bold key figures, names, dates, and IDs so they are easy to scan at a glance.\n"
+        "4. For calculations or transaction questions, show the math cleanly in ₹ (INR) and give a plain-English takeaway.\n"
+        "5. For broad requests like 'summarize', write a short friendly overview paragraph followed by clean bullet points.\n"
+        "6. Use ONLY facts present in the provided document. If a detail is not printed on the document, state that clearly in a polite sentence.\n"
+        "7. NEVER mention internal system/parser metadata (such as REVIEW_REQUIRED, BANK_PARSER_HYBRID_V2, or discovery sources) unless the user specifically asks about pipeline diagnostics.\n"
+        "8. When reading multi-column tables (such as marksheets, invoices, or ledgers), verify column alignment using arithmetic before answering (e.g., verify Theory + Practical/Internal = Total, and verify the sum of subject totals equals the Aggregate). Never confuse Full Marks (e.g., 500) with Marks Obtained (e.g., 368)."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": (
+                f"Here is the uploaded document data to reference for all questions:\n\n"
+                f"STRUCTURED SUMMARY:\n{context_summary}\n\n"
+                f"EXTRACTED DOCUMENT TEXT:\n{markdown_excerpt[:12000]}"
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": "Got it. I have reviewed the document and I am ready to answer your questions clearly.",
+        },
+    ]
+
+    if chat_history:
+        for turn in chat_history[1:][-6:]:
+            if turn.get("role") in ("user", "assistant") and turn.get("content"):
+                messages.append({"role": turn["role"], "content": turn["content"]})
+
+    messages.append({"role": "user", "content": question})
+
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=30.0)
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=0.25,
+        messages=messages,
+    )
+    return resp.choices[0].message.content or "I could not generate a response for that question."
+
+
+def _format_llm_style_summary(
+    doc_code: str,
+    id_card: dict,
+    fin_rec: dict,
+    ext_meta: dict,
+    markdown_content: str = "",
+    filename: str = "document",
+) -> str:
+    """Formats a structured brief tailored to Bank Statement, Aadhaar, PAN, or unknown docs."""
+    bad_placeholders = {
+        "not found", "n/a", "none", "unknown", "unknown holder",
+        "unknown bank", "details", "detail", "info", "information", "summary",
+    }
+
     def _pick(*vals, default="Not Found"):
         for v in vals:
             if v is None:
                 continue
             s = str(v).strip()
-            if s and s.lower() not in ("not found", "n/a", "none", "unknown", "unknown holder", "unknown bank", "detail"):
+            if s and s.lower() not in bad_placeholders:
                 return s
         return default
+
     if doc_code == "BANK_STATEMENT":
-        bank_name = id_card.get("issuing_bank") or ext_meta.get("bank_name") or "Not Found"
-        acct_no = id_card.get("account_number") or ext_meta.get("account_number") or "Not Found"
-        ifsc = id_card.get("ifsc_code") or ext_meta.get("ifsc_code") or "Not Printed on Statement"
-        holder = id_card.get("holder_name") or ext_meta.get("account_holder") or "Not Found"
-        branch = id_card.get("branch_name") or ext_meta.get("branch") or "Not Found"
+        bp_meta = fin_rec.get("blueprint_metadata") or {}
+        bank_name = _pick(id_card.get("issuing_bank"), bp_meta.get("issuing_bank"), ext_meta.get("bank_name"))
+        acct_no = _pick(id_card.get("account_number"), bp_meta.get("account_number"), ext_meta.get("account_number"))
+        ifsc = _pick(
+            id_card.get("ifsc_code"),
+            bp_meta.get("ifsc_code"),
+            ext_meta.get("ifsc_code"),
+            default="Not Printed on Statement",
+        )
+        holder = _pick(id_card.get("holder_name"), bp_meta.get("holder_name"), ext_meta.get("account_holder"))
+        branch = _pick(id_card.get("branch_name"), bp_meta.get("branch_name"), ext_meta.get("branch"))
 
         op_list = (fin_rec.get("summary") or {}).get("opening_balance") or []
         opening = op_list[0] if op_list else fin_rec.get("opening_balance_used")
@@ -749,27 +801,27 @@ def _format_llm_style_summary(doc_code: str, id_card: dict, fin_rec: dict, ext_m
     if doc_code == "AADHAAR_CARD":
         return (
             f"### 🛡️ Aadhaar Card Summary\n"
-            f"- **Aadhaar No.** = `{fin_rec.get('aadhaar_number_display') or '[Aadhaar Redacted]'}`\n"
-            f"- **Name** = `{fin_rec.get('legal_name') or id_card.get('holder_name') or 'Not Found'}`\n"
-            f"- **Father / Care-Of Name** = `{fin_rec.get('father_name') or 'Not Found'}`\n"
-            f"- **Date of Birth / YOB** = `{fin_rec.get('date_of_birth') or 'Not Found'}`\n"
-            f"- **Gender** = `{fin_rec.get('gender') or 'Not Found'}`\n"
-            f"- **Address** = `{fin_rec.get('address') or 'Not Found'}`\n"
-            f"- **Issue Date** = `{fin_rec.get('issue_date') or 'Not Found'}`\n"
+            f"- **Aadhaar No.** = `{fin_rec.get('uid_masked') or '[Aadhaar Redacted]'}`\n"
+            f"- **Name** = `{_pick(fin_rec.get('legal_name'), id_card.get('holder_name'))}`\n"
+            f"- **Father / Care-Of Name** = `{_pick(fin_rec.get('father_name'))}`\n"
+            f"- **Date of Birth / YOB** = `{_pick(fin_rec.get('date_of_birth'))}`\n"
+            f"- **Gender** = `{_pick(fin_rec.get('gender'))}`\n"
+            f"- **Address** = `{_pick(fin_rec.get('address'))}`\n"
+            f"- **Issue Date** = `{_pick(fin_rec.get('issue_date'))}`\n"
             f"- **Portrait Check** = `{fin_rec.get('portrait_verification') or 'Verified'}`\n"
         )
 
     if doc_code == "PAN_CARD":
         return (
             f"### 🪪 PAN Card Summary\n"
-            f"- **PAN No.** = `{fin_rec.get('pan_number') or id_card.get('pan_number') or ext_meta.get('pan') or 'Not Found'}`\n"
-            f"- **Holder Name** = `{fin_rec.get('legal_name') or id_card.get('holder_name') or 'Not Found'}`\n"
-            f"- **Father's Name** = `{fin_rec.get('father_name') or 'Not Found'}`\n"
-            f"- **Date of Birth** = `{fin_rec.get('date_of_birth') or 'Not Found'}`\n"
-            f"- **Entity Category** = `{fin_rec.get('entity_category') or 'Not Found'}`\n"
+            f"- **PAN No.** = `{_pick(fin_rec.get('pan_number'), id_card.get('pan_number'), ext_meta.get('pan'))}`\n"
+            f"- **Holder Name** = `{_pick(fin_rec.get('legal_name'), id_card.get('holder_name'), ext_meta.get('account_holder'))}`\n"
+            f"- **Father's Name** = `{_pick(fin_rec.get('father_name'))}`\n"
+            f"- **Date of Birth** = `{_pick(fin_rec.get('date_of_birth'))}`\n"
+            f"- **Entity Category** = `{_pick(fin_rec.get('entity_category'))}`\n"
             f"- **Portrait Check** = `{fin_rec.get('portrait_verification') or 'Verified'}`\n"
         )
-        
+
     if doc_code == "UNKNOWN_DOCUMENT" and markdown_content.strip():
         return _ask_assistant_llm(
             (
@@ -780,88 +832,33 @@ def _format_llm_style_summary(doc_code: str, id_card: dict, fin_rec: dict, ext_m
             f"Document filename: {filename}",
             markdown_content,
         )
-    INTERNAL_KEYS = {
+
+    internal_keys = {
         "document_type", "portrait_base64", "status", "parser_engine_used",
         "discovery_source", "total_pages_processed", "schema_confidence",
         "llm_self_score", "bank_parser_error", "llm_processing_time_sec",
+        "llm_processing_time", "llm_elapsed_seconds", "llm_model_used",
     }
-    
+
     lines = [f"### 📄 {id_card.get('doc_category', 'Document')} Summary"]
     for k, v in ext_meta.items():
-        lines.append(f"- **{k.replace('_', ' ').title()}** = `{v}`")
+        if v is not None and str(v).strip():
+            lines.append(f"- **{k.replace('_', ' ').title()}** = `{v}`")
     for k, v in fin_rec.items():
-        if not isinstance(v, (list, dict)) and k not in ("document_type", "portrait_base64") and "aadhaar" not in k.lower():
+        if (
+            not isinstance(v, (list, dict))
+            and k not in internal_keys
+            and "aadhaar" not in k.lower()
+            and v is not None
+            and str(v).strip()
+        ):
             lines.append(f"- **{k.replace('_', ' ').title()}** = `{v}`")
     return "\n".join(lines)
 
-def _ask_assistant_llm(
-    question: str,
-    context_summary: str,
-    markdown_excerpt: str,
-    chat_history: list | None = None,
-) -> str:
-    api_key = (
-        os.environ.get("ZAI_API_KEY")
-        or os.environ.get("GLM_API_KEY")
-        or os.environ.get("OPENAI_API_KEY")
-        or os.environ.get("GROQ_API_KEY")
-        or ""
-    ).strip()
-    if not api_key:
-        return "⚠️ No LLM API key found in `.streamlit/secrets.toml` or `.env`. Add `GLM_API_KEY` (or `OPENAI_API_KEY` / `GROQ_API_KEY`) to enable chat answers."
 
-    base_url = os.environ.get("ZAI_BASE_URL") or (
-        "https://api.groq.com/openai/v1" if api_key.startswith("gsk_")
-        else ("https://api.openai.com/v1" if api_key.startswith("sk-") and "." not in api_key else "https://api.z.ai/api/paas/v4/")
-    )
-    model = os.environ.get("ZAI_MODEL") or (
-        "llama-3.3-70b-versatile" if api_key.startswith("gsk_")
-        else ("gpt-4o-mini" if api_key.startswith("sk-") and "." not in api_key else "glm-4.5-flash")
-    )
-
-    system_prompt = (
-        "You are a helpful, clear, and polite Indian financial and document assistant.\n"
-        "RULES FOR WRITING ANSWERS:\n"
-        "1. Always respond in natural, complete, human-readable sentences — NEVER reply with bare 'Field = Value' snippets.\n"
-        "2. Add helpful context from the document naturally (for example: 'The account number listed on the Standard Chartered Bank statement for M/S Do Wide Associates is **80405128582**.').\n"
-        "3. Bold key figures, names, dates, and IDs so they are easy to scan at a glance.\n"
-        "4. For calculations or transaction questions, show the math cleanly in ₹ (INR) and give a plain-English takeaway.\n"
-        "5. For broad requests like 'summarize', write a short friendly overview paragraph followed by clean bullet points.\n"
-        "6. Use ONLY facts present in the provided document. If a detail is not printed on the document, state that clearly in a polite sentence."
-        "7. NEVER mention internal system/parser metadata (such as REVIEW_REQUIRED, BANK_PARSER_HYBRID_V2, or discovery sources) unless the user specifically asks about pipeline diagnostics.\n"
-        "8. When reading multi-column tables (such as marksheets, invoices, or ledgers), verify column alignment using arithmetic before answering (e.g., verify Theory + Practical/Internal = Total, and verify the sum of subject totals equals the Aggregate). Never confuse Full Marks (e.g., 500) with Marks Obtained (e.g., 368)."
-    )
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": (
-                f"Here is the uploaded document data to reference for all questions:\n\n"
-                f"STRUCTURED SUMMARY:\n{context_summary}\n\n"
-                f"EXTRACTED DOCUMENT TEXT:\n{markdown_excerpt[:12000]}"
-            ),
-        },
-        {
-            "role": "assistant",
-            "content": "Got it. I have reviewed the document and I am ready to answer your questions clearly.",
-        },
-    ]
-    if chat_history:
-        for turn in chat_history[1:][-6:]:
-            if turn.get("role") in ("user", "assistant") and turn.get("content"):
-                messages.append({"role": turn["role"], "content": turn["content"]})
-
-    messages.append({"role": "user", "content": question})
-
-    client = OpenAI(api_key=api_key, base_url=base_url, timeout=30.0)
-    resp = client.chat.completions.create(
-        model=model,
-        temperature=0.25,
-        messages=messages,
-    )
-    return resp.choices[0].message.content or "I could not generate a response for that question."
-
+# ==============================================================================
+# MODULE 2: UNIVERSAL DOCUMENT EXTRACTOR
+# ==============================================================================
 if st.session_state.get("active_page") == "Document Extractor":
     st.markdown("""
     <div class="top-bar">
@@ -895,7 +892,7 @@ if st.session_state.get("active_page") == "Document Extractor":
                 tmp.write(ai_file.getbuffer())
                 tmp_path = tmp.name
             try:
-                with st.spinner("Extracting Uploaded document & running financial/KYC engine..."):
+                with st.spinner("Extracting uploaded document & running financial/KYC engine..."):
                     ext_res = extract_universal_document(tmp_path, use_glm_ocr=use_glm_ocr)
                     fin_rec, id_card, doc_code = {}, {}, "UNKNOWN_DOCUMENT"
                     if suffix in (".pdf", ".png", ".jpg", ".jpeg", ".docx"):
@@ -907,7 +904,12 @@ if st.session_state.get("active_page") == "Document Extractor":
                         doc_code = fin_rec.get("document_type") or id_card.get("doc_code", "UNKNOWN_DOCUMENT")
 
                     summary_md = _format_llm_style_summary(
-                        doc_code, id_card, fin_rec, ext_res.get("financial_metadata") or {}
+                        doc_code,
+                        id_card,
+                        fin_rec,
+                        ext_res.get("financial_metadata") or {},
+                        markdown_content=ext_res.get("markdown_content") or "",
+                        filename=ai_file.name,
                     )
                     st.session_state["ai_last_sig"] = file_sig
                     st.session_state["ai_payload"] = {
@@ -976,7 +978,7 @@ if st.session_state.get("active_page") == "Document Extractor":
                     t_no = tbl.get("table_number", 1)
                     st.markdown(f"**Table {t_no}** ({tbl.get('row_count', 0)} rows × {tbl.get('column_count', 0)} cols)")
                     df_t = pd.DataFrame(tbl.get("data", []))
-                    st.dataframe(df_t, width='stretch')
+                    st.dataframe(df_t, width="stretch")
 
         with tab_md:
             md_content = ext_res.get("markdown_content") or ""
@@ -992,8 +994,9 @@ if st.session_state.get("active_page") == "Document Extractor":
             st.json({"structured_summary_fields": data["fin_rec"], "universal_extractor": ext_res})
 
     st.stop()
-    
-# TOP MINIMAL HEADER BAR & PAGE TITLE
+
+
+# MODULE 1: AI DOCUMENT CHECKER (SINGLE DOCUMENT & MULTI-DOCUMENT FAMILY D)
 st.markdown("""
 <div class="top-bar">
     <div class="top-pill">📄 Module 1: Document Checker & Risk Calibration</div>
@@ -1005,7 +1008,6 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-
 # MODE 1: SINGLE DOCUMENT AUDIT
 if inspection_mode == "Single Document Audit":
     col_up, col_sup, col_pipe = st.columns([1.35, 1.05, 1.55])
@@ -1013,7 +1015,8 @@ if inspection_mode == "Single Document Audit":
     with col_up:
         uploaded_file = st.file_uploader(
             "Drag & Drop Document Here (PDF, PNG, JPG, JPEG, DOCX)",
-            type=["pdf", "png", "jpg", "jpeg", "docx"]
+            type=["pdf", "png", "jpg", "jpeg", "docx"],
+            key="single_doc_uploader",
         )
 
     with col_sup:
@@ -1033,7 +1036,6 @@ if inspection_mode == "Single Document Audit":
         </div>
         """, unsafe_allow_html=True)
 
-    # Determine Stage 3 label dynamically once a document is processed
     stage3_label = "Transaction<br>Extraction"
     if uploaded_file:
         suffix = os.path.splitext(uploaded_file.name)[1].lower()
@@ -1044,40 +1046,10 @@ if inspection_mode == "Single Document Audit":
 
         try:
             with st.spinner("Running 5-Stage Verification Pipeline..."):
-                try:
-                    report = verify_any_file(temp_path, original_filename=uploaded_file.name)
-
-                    print("[DEBUG] AFTER verify_any_file", flush=True)
-
-                except Exception as e:
-                    print(
-                        "[DEBUG] PIPELINE ERROR:",
-                        repr(e),
-                        flush=True
-                    )
-                    raise
+                report = verify_any_file(temp_path, original_filename=uploaded_file.name)
                 report["original_filename"] = uploaded_file.name
-
                 m1_out = build_module1_output(temp_path, report, tenant_id=tenant_choice)
 
-            print("[DEBUG] AFTER build_module1_output", flush=True)
-            # try:
-            #     report = verify_any_file(temp_path, original_filename=uploaded_file.name)
-            #     print("[DEBUG] AFTER verify_any_file", flush=True)
-
-            # except Exception as e:
-            #     print("[DEBUG] PIPELINE ERROR:", repr(e), flush=True)
-            #     raise
-
-            # m1_out = build_module1_output(temp_path, report, tenant_id=tenant_choice)
-
-            # with st.spinner("Running 5-Stage Verification Pipeline..."):
-            #     report = verify_any_file(temp_path, original_filename=uploaded_file.name)
-            #     report["original_filename"] = uploaded_file.name
-            #     m1_out = build_module1_output(temp_path, report, tenant_id=tenant_choice)
-            
-
-            # print("[DEBUG] AFTER build_module1_output", flush=True)   
             id_card = m1_out["identity_card"]
             fin_rec = report.get("financial_reconciliation", {})
             doc_code = fin_rec.get("document_type") or id_card.get("doc_code", "UNKNOWN_DOCUMENT")
@@ -1103,7 +1075,6 @@ if inspection_mode == "Single Document Audit":
                 </div>
                 """, unsafe_allow_html=True)
 
-            # FILE STATUS STRIP (ONLY SHOWS '• N Rows' FOR BANK STATEMENTS!)
             pages_cnt = m1_out.get("total_pages_processed", 1)
             tx_list = fin_rec.get("transactions", [])
             if doc_code == "BANK_STATEMENT":
@@ -1129,7 +1100,7 @@ if inspection_mode == "Single Document Audit":
                 </div>
             </div>
             """, unsafe_allow_html=True)
-            
+
             if doc_code == "BANK_STATEMENT":
                 eng_used = fin_rec.get("parser_engine_used", "LEGACY_ENGINE")
                 disc_src = fin_rec.get("discovery_source", "GEOMETRIC_ONLY")
@@ -1140,13 +1111,13 @@ if inspection_mode == "Single Document Audit":
                 bp_err = fin_rec.get("bank_parser_error")
                 if bp_err:
                     st.warning(f"⚠️ bank_parser fallback notice: {bp_err}")
+
                 llm_sec = (
                     fin_rec.get("llm_elapsed_seconds")
                     or fin_rec.get("llm_processing_time")
-                    or (fin_rec.get("schema_confidence") or {}).get("llm_elapsed_seconds")
-                    or (fin_rec.get("schema_confidence") or {}).get("llm_processing_time")
+                    or sch_conf.get("llm_elapsed_seconds")
+                    or sch_conf.get("llm_processing_time")
                 )
-
                 if llm_sec is not None:
                     llm_sec = float(llm_sec)
                     llm_min = llm_sec / 60.0
@@ -1159,17 +1130,9 @@ if inspection_mode == "Single Document Audit":
                     st.caption(f"⏱️ **Z.ai LLM Processing Time:** {time_str}")
                 else:
                     st.caption("⏱️ **Z.ai LLM Processing Time:** Not available")
-                emp_str = (
-                    f"{emp_c:.2f} ({int(emp_c * 100)}%)"
-                    if isinstance(emp_c, (int, float))
-                    else "N/A"
-                )
 
-                llm_str = (
-                    f"{llm_c:.2f}"
-                    if isinstance(llm_c, (int, float))
-                    else "Offline/Fallback"
-                )
+                emp_str = f"{emp_c:.2f} ({int(emp_c * 100)}%)" if isinstance(emp_c, (int, float)) else "N/A"
+                llm_str = f"{llm_c:.2f}" if isinstance(llm_c, (int, float)) else "Offline/Fallback"
 
                 st.markdown(
                     f'<div style="background:#eef2ff; border:1px solid #c7d2fe; '
@@ -1177,30 +1140,26 @@ if inspection_mode == "Single Document Audit":
                     f'font-size:12px; color:#1e1b4b; display:flex; '
                     f'justify-content:space-between; align-items:center;">'
                     f'<span>⚙️ <b>Active Parser Engine:</b> <code>{eng_used}</code> '
-                    f'&nbsp;|&nbsp; <b>Stage 2 Discovery:</b> '
-                    f'<code>{disc_src}</code></span>'
-                    f'<span>📊 <b>Empirical Schema Confidence:</b> '
-                    f'<b>{emp_str}</b> (LLM Self-Score: {llm_str})</span></div>',
-                    unsafe_allow_html=True
+                    f'&nbsp;|&nbsp; <b>Stage 2 Discovery:</b> <code>{disc_src}</code></span>'
+                    f'<span>📊 <b>Empirical Schema Confidence:</b> <b>{emp_str}</b> '
+                    f'(LLM Self-Score: {llm_str})</span></div>',
+                    unsafe_allow_html=True,
                 )
 
-            # ------------------------------------------------------------------
-            # UNIFIED ENTITY CARD (LEFT) + TRIAGE RISK BANNER (RIGHT)
-            # ------------------------------------------------------------------
             col_id, col_tri = st.columns([1.15, 1.0])
 
             with col_id:
                 if doc_code == "BANK_STATEMENT":
-                 bank_disp = id_card.get("issuing_bank") or "UNKNOWN"
-                 logo_txt = bank_disp.upper() if bank_disp != "UNKNOWN" else "UNKNOWN BANK"
-                 extra_meta = ""
-                 if id_card.get("branch_name"):
-                     extra_meta += f" &nbsp;|&nbsp; Branch: <b>{html.escape(str(id_card['branch_name']))}</b>"
-                 if id_card.get("ifsc_code"):
-                     extra_meta += f" &nbsp;|&nbsp; IFSC: <b>{html.escape(str(id_card['ifsc_code']))}</b>"
-                 if id_card.get("account_number"):
-                     extra_meta += f" &nbsp;|&nbsp; A/C: <b>{html.escape(str(id_card['account_number']))}</b>"
-                 sub_line_1 = f"Category: <b>Bank Statement</b> &nbsp;|&nbsp; Issuing Bank: <b>{html.escape(str(bank_disp))}</b>{extra_meta}"
+                    bank_disp = id_card.get("issuing_bank") or "UNKNOWN"
+                    logo_txt = bank_disp.upper() if bank_disp != "UNKNOWN" else "UNKNOWN BANK"
+                    extra_meta = ""
+                    if id_card.get("branch_name"):
+                        extra_meta += f" &nbsp;|&nbsp; Branch: <b>{html.escape(str(id_card['branch_name']))}</b>"
+                    if id_card.get("ifsc_code"):
+                        extra_meta += f" &nbsp;|&nbsp; IFSC: <b>{html.escape(str(id_card['ifsc_code']))}</b>"
+                    if id_card.get("account_number"):
+                        extra_meta += f" &nbsp;|&nbsp; A/C: <b>{html.escape(str(id_card['account_number']))}</b>"
+                    sub_line_1 = f"Category: <b>Bank Statement</b> &nbsp;|&nbsp; Issuing Bank: <b>{html.escape(str(bank_disp))}</b>{extra_meta}"
                 elif doc_code == "PAN_CARD":
                     logo_txt = "INCOME TAX\nDEPT (PAN)"
                     pan_disp = fin_rec.get("pan_number") or id_card.get("pan_number") or "NOT FOUND"
@@ -1211,13 +1170,13 @@ if inspection_mode == "Single Document Audit":
                     )
                 elif doc_code == "AADHAAR_CARD":
                     logo_txt = "UIDAI\nAADHAAR"
-                    uid_disp = fin_rec.get("aadhaar_number_display") or id_card.get("aadhaar_number") or "N/A"
+                    uid_disp = fin_rec.get("uid_masked") or "[Aadhaar Redacted]"
                     father_disp = fin_rec.get("father_name") or "N/A"
                     addr_disp = fin_rec.get("address") or "N/A"
                     sub_line_1 = (
                         f"Category: <b>Aadhaar Card (KYC)</b> &nbsp;|&nbsp; Father/C/O: <b>{html.escape(str(father_disp))}</b> "
                         f"&nbsp;|&nbsp; DOB: <b>{html.escape(str(fin_rec.get('date_of_birth') or 'N/A'))}</b>"
-                        f"<div style='margin-top:6px;'>Aadhaar No: <span style='font-size:30px; font-weight:800; color:#1e1b4b; letter-spacing:2px;'>{html.escape(str(uid_disp))}</span></div>"
+                        f"<div style='margin-top:6px;'>Aadhaar No: <span style='font-size:26px; font-weight:800; color:#1e1b4b; letter-spacing:1.5px;'>{html.escape(str(uid_disp))}</span></div>"
                         f"<div style='font-size:12px; color:#334155; margin-top:4px;'>📍 <b>Address:</b> {html.escape(str(addr_disp))}</div>"
                     )
                 elif doc_code == "SALARY_SLIP":
@@ -1245,7 +1204,6 @@ if inspection_mode == "Single Document Audit":
                 </div>
                 """, unsafe_allow_html=True)
 
-
             with col_tri:
                 band = m1_out["triage_band"]
                 doc_score = m1_out["overall_document_risk_score"]
@@ -1270,11 +1228,11 @@ if inspection_mode == "Single Document Audit":
                     </div>
                     <div class="triage-stat-divider">
                         <div style="font-size:11px; font-weight:600; color:#475569 !important;">Overall Document Risk</div>
-                        <div style="font-size:19px; font-weight:800; color:#0f172a !important;">{doc_score:.2f} ({int(doc_score*100)}%)</div>
+                        <div style="font-size:19px; font-weight:800; color:#0f172a !important;">{doc_score:.2f} ({int(doc_score * 100)}%)</div>
                     </div>
                     <div class="triage-stat-divider">
                         <div style="font-size:11px; font-weight:600; color:#475569 !important;">Max Individual Finding</div>
-                        <div style="font-size:19px; font-weight:800; color:#0f172a !important;">{max_find_score:.2f} ({int(max_find_score*100)}%)</div>
+                        <div style="font-size:19px; font-weight:800; color:#0f172a !important;">{max_find_score:.2f} ({int(max_find_score * 100)}%)</div>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -1347,7 +1305,7 @@ if inspection_mode == "Single Document Audit":
                 with k2:
                     render_kpi_card("🪪", "Embedded PAN", fin_rec.get("embedded_pan") or "N/A")
                 with k3:
-                    render_kpi_card("📍", "Jurisdiction", str(fin_rec.get("state_jurisdiction") or "N/A")[:18])
+                    render_kpi_card("📍", "Jurisdiction", str(fin_rec.get("jurisdiction") or fin_rec.get("state_jurisdiction") or "N/A")[:18])
                 with k4:
                     render_kpi_card("🏢", "Legal Name", str(fin_rec.get("legal_name") or id_card.get("holder_name"))[:18])
                 with k5:
@@ -1421,15 +1379,12 @@ if inspection_mode == "Single Document Audit":
 
             st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
 
-            # ------------------------------------------------------------------
-            # 5 DETAIL TABS (3-COLUMN MOCKUP LAYOUT IN TAB 1)
-            # ------------------------------------------------------------------
             tab_findings, tab_struct, tab_breakdown, tab_preview, tab_raw = st.tabs([
                 "🛡️ Audit & Forensics",
                 "☰ Structured Findings (Sec 4.3)",
                 "⊞ Extracted Data",
                 "🖼️ Visual Evidence",
-                "<> Module 1 Contract JSON"
+                "<> Module 1 Contract JSON",
             ])
 
             with tab_findings:
@@ -1521,26 +1476,37 @@ if inspection_mode == "Single Document Audit":
                             "finding_code": "Finding Code",
                             "raw_detector_score": "Raw Score",
                             "individual_finding_score": "Finding Confidence",
-                            "reason": "Evidence Reason"
-                        }
+                            "reason": "Evidence Reason",
+                        },
                     )
                 else:
                     st.success("✓ Zero structured anomaly findings generated.")
 
             with tab_breakdown:
-                # DOCUMENT-AWARE DATA TAB: NO TRANSACTION LEDGER FOR PAN/AADHAAR
                 if doc_code == "BANK_STATEMENT":
-                    render_html_table(
-                        fin_rec.get("transactions", []),
-                        column_rename_map={
+                    txs = fin_rec.get("transactions", [])
+                    if len(txs) > 150:
+                        df_tx = pd.DataFrame(txs).rename(columns={
                             "date": "Transaction Date",
                             "description": "Narration / Description",
                             "credit": "Credit / Deposit (₹)",
                             "debit": "Debit / Withdrawal (₹)",
                             "balance": "Running Balance (₹)",
-                            "page": "Page No."
-                        }
-                    )
+                            "page": "Page No.",
+                        })
+                        st.dataframe(df_tx, width="stretch", hide_index=True)
+                    else:
+                        render_html_table(
+                            txs,
+                            column_rename_map={
+                                "date": "Transaction Date",
+                                "description": "Narration / Description",
+                                "credit": "Credit / Deposit (₹)",
+                                "debit": "Debit / Withdrawal (₹)",
+                                "balance": "Running Balance (₹)",
+                                "page": "Page No.",
+                            },
+                        )
                 elif doc_code == "PAN_CARD":
                     pan_no = id_card.get("pan_number") or fin_rec.get("pan_number") or "NOT FOUND"
                     kyc_rows = [
@@ -1572,13 +1538,13 @@ if inspection_mode == "Single Document Audit":
                         st.markdown("**Earnings Breakdown**")
                         render_html_table(
                             fin_rec.get("earnings_breakdown", []),
-                            column_rename_map={"name": "Earning Component", "amount": "Amount (₹)"}
+                            column_rename_map={"name": "Earning Component", "amount": "Amount (₹)"},
                         )
                     with c_ded:
                         st.markdown("**Deductions Breakdown**")
                         render_html_table(
                             fin_rec.get("deductions_breakdown", []),
-                            column_rename_map={"name": "Deduction Component", "amount": "Amount (₹)"}
+                            column_rename_map={"name": "Deduction Component", "amount": "Amount (₹)"},
                         )
                 else:
                     kv_list = [
@@ -1592,7 +1558,7 @@ if inspection_mode == "Single Document Audit":
                 s_findings = m1_out.get("structured_findings", [])
                 if suffix in [".png", ".jpg", ".jpeg"]:
                     annotated_img = draw_visual_findings_on_image(temp_path, report.get("forensic_flags", []))
-                    st.image(annotated_img, caption="Visual Inspection View", width='stretch')
+                    st.image(annotated_img, caption="Visual Inspection View", width="stretch")
                 elif suffix == ".pdf":
                     doc = pymupdf.open(temp_path)
                     total_p = len(doc)
@@ -1600,7 +1566,7 @@ if inspection_mode == "Single Document Audit":
                     selected_page = st.selectbox(
                         f"Select PDF Page to Inspect (1 to {total_p})",
                         options=list(range(1, total_p + 1)),
-                        format_func=lambda p: f"Page {p} of {total_p}" + (" 🚨 [HAS FINDINGS]" if p in flagged_pages else " ✓ [Clean]")
+                        format_func=lambda p: f"Page {p} of {total_p}" + (" 🚨 [HAS FINDINGS]" if p in flagged_pages else " ✓ [Clean]"),
                     )
                     page_obj = doc[selected_page - 1]
                     scale = 150 / 72.0
@@ -1610,7 +1576,7 @@ if inspection_mode == "Single Document Audit":
                     for pf in [f for f in s_findings if f.get("page") == selected_page and f.get("bbox")]:
                         x0, y0, x1, y1 = [c * scale for c in pf["bbox"]]
                         draw.rectangle([x0 - 6, y0 - 6, x1 + 6, y1 + 6], outline=(220, 38, 38), width=4)
-                    st.image(img, caption=f"Page {selected_page} of {total_p}", width='stretch')
+                    st.image(img, caption=f"Page {selected_page} of {total_p}", width="stretch")
                     doc.close()
 
             with tab_raw:
@@ -1638,304 +1604,204 @@ if inspection_mode == "Single Document Audit":
             </div>
             """, unsafe_allow_html=True)
 
+
+# ------------------------------------------------------------------------------
 # MODE 2: MULTI-DOCUMENT PACK CROSS-CHECK (FAMILY D)
+# ------------------------------------------------------------------------------
 else:
-    st.markdown("#### 📁 Multi-Document Application Pack Identifier & Verifier (Family D)")
-    st.caption("Upload any 2 to 4 loan application documents (Bank Statement, PAN Card, Aadhaar Card, Salary Slip, GST, Udyam, ITR) to run cross-document KYC & financial consistency checks.")
+    st.markdown("#### 📁 Multi-Document Application Pack Verifier (Family D)")
+    st.caption(
+        "Upload 2 or more borrower documents (Bank Statement, PAN Card, Aadhaar Card, Salary Slip, "
+        "GST REG-06 / GSTR-1 / GSTR-3B / GSTR-2B, Udyam, ITR, Form 3CB/3CD, Balance Sheet) "
+        "to run unified KYC, GST, banking, and income cross-checks."
+    )
 
-    col_u1, col_u2, col_u3, col_u4 = st.columns(4)
-    with col_u1:
-        f_doc1 = st.file_uploader("Document 1 (e.g. Bank Statement)", type=["pdf", "png", "jpg", "jpeg", "docx"], key="u1")
-    with col_u2:
-        f_doc2 = st.file_uploader("Document 2 (e.g. PAN Card)", type=["pdf", "png", "jpg", "jpeg", "docx"], key="u2")
-    with col_u3:
-        f_doc3 = st.file_uploader("Document 3 (e.g. Aadhaar Card)", type=["pdf", "png", "jpg", "jpeg", "docx"], key="u3")
-    with col_u4:
-        f_doc4 = st.file_uploader("Document 4 (e.g. GST / Udyam / Salary Slip)", type=["pdf", "png", "jpg", "jpeg", "docx"], key="u4")
+    col_up_pack, col_opt_pack = st.columns([2.6, 1.0])
+    with col_up_pack:
+        uploaded_list = st.file_uploader(
+            "Drag & Drop Borrower Loan Pack (2+ files: PDF, PNG, JPG, JPEG, DOCX)",
+            type=["pdf", "png", "jpg", "jpeg", "docx"],
+            accept_multiple_files=True,
+            key="family_d_pack_uploader",
+        )
+    with col_opt_pack:
+        st.markdown("<div class='saas-card'>", unsafe_allow_html=True)
+        use_llm_pack = st.toggle("Use Stage 2 LLM for Bank PDFs", value=False, key="pack_use_llm")
+        st.caption("Off = fast geometric parser (~1–2s/doc). On = Z.ai LLM layout blueprint for complex bank layouts.")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    def _normalize_name_tokens(name_str: str) -> set[str]:
-        if not name_str:
-            return set()
-        stop_w = {
-            "mr", "mrs", "ms", "shri", "smt", "kumari", "dr", "m/s", "ms", "prop",
-            "proprietor", "unknown", "holder", "verified", "enterprises", "traders",
-            "services", "private", "limited", "pvt", "ltd", "llp", "and", "sons", "co"
-        }
-        tokens = re.findall(r"[a-z]{2,}", str(name_str).lower())
-        return {t for t in tokens if t not in stop_w}
+    if not uploaded_list:
+        st.info("Upload at least **2 documents** for the same borrower to run Family D verification.")
+    elif len(uploaded_list) < 2:
+        st.warning("Upload at least **1 more document** (minimum 2 files required for cross-document verification).")
+    else:
+        pack_sig = (tuple((f.name, f.size) for f in uploaded_list), tenant_choice, use_llm_pack)
+        run_clicked = st.button("🚀 Identify All Documents & Run Family D Cross-Check", type="primary", width="stretch")
 
-    def _names_match_fuzzy(n1: str, n2: str) -> bool:
-        t1 = _normalize_name_tokens(n1)
-        t2 = _normalize_name_tokens(n2)
-        if not t1 or not t2:
-            return True
-        if t1 == t2 or t1.issubset(t2) or t2.issubset(t1):
-            return True
-        overlap = len(t1 & t2)
-        return overlap >= max(1, min(len(t1), len(t2)) - 1) and overlap >= 1
-
-    def run_comprehensive_family_d_checks(results_list: list) -> dict:
-        checks = []
-        mismatches = []
-        warnings = []
-
-        by_code = {}
-        for fname, rep, m1 in results_list:
-            d_code = m1["identity_card"].get("doc_code") or rep.get("financial_reconciliation", {}).get("document_type", "UNKNOWN_DOCUMENT")
-            by_code.setdefault(d_code, []).append((fname, rep, m1))
-
-        pan_docs = by_code.get("PAN_CARD", [])
-        aadhaar_docs = by_code.get("AADHAAR_CARD", [])
-        bank_docs = by_code.get("BANK_STATEMENT", [])
-        slip_docs = by_code.get("SALARY_SLIP", [])
-        gst_docs = by_code.get("GST_CERTIFICATE", [])
-        udyam_docs = by_code.get("UDYAM_CERTIFICATE", [])
-        itr_docs = by_code.get("ITR_DOCUMENT", [])
-
-        # 1. Cross-Check Personal KYC Holder Name: PAN Card vs. Aadhaar Card
-        if pan_docs and aadhaar_docs:
-            p_fn, p_rep, p_m1 = pan_docs[0]
-            a_fn, a_rep, a_m1 = aadhaar_docs[0]
-            p_name = p_rep.get("financial_reconciliation", {}).get("legal_name") or p_m1["identity_card"].get("holder_name", "Unknown")
-            a_name = a_rep.get("financial_reconciliation", {}).get("legal_name") or a_m1["identity_card"].get("holder_name", "Unknown")
-
-            if _names_match_fuzzy(p_name, a_name):
-                checks.append({
-                    "Cross-Check": "PAN vs. Aadhaar Holder Name",
-                    "Documents": f"{p_fn} ↔ {a_fn}",
-                    "Comparison": f"'{p_name}' ↔ '{a_name}'",
-                    "Status": "PASSED",
-                })
-            else:
-                msg = f"KYC Identity Mismatch: PAN Card belongs to '{p_name}' ({p_fn}), whereas Aadhaar Card belongs to '{a_name}' ({a_fn})."
-                mismatches.append(msg)
-                checks.append({
-                    "Cross-Check": "PAN vs. Aadhaar Holder Name",
-                    "Documents": f"{p_fn} ↔ {a_fn}",
-                    "Comparison": f"'{p_name}' ≠ '{a_name}'",
-                    "Status": "FAILED",
-                })
-
-            # 2. Cross-Check Date of Birth: PAN Card DOB vs. Aadhaar Card DOB
-            p_dob = p_rep.get("financial_reconciliation", {}).get("date_of_birth")
-            a_dob = a_rep.get("financial_reconciliation", {}).get("date_of_birth")
-            if p_dob and a_dob:
-                p_dob_norm = re.sub(r"[^\d]", "", str(p_dob))
-                a_dob_norm = re.sub(r"[^\d]", "", str(a_dob))
-                dob_ok = (p_dob_norm == a_dob_norm) or (len(a_dob_norm) == 4 and p_dob_norm.endswith(a_dob_norm))
-                if dob_ok:
-                    checks.append({
-                        "Cross-Check": "PAN vs. Aadhaar Date of Birth",
-                        "Documents": f"{p_fn} ↔ {a_fn}",
-                        "Comparison": f"DOB '{p_dob}' ↔ '{a_dob}'",
-                        "Status": "PASSED",
-                    })
-                else:
-                    msg = f"KYC Date of Birth Mismatch: PAN Card shows DOB '{p_dob}' ({p_fn}), but Aadhaar Card shows DOB '{a_dob}' ({a_fn})."
-                    mismatches.append(msg)
-                    checks.append({
-                        "Cross-Check": "PAN vs. Aadhaar Date of Birth",
-                        "Documents": f"{p_fn} ↔ {a_fn}",
-                        "Comparison": f"DOB '{p_dob}' ≠ '{a_dob}'",
-                        "Status": "FAILED",
-                    })
-
-        # 3. Cross-Check 10-Char PAN Number Across All Documents Carrying a PAN
-        extracted_pans = []
-        for fname, rep, m1 in results_list:
-            f_rec = rep.get("financial_reconciliation", {})
-            p_val = f_rec.get("pan_number") or f_rec.get("embedded_pan") or m1["identity_card"].get("pan_number")
-            if p_val and len(str(p_val).strip()) == 10:
-                extracted_pans.append((fname, m1["identity_card"].get("doc_category", "Document"), str(p_val).strip().upper()))
-
-        if len(extracted_pans) >= 2:
-            unique_pans = {p for _, _, p in extracted_pans}
-            pan_summary_str = ", ".join(f"{cat}: {p}" for _, cat, p in extracted_pans)
-            if len(unique_pans) == 1:
-                checks.append({
-                    "Cross-Check": "10-Character PAN Consistency",
-                    "Documents": f"{len(extracted_pans)} Documents",
-                    "Comparison": pan_summary_str,
-                    "Status": "PASSED",
-                })
-            else:
-                msg = f"Cross-Document PAN Mismatch: Conflicting PAN numbers detected across pack ({pan_summary_str})."
-                mismatches.append(msg)
-                checks.append({
-                    "Cross-Check": "10-Character PAN Consistency",
-                    "Documents": f"{len(extracted_pans)} Documents",
-                    "Comparison": pan_summary_str,
-                    "Status": "FAILED",
-                })
-
-        # 4. Cross-Check Bank Statement Entity vs. KYC / Business Documents
-        if bank_docs:
-            b_fn, b_rep, b_m1 = bank_docs[0]
-            b_holder = b_m1["identity_card"].get("holder_name", "Unknown Holder")
-            b_txs = b_rep.get("financial_reconciliation", {}).get("transactions", [])
-            b_full_narration = " ".join((t.get("description") or "") for t in b_txs).lower()
-            is_business_acct = bool(re.search(r"\b(?:M/S|ENTERPRISES|TRADERS|SERVICES|PRIVATE|LIMITED|PVT|LTD|LLP|SONS|INDUSTRIES|CORPORATION)\b", b_holder, re.I))
-
-            # Compare against GST / Udyam business name if uploaded
-            for bus_fn, bus_rep, bus_m1 in (gst_docs + udyam_docs):
-                bus_name = bus_m1["identity_card"].get("holder_name", "Unknown")
-                if _names_match_fuzzy(b_holder, bus_name):
-                    checks.append({
-                        "Cross-Check": "Bank Account vs. Business Registration",
-                        "Documents": f"{b_fn} ↔ {bus_fn}",
-                        "Comparison": f"'{b_holder}' ↔ '{bus_name}'",
-                        "Status": "PASSED",
-                    })
-                else:
-                    msg = f"Business Entity Mismatch: Bank Statement is for '{b_holder}', while {bus_m1['identity_card'].get('doc_category')} is for '{bus_name}'."
-                    mismatches.append(msg)
-                    checks.append({
-                        "Cross-Check": "Bank Account vs. Business Registration",
-                        "Documents": f"{b_fn} ↔ {bus_fn}",
-                        "Comparison": f"'{b_holder}' ≠ '{bus_name}'",
-                        "Status": "FAILED",
-                    })
-
-            # Compare Bank Statement against Personal KYC (PAN / Aadhaar)
-            for kyc_fn, kyc_rep, kyc_m1 in (pan_docs + aadhaar_docs):
-                kyc_name = kyc_rep.get("financial_reconciliation", {}).get("legal_name") or kyc_m1["identity_card"].get("holder_name", "Unknown")
-                kyc_cat = kyc_m1["identity_card"].get("doc_category", "KYC ID")
-                if not is_business_acct:
-                    if _names_match_fuzzy(b_holder, kyc_name):
-                        checks.append({
-                            "Cross-Check": f"Bank Account Holder vs. {kyc_cat}",
-                            "Documents": f"{b_fn} ↔ {kyc_fn}",
-                            "Comparison": f"'{b_holder}' ↔ '{kyc_name}'",
-                            "Status": "PASSED",
-                        })
-                    else:
-                        msg = f"Account Holder vs. {kyc_cat} Mismatch: Bank account belongs to '{b_holder}', whereas {kyc_cat} belongs to '{kyc_name}'."
-                        mismatches.append(msg)
-                        checks.append({
-                            "Cross-Check": f"Bank Account Holder vs. {kyc_cat}",
-                            "Documents": f"{b_fn} ↔ {kyc_fn}",
-                            "Comparison": f"'{b_holder}' ≠ '{kyc_name}'",
-                            "Status": "FAILED",
-                        })
-                else:
-                    kyc_tokens = _normalize_name_tokens(kyc_name)
-                    in_narration = any(tok in b_full_narration for tok in kyc_tokens if len(tok) >= 4)
-                    co_app_hint = any(k in kyc_fn.lower() for k in ("co app", "co_app", "prop", b_holder.lower()[:6]))
-                    status_lbl = "PASSED" if (in_narration or co_app_hint) else "REVIEW"
-                    comp_note = f"Business A/C '{b_holder}' ↔ Proprietor/Co-Applicant '{kyc_name}'"
-                    if status_lbl == "REVIEW":
-                        warnings.append(
-                            f"Proprietor / Co-Applicant Linkage Notice: Bank Statement is in business name '{b_holder}' while {kyc_cat} is for individual '{kyc_name}' — verify proprietorship/partnership deed."
-                        )
-                    checks.append({
-                        "Cross-Check": f"Business Bank A/C vs. Individual {kyc_cat}",
-                        "Documents": f"{b_fn} ↔ {kyc_fn}",
-                        "Comparison": comp_note,
-                        "Status": "PASSED" if status_lbl == "PASSED" else "NEEDS_REVIEW",
-                    })
-
-        # 5. Roll up individual document biometric or forensic failures
-        for fname, rep, m1 in results_list:
-            f_rec = rep.get("financial_reconciliation", {})
-            cov = f_rec.get("audit_coverage", {})
-            if cov.get("human_portrait_verified") == "FAILED":
-                msg = f"Biometric Portrait Alert on {fname}: {f_rec.get('portrait_verification', 'Non-human / spoof portrait detected')}."
-                mismatches.append(msg)
-                checks.append({
-                    "Cross-Check": "KYC Biometric Portrait Integrity",
-                    "Documents": fname,
-                    "Comparison": f_rec.get("portrait_verification", "FAILED"),
-                    "Status": "FAILED",
-                })
-            elif m1.get("triage_band") == "high_risk":
-                msg = f"High-Risk Document Alert on {fname}: Document scored {m1.get('overall_document_risk_score', 0):.2f} risk ({len(m1.get('structured_findings', []))} finding(s))."
-                mismatches.append(msg)
-                checks.append({
-                    "Cross-Check": "Individual Document Integrity Gate",
-                    "Documents": fname,
-                    "Comparison": f"Triage: HIGH RISK ({int(m1.get('overall_document_risk_score', 0)*100)}%)",
-                    "Status": "FAILED",
-                })
-
-        status = "MISMATCH_DETECTED" if mismatches else ("REVIEW_REQUIRED" if warnings else "NO_MISMATCH_FOUND")
-        return {
-            "status": status,
-            "checks": checks,
-            "findings": mismatches + warnings if (mismatches or warnings) else ["All uploaded documents passed Family D cross-document verification."],
-            "mismatches": mismatches,
-            "warnings": warnings,
-        }
-
-    if st.button("🚀 Identify All Documents & Run Family D Cross-Check", type="primary"):
-        uploaded_list = [f for f in (f_doc1, f_doc2, f_doc3, f_doc4) if f is not None]
-        if len(uploaded_list) < 2:
-            st.error("Please upload at least 2 documents to run Family D Cross-Document verification.")
-        else:
+        if run_clicked:
             temp_paths = []
             results = []
+            doc_contracts = []
+            progress = st.progress(0, text="Starting Family D dossier pipeline...")
             try:
-                with st.spinner("Analyzing uploaded pack and running Family D cross-reconciliation..."):
-                    for uf in uploaded_list:
-                        ext = os.path.splitext(uf.name)[1].lower()
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as t:
-                            t.write(uf.getbuffer())
-                            temp_paths.append(t.name)
-                            rep = verify_any_file(t.name, original_filename=uf.name, use_llm=False)
-                            rep["original_filename"] = uf.name
-                            m1 = build_module1_output(t.name, rep, tenant_id=tenant_choice)
-                            results.append((uf.name, rep, m1))
+                for idx_u, uf in enumerate(uploaded_list):
+                    progress.progress(
+                        idx_u / len(uploaded_list),
+                        text=f"Analyzing {uf.name} ({idx_u + 1}/{len(uploaded_list)})...",
+                    )
+                    ext = os.path.splitext(uf.name)[1].lower() or ".pdf"
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as t:
+                        t.write(uf.getbuffer())
+                        tmp_path = t.name
+                        temp_paths.append(tmp_path)
 
-                # Render Summary Cards for each uploaded document in the pack
-                st.markdown("##### 📋 Uploaded Application Pack Summary")
-                pack_cols = st.columns(len(results))
-                for idx_c, (fname, rep, m1) in enumerate(results):
+                    rep = verify_any_file(tmp_path, original_filename=uf.name, use_llm=use_llm_pack)
+                    rep["original_filename"] = uf.name
+                    m1 = build_module1_output(tmp_path, rep, tenant_id=tenant_choice)
+                    m1["filename"] = uf.name
+                    results.append((uf.name, rep, m1))
+                    doc_contracts.append(m1)
+
+                progress.progress(0.92, text="Running Family D cross-document verification...")
+                cross_rep = verify_loan_dossier(doc_contracts)
+                progress.progress(1.0, text="Family D verification complete.")
+
+                st.session_state["family_d_pack_sig"] = pack_sig
+                st.session_state["family_d_pack_data"] = {
+                    "results": results,
+                    "doc_contracts": doc_contracts,
+                    "cross_rep": cross_rep,
+                }
+            finally:
+                for p in temp_paths:
+                    if os.path.exists(p):
+                        try:
+                            os.unlink(p)
+                        except OSError:
+                            pass
+
+        saved_pack = st.session_state.get("family_d_pack_data")
+        if saved_pack and st.session_state.get("family_d_pack_sig") == pack_sig:
+            results = saved_pack["results"]
+            cross_rep = saved_pack["cross_rep"]
+            struct_findings = cross_rep.get("structured_findings") or []
+
+            max_single_risk = max(
+                (float(m1.get("overall_document_risk_score") or 0.0) for _, _, m1 in results),
+                default=0.0,
+            )
+            fam_d_contrib = float(cross_rep.get("risk_score_contribution", 0)) / 100.0
+            combined_risk = min(
+                0.95,
+                max(max_single_risk, fam_d_contrib) + (0.12 if struct_findings and max_single_risk >= 0.35 else 0.0),
+            )
+
+            doc_alerts = []
+            for fname, rep, m1 in results:
+                fr = rep.get("financial_reconciliation") or {}
+                if (fr.get("audit_coverage") or {}).get("human_portrait_verified") == "FAILED":
+                    doc_alerts.append(
+                        f"Biometric Portrait Alert on **{fname}**: {fr.get('portrait_verification', 'Spoof detected')}"
+                    )
+                elif m1.get("triage_band") == "high_risk":
+                    doc_alerts.append(
+                        f"High-Risk Single Document (**{fname}**): scored {int(round(float(m1.get('overall_document_risk_score', 0)) * 100))}% risk."
+                    )
+
+            if combined_risk >= 0.70 or any(f.get("severity") == "CRITICAL" for f in struct_findings) or doc_alerts:
+                pack_triage, tri_cls = "HIGH RISK", "kpi-dr"
+            elif combined_risk >= 0.35 or struct_findings:
+                pack_triage, tri_cls = "NEEDS REVIEW", ""
+            else:
+                pack_triage, tri_cls = "LOW RISK", "kpi-cr"
+
+            k1, k2, k3, k4 = st.columns(4)
+            with k1:
+                render_kpi_card("🛡️", "Dossier Triage Band", pack_triage, tri_cls)
+            with k2:
+                render_kpi_card("📑", "Documents Checked", str(len(results)))
+            with k3:
+                render_kpi_card("📊", "Combined Pack Risk", f"{combined_risk:.2f} ({int(round(combined_risk * 100))}%)")
+            with k4:
+                render_kpi_card("🔗", "Family D Findings", str(len(struct_findings) + len(doc_alerts)))
+
+            st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+
+            st.markdown("##### 📋 Uploaded Application Pack Summary")
+            for row_start in range(0, len(results), 4):
+                row_slice = results[row_start : row_start + 4]
+                pack_cols = st.columns(len(row_slice))
+                for idx_c, (fname, rep, m1) in enumerate(row_slice):
                     ic = m1["identity_card"]
                     fr = rep.get("financial_reconciliation", {})
                     d_code = fr.get("document_type") or ic.get("doc_code", "UNKNOWN")
                     with pack_cols[idx_c]:
-                        extra_line = ""
                         if d_code == "BANK_STATEMENT":
-                            extra_line = f"Bank: <b>{html.escape(str(ic.get('issuing_bank') or 'UNKNOWN'))}</b><br>Closing: <b>₹ {fr.get('closing_balance', 0):,.2f}</b>"
+                            extra_line = (
+                                f"Bank: <b>{html.escape(str(ic.get('issuing_bank') or 'UNKNOWN'))}</b><br>"
+                                f"Credits: <b>₹ {float(fr.get('total_credits') or 0):,.2f}</b><br>"
+                                f"Closing: <b>₹ {float(fr.get('closing_balance') or 0):,.2f}</b>"
+                            )
                         elif d_code == "PAN_CARD":
-                            extra_line = f"PAN: <b>{html.escape(str(fr.get('pan_number') or ic.get('pan_number') or 'N/A'))}</b><br>DOB: <b>{html.escape(str(fr.get('date_of_birth') or 'N/A'))}</b>"
+                            extra_line = (
+                                f"PAN: <b>{html.escape(str(fr.get('pan_number') or ic.get('pan_number') or 'N/A'))}</b><br>"
+                                f"DOB: <b>{html.escape(str(fr.get('date_of_birth') or 'N/A'))}</b>"
+                            )
                         elif d_code == "AADHAAR_CARD":
-                            extra_line = f"UID: <b>[Aadhaar Redacted]</b><br>DOB: <b>{html.escape(str(fr.get('date_of_birth') or 'N/A'))}</b>"
+                            extra_line = (
+                                f"UID: <b>[Aadhaar Redacted]</b><br>"
+                                f"DOB: <b>{html.escape(str(fr.get('date_of_birth') or 'N/A'))}</b>"
+                            )
+                        elif d_code == "GST_CERTIFICATE":
+                            extra_line = (
+                                f"GSTIN: <b>{html.escape(str(fr.get('gstin') or 'N/A'))}</b><br>"
+                                f"Period: <b>{html.escape(str(fr.get('tax_period') or fr.get('financial_year') or 'N/A'))}</b>"
+                            )
+                        elif d_code == "TAX_AUDIT_REPORT":
+                            extra_line = (
+                                f"PAN: <b>{html.escape(str(fr.get('pan_number') or 'N/A'))}</b><br>"
+                                f"Turnover: <b>{html.escape(str(fr.get('total_turnover_display') or 'N/A'))}</b>"
+                            )
                         else:
                             extra_line = f"Status: <b>{html.escape(str(fr.get('status', 'VERIFIED')))}</b>"
 
+                        single_pct = int(round(float(m1.get("overall_document_risk_score") or 0) * 100))
                         st.markdown(f"""
                         <div class="saas-card" style="margin-bottom:12px;">
-                            <div style="font-size:11px; font-weight:700; color:#4f46e5;">{html.escape(str(ic.get('doc_category', 'Document')).upper())}</div>
+                            <div style="font-size:11px; font-weight:700; color:#4f46e5;">{html.escape(str(fr.get('form_display_label') or ic.get('doc_category', 'Document')).upper())}</div>
                             <div style="font-size:14px; font-weight:800; color:#0f172a; margin:3px 0;">{html.escape(str(ic.get('holder_name', 'Unknown Holder')))}</div>
                             <div style="font-size:12px; color:#475569;">{extra_line}</div>
-                            <div style="font-size:11px; color:#64748b; margin-top:4px;">📄 {html.escape(fname)}</div>
+                            <div style="font-size:11px; color:#64748b; margin-top:6px;">📄 {html.escape(fname)} • Risk: <b>{single_pct}%</b></div>
                         </div>
                         """, unsafe_allow_html=True)
 
-                cross_rep = run_comprehensive_family_d_checks(results)
+            c_mat_d, c_find_d = st.columns([1.1, 1.4])
+            with c_mat_d:
+                cov_rows_d = [
+                    {"Check": k.replace("_", " ").title(), "Status": v}
+                    for k, v in (cross_rep.get("checks_matrix") or {}).items()
+                ]
+                render_coverage_matrix_html(cov_rows_d, title="🔗 Family D: Cross-Document Verification Matrix")
 
-                st.markdown("##### 🛡️ Family D Cross-Document Verification Matrix")
-                if cross_rep.get("checks"):
-                    render_html_table(cross_rep["checks"])
-
-                if cross_rep["status"] == "NO_MISMATCH_FOUND":
-                    st.success("✅ Family D PASSED: All uploaded documents belong to the same applicant/entity and cross-reconcile cleanly!")
-                elif cross_rep["status"] == "REVIEW_REQUIRED":
-                    for w_msg in cross_rep.get("warnings", []):
-                        st.warning(f"⚠️ {w_msg}")
+            with c_find_d:
+                st.markdown("##### 🔍 Cross-Document & Pack Findings")
+                if not struct_findings and not doc_alerts:
+                    st.success("✅ Family D PASSED: All applicable cross-document checks reconciled cleanly with zero conflicts.")
                 else:
-                    for m_msg in cross_rep.get("mismatches", []):
-                        st.error(f"🚨 {m_msg}")
-                    for w_msg in cross_rep.get("warnings", []):
-                        st.warning(f"⚠️ {w_msg}")
+                    for alert in doc_alerts:
+                        st.error(f"🚨 {alert}")
+                    for f in struct_findings:
+                        sev = f.get("severity", "HIGH")
+                        docs_cmp = ", ".join(f.get("documents_compared") or [])
+                        msg = f"**[{sev}] {f.get('finding_code')}** ({docs_cmp}) — {f.get('message')}"
+                        if sev == "CRITICAL":
+                            st.error(f"🚨 {msg}")
+                        else:
+                            st.warning(f"⚠️ {msg}")
 
-                with st.expander("View Complete Module 1 Multi-Document JSON Payload"):
-                    st.json({
-                        "identified_cards": [m1["identity_card"]["identity_badge"] for _, _, m1 in results],
-                        "family_d_cross_check": cross_rep,
-                        "document_outputs": [m1 for _, _, m1 in results]
-                    })
-            finally:
-                for p in temp_paths:
-                    if os.path.exists(p):
-                        os.unlink(p)
+            with st.expander("<> Complete Module 1 Multi-Document JSON Payload"):
+                st.json({
+                    "identified_cards": [m1["identity_card"]["identity_badge"] for _, _, m1 in results],
+                    "family_d_cross_check": cross_rep,
+                    "document_outputs": [m1 for _, _, m1 in results],
+                })

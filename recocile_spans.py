@@ -29,9 +29,11 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
     if full_text:
         txt_summary = extract_summary_from_full_text(full_text)
         for k, vals in txt_summary.items():
-            items = [vals] if isinstance(vals, str) else vals
+            if isinstance(vals, str):
+                summary[k] = vals
+                continue
             target = summary.setdefault(k, [])
-            for v in items:
+            for v in vals:
                 if v not in target:
                     target.append(v)
 
@@ -161,7 +163,7 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
                 continue
 
             row_has_any_date_or_amt = any(
-                DATE_RE.match(s["text"].strip()) or re.search(r"\d+\.\d{2}", normalize_ocr_amount_str(s["text"]))
+                DATE_RE.match(s["text"].strip()) or re.search(r"(?:\d+\.\d{2}|(?<![A-Za-z0-9])\.\d{2})", normalize_ocr_amount_str(s["text"]))
                 for s in row
             )
             if not row_has_any_date_or_amt and any(skip_k in row_joined_lower for skip_k in [
@@ -444,7 +446,10 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
                             tx["credit"] = abs(val)
                     elif closest_mon_col == "debit":
                         tx["debit"] = val
-                elif val is not None and is_monetary_col and dist_to_col <= 65.0 and not page_uses_decimals:
+                elif val is not None and is_monetary_col and (
+                    (dist_to_col <= 65.0 and not page_uses_decimals)
+                    or (closest_col in ("credit", "debit") and dist_to_col <= 50.0 and re.fullmatch(r"\d{1,3}", txt))
+                ):
                     if closest_col == "balance":
                         tx["balance"] = -abs(val) if (txt.startswith("-") or ind == "DR") else abs(val)
                         tx["_bal_cy"] = s["cy"]
@@ -565,7 +570,16 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
                 summary["opening_balance"].insert(0, first_t["balance"])
             transactions = transactions[1:]
 
-    if transactions and (transactions[0]["credit"] > 0 or transactions[0]["debit"] > 0):
+    is_overdraft_summary = (
+        (summary.get("opening_balance") and summary["opening_balance"][0] < 0)
+        or (summary.get("closing_balance") and summary["closing_balance"][0] < 0)
+    )
+    if (
+        transactions
+        and not is_overdraft_summary
+        and summary.get("opening_balance_source") != "EXTRACTED_FROM_STATEMENT"
+        and (transactions[0]["credit"] > 0 or transactions[0]["debit"] > 0)
+    ):
         inferred_first_open = round(transactions[0]["balance"] - transactions[0]["credit"] + transactions[0]["debit"], 2)
         if not summary["opening_balance"]:
             summary["opening_balance"] = [inferred_first_open]
@@ -599,7 +613,10 @@ def reconcile_spans(pages_spans, y_tolerance=6.0, full_text=""):
         abs_delta = abs(delta)
         current_net = round(tx["credit"] - tx["debit"], 2)
 
-        if abs_delta > 0 and abs(current_net - delta) > 1.0:
+        if abs_delta > 0 and (
+            abs(current_net - delta) > 1.0
+            or (tx["credit"] == 0.0 and tx["debit"] == 0.0 and abs_delta >= 0.01)
+        ):
             if abs(tx["credit"] - abs_delta) <= 1.0 or abs(tx["debit"] - abs_delta) <= 1.0:
                 if delta > 0:
                     tx["credit"], tx["debit"] = abs_delta, 0.0

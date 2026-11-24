@@ -604,6 +604,11 @@ def identify_document_and_entity(file_path: str, raw_report: dict = None) -> dic
         m_ifsc = re.search(r"IFSC(?:\s*Code)?[\s:\|\-]*([A-Z]{4})[0O]([A-Z0-9]{6})\b", pre_table_header.upper())
         if m_ifsc:
             ifsc_code = f"{m_ifsc.group(1)}0{m_ifsc.group(2)}"
+        if not ifsc_code:
+         for m_any_ifsc in re.finditer(r"\b([A-Z]{4})0([A-Z0-9]{6})\b", pre_table_header.upper()):
+             if m_any_ifsc.group(1) in UNIVERSAL_IFSC_BANK_MAP:
+                 ifsc_code = f"{m_any_ifsc.group(1)}0{m_any_ifsc.group(2)}"
+                 break
 
         m_ac = re.search(
             r"(?:Account\s*(?:No\.?|Number)|A/C\s*(?:No\.?|Number)?)\s*[:\|\-\n]+\s*([A-Z0-9X\*]{6,22})",
@@ -1076,29 +1081,32 @@ def build_module1_output(file_path, raw_report, tenant_id="default_lender", doc_
         ):
             identity_info["issuing_bank"] = bp_bank
 
-    if bp_holder and bp_holder not in ("Unknown Holder", "") and identity_info.get("holder_name") in (None, "", "Unknown Holder"):
-        clean_bp_h = _format_entity_name_clean(bp_holder)
-        identity_info["holder_name"] = clean_bp_h
-        identity_info["identity_badge"] = f"{identity_info.get('doc_category', 'Document')} of {clean_bp_h}"
+    invalid_holders = {
+        "", "unknown", "unknown holder", "address", "name", "account", "branch",
+        "city", "state", "phone", "email", "regular", "status", "currency", "inr",
+        "details", "detail", "india and rajasthan bank ltd",
+    }
 
     for k_meta in ("branch_name", "account_number", "ifsc_code", "customer_id"):
         if bp_meta.get(k_meta) and not identity_info.get(k_meta):
             identity_info[k_meta] = bp_meta[k_meta]
-    if bp_holder:
-        identity_info["holder_name"] = bp_holder  
-    invalid_holders = {
-        "", "unknown holder", "address", "name", "account", "branch", "city",
-        "state", "phone", "email", "regular", "status", "currency", "inr",
-        "india and rajasthan bank ltd"
-    }
-    if bp_holder and bp_holder.lower() not in invalid_holders:
-        identity_info["holder_name"] = bp_holder
-        identity_info["person_name"] = bp_holder
-        identity_info["identity_badge"] = f"{identity_info['doc_category']} of {bp_holder}"
-    elif (identity_info.get("holder_name") or "").strip().lower() in invalid_holders:
-        identity_info["holder_name"] = "Unknown Holder"
-        identity_info["person_name"] = "Unknown Holder"
-        identity_info["identity_badge"] = f"{identity_info['doc_category']} of Unknown Holder"
+
+    cur_holder = (identity_info.get("holder_name") or "").strip()
+    bp_valid = bool(bp_holder and bp_holder.lower() not in invalid_holders and "bank" not in bp_holder.lower())
+    cur_valid = bool(cur_holder and cur_holder.lower() not in invalid_holders and "bank" not in cur_holder.lower())
+
+    if bp_valid and not cur_valid:
+        chosen_holder = _format_entity_name_clean(bp_holder)
+    elif cur_valid:
+        chosen_holder = _format_entity_name_clean(cur_holder)
+    elif bp_valid:
+        chosen_holder = _format_entity_name_clean(bp_holder)
+    else:
+        chosen_holder = "Unknown Holder"
+
+    identity_info["holder_name"] = chosen_holder
+    identity_info["person_name"] = chosen_holder
+    identity_info["identity_badge"] = f"{identity_info.get('doc_category', 'Document')} of {chosen_holder}"
 
     fin_rec = dict(raw_report.get("financial_reconciliation", {}))
     if doc_code == "UNKNOWN_DOCUMENT":

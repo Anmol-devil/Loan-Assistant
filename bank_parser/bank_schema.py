@@ -71,7 +71,8 @@ Given structural samples from a multi-page Indian bank statement (with both poin
     "issuing_bank": "Full Bank Name (e.g., RBL Bank, HDFC Bank, ICICI Bank, Yes Bank, Jammu & Kashmir Bank, Axis Bank — NEVER an IFSC code or counterparty bank) or null",
     "holder_name": "Customer or Business/Firm Name (e.g., K2 Beverages LLP, M/S. Hind Services, Lohia And Sons — NEVER a city/address fragment) or null",
     "account_number": "Account Number or null",
-    "ifsc_code": "11-char IFSC of the issuing branch or null"
+    "ifsc_code": "11-char IFSC of the issuing branch or null",
+    "branch_name": "Issuing bank branch name (e.g., DELHI RANI BAGH, VIKASPURI — NEVER 'Details' or an address) or null"
   },
   "stated_summary": {
     "summary_found_on_page": null,
@@ -337,7 +338,7 @@ def _strictly_truncate_pre_table_lines(raw_pre_hdr: str) -> List[str]:
         if cells and DATE_START_RE.match(cells[0]) and not any(
             p in low_ln for p in ("period", "from", "as on", "open date", "expiry")
         ):
-            if re.search(r"\d+\.\d{2}", clean_ln) or any(k in low_ln for k in ("mbk/", "neft", "rtgs", "imps", "upi")):
+            if re.search(r"(?:\d+\.\d{2}|(?<![A-Za-z0-9])\.\d{2})", clean_ln) or any(k in low_ln for k in ("mbk/", "neft", "rtgs", "imps", "upi")):
                 break
 
         out.append(clean_ln)
@@ -645,7 +646,7 @@ def _deterministic_blueprint_discovery(
             for k_off in range(1, 5):
                 if h_idx + k_off < len(lines):
                     next_ln = lines[h_idx + k_off]
-                    if any(re.search(r"\d+\.\d{2}", s["text"]) or DATE_START_RE.match(s["text"]) for s in next_ln):
+                    if any(re.search(r"(?:\d+\.\d{2}|(?<![A-Za-z0-9])\.\d{2})", s["text"]) or DATE_START_RE.match(s["text"]) for s in next_ln):
                         break
                     hdr_spans.extend(next_ln)
 
@@ -811,16 +812,49 @@ def discover_and_ground_blueprint(
     if not isinstance(llm_id, dict):
         llm_id = {}
 
-    det_holder = det_blueprint["document_identity"].get("holder_name") or "Unknown Holder"
-    if det_holder == "Unknown Holder" and llm_id.get("holder_name"):
-        cand_h = str(llm_id["holder_name"]).strip()
-        if (
-            "bank" not in cand_h.lower()
-            and not _is_address_or_branch_line(cand_h)
-            and len(cand_h) >= 5
-            and any(re.search(rf"\b{re.escape(cand_h.lower())}\b", ln) for ln in strict_pre_lines)
-        ):
-            det_blueprint["document_identity"]["holder_name"] = cand_h.title()
+    header_alpha_tokens = set(re.findall(r"[a-z]{2,}", safe_sample["page1_pre_table_header"].lower()))
+    header_compact = re.sub(r"[^A-Z0-9]", "", safe_sample["page1_pre_table_header"].upper())
+
+    # 1. Holder Name — prefer grounded LLM output whenever regex missed or returned a weak/noisy guess
+    cand_h = str(llm_id.get("holder_name") or "").strip()
+    if cand_h and "bank" not in cand_h.lower() and not _is_address_or_branch_line(cand_h) and len(cand_h) >= 4:
+        cand_tokens = [t for t in re.findall(r"[a-z]{2,}", cand_h.lower()) if t not in ("mr", "mrs", "ms", "shri", "smt")]
+        if cand_tokens:
+            overlap = sum(1 for t in cand_tokens if t in header_alpha_tokens) / len(cand_tokens)
+            if overlap >= 0.70:
+                det_blueprint["document_identity"]["holder_name"] = _format_entity_title(cand_h)
+
+    # 2. Issuing Bank — allow LLM to fill missing bank
+    det_bank = det_blueprint["document_identity"].get("issuing_bank")
+    if not det_bank and (llm_id.get("issuing_bank") or llm_id.get("ifsc_code")):
+        raw_b = llm_id.get("issuing_bank") or llm_id.get("ifsc_code")
+        det_blueprint["document_identity"]["issuing_bank"] = _normalize_issuing_bank_name(raw_b, fallback_bank=det_bank)
+
+    # 3. IFSC Code — actually save LLM IFSC if grounded in Page 1 header (handles OCR 'O' vs '0')
+    if not det_blueprint["document_identity"].get("ifsc_code") and llm_id.get("ifsc_code"):
+        raw_ifsc = re.sub(r"[^A-Z0-9]", "", str(llm_id["ifsc_code"]).upper())
+        if len(raw_ifsc) == 11 and raw_ifsc[:4] in UNIVERSAL_IFSC_MAP and raw_ifsc[4] in ("0", "O"):
+            fixed_ifsc = raw_ifsc[:4] + "0" + raw_ifsc[5:]
+            if raw_ifsc in header_compact or fixed_ifsc in header_compact:
+                det_blueprint["document_identity"]["ifsc_code"] = fixed_ifsc
+                if not det_blueprint["document_identity"].get("issuing_bank"):
+                    det_blueprint["document_identity"]["issuing_bank"] = UNIVERSAL_IFSC_MAP[raw_ifsc[:4]]
+
+    # 4. Account Number — actually save LLM account number if grounded in Page 1 header
+    if not det_blueprint["document_identity"].get("account_number") and llm_id.get("account_number"):
+        raw_ac = re.sub(r"\s+", "", str(llm_id["account_number"])).strip()
+        ac_digits = re.sub(r"[^A-Z0-9]", "", raw_ac.upper())
+        if len(ac_digits) >= 6 and ac_digits in header_compact:
+            det_blueprint["document_identity"]["account_number"] = raw_ac
+
+    # 5. Branch Name — save LLM branch name if grounded and not a heading word
+    if not det_blueprint["document_identity"].get("branch_name") and llm_id.get("branch_name"):
+        cand_br = str(llm_id["branch_name"]).strip(" :-|.,")
+        br_tokens = re.findall(r"[a-z]{3,}", cand_br.lower())
+        bad_br = {"details", "detail", "info", "information", "summary", "branch", "address", "code", "unknown", "none", "n/a"}
+        if cand_br and cand_br.lower() not in bad_br and br_tokens:
+            if any(t in header_alpha_tokens for t in br_tokens):
+                det_blueprint["document_identity"]["branch_name"] = cand_br.upper()
 
     det_bank = det_blueprint["document_identity"].get("issuing_bank")
     if not det_bank and (llm_id.get("issuing_bank") or llm_id.get("ifsc_code")):

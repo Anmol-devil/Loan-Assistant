@@ -40,24 +40,24 @@ MALFORMED_MULTI_DOT_RE = re.compile(r"^[₹$\s]*([+-]?\d{1,3}(?:\.\d{2,3})+\.\d{
 MALFORMED_THREE_DEC_RE = re.compile(r"^[₹$\s]*([+-]?\d{1,3})\.(\d{3})$")
 
 AMOUNT_CR_DR_RE = re.compile(
-    r"^([+-]?(?:\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d{1,2})?)\s*(?:\((Cr|Dr)\)|\b(Cr|Dr)\b)?([+-])?$",
+    r"^([+-]?(?:(?:\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d{1,2})?|\.\d{2}))\s*(?:\((Cr|Dr)\)|(Cr|Dr)\b)?([+-])?$",
     re.IGNORECASE,
 )
 
 NUMERIC_FRAGMENT_RE = re.compile(r"^[₹$,.:\d\s+-]+$")
 CR_DR_SUFFIX_RE = re.compile(r"^(?:\((?:Cr|Dr)\)|(?:Cr|Dr))$", re.IGNORECASE)
 DECIMAL_AMOUNT_TOKEN_RE = re.compile(
-    r"^[₹$\s]*[+-]?(?:\d{1,3}(?:,\d{2,3})+|\d+)[\.,:\-]\d{2}(?:\s*\(?[CD]r\)?)?$",
+    r"^[₹$\s]*[+-]?(?:(?:\d{1,3}(?:,\d{2,3})+|\d+)[\.,:\-]\d{2}|\.\d{2})(?:\s*\(?[CD]r\)?)?$",
     re.IGNORECASE,
 )
 
 INLINE_DECIMAL_FINDER_RE = re.compile(
-    r"(?<![A-Za-z0-9\./\-])([+-]?(?:\d{1,3}(?:,\d{2,3})+|\d{1,9})[\.,:\-]\d{2}(?:\s*\((?:Cr|Dr)\))?|[+-]?\d{3,8}\s\d{2}(?=\s+[A-Za-z\[]|$))(?![A-Za-z0-9\./\-])",
+    r"(?<![A-Za-z0-9\./\-])([+-]?(?:(?:\d{1,3}(?:,\d{2,3})+|\d{1,9})[\.,:\-]\d{2}|\.\d{2})(?:\s*\((?:Cr|Dr)\))?|[+-]?\d{3,8}\s\d{2}(?=\s+[A-Za-z\[]|$))(?![A-Za-z0-9\./\-])",
     re.IGNORECASE,
 )
 
 PURE_CURRENCY_RE = re.compile(
-    r"^[₹$\s]*[+-]?(?:\d{1,3}(?:,\d{2,3})+|\d+)\.\d{2}\s*(?:\((?:Cr|Dr)\)|\b(?:Cr|Dr)\b)?$",
+    r"^[₹$\s]*[+-]?(?:(?:\d{1,3}(?:,\d{2,3})+|\d+)\.\d{2}|\.\d{2})\s*(?:\((?:Cr|Dr)\)|(?:Cr|Dr)\b)?$",
     re.IGNORECASE,
 )
 
@@ -167,7 +167,7 @@ def parse_amount_with_sign(text):
         prefix_ind = (m_pref.group(1) or m_pref.group(2)).upper()
         s = normalize_ocr_amount_str(m_pref.group(3).strip())
 
-    s_no_crdr = re.sub(r"\((?:Cr|Dr)\)|\b(?:Cr|Dr)\b", "", s, flags=re.IGNORECASE).strip()
+    s_no_crdr = re.sub(r"\((?:Cr|Dr)\)|(?<=[\d\s])(?:Cr|Dr)\b", "", s, flags=re.IGNORECASE).strip()
     s_no_curr = re.sub(r"(?:INR|Rs\.?|₹|\$)", "", s_no_crdr, flags=re.IGNORECASE).strip()
     s_no_curr = normalize_ocr_amount_str(s_no_curr)
     if re.search(r"[A-Za-z:@/]", s_no_curr):
@@ -784,42 +784,120 @@ def run_math_checks(
                 else:
                     audit_coverage["statement_period_verified"] = "PASSED"
 
-    # 7. INLINE UNSIGNED OVERDRAFT NORMALIZER (RUNS BEFORE OPENING BAL!)
+    # 7. UNSIGNED OVERDRAFT & ZERO-CROSSING SIGN RESOLVER (RUNS BEFORE OPENING BAL!)
     sum_cb = summary["closing_balance"][0] if summary.get("closing_balance") else None
     sum_ob = summary["opening_balance"][0] if summary.get("opening_balance") else None
-    if (
-        sum_cb is not None
-        and sum_cb < 0
-        and ordered_txs[-1].get("balance") is not None
-        and ordered_txs[-1]["balance"] > 0
-        and abs(abs(sum_cb) - abs(ordered_txs[-1]["balance"])) <= 1.5
-    ):
-        # Negate all unsigned overdraft balances in the table
-        for t in ordered_txs:
-            if t.get("balance") is not None and t["balance"] > 0:
-                t["balance"] = -abs(float(t["balance"]))
+    has_any_positive_bal = any(t.get("balance") is not None and t["balance"] > 0 for t in ordered_txs)
 
-        r0 = ordered_txs[0]
-        if sum_ob is not None and r0.get("balance") is not None:
-            d0 = float(r0.get("debit") or 0.0)
-            c0 = float(r0.get("credit") or 0.0)
-            b0 = float(r0["balance"])
-            if d0 > 0 and c0 == 0 and abs((sum_ob + d0) - b0) <= 1.0 and abs((sum_ob - d0) - b0) > 1.0:
-                r0["credit"], r0["debit"] = d0, 0.0
-            elif c0 > 0 and d0 == 0 and abs((sum_ob - c0) - b0) <= 1.0 and abs((sum_ob + c0) - b0) > 1.0:
-                r0["debit"], r0["credit"] = c0, 0.0
+    if ((sum_ob is not None and sum_ob < 0) or (sum_cb is not None and sum_cb < 0)) and has_any_positive_bal:
+        if sum_ob is not None and sum_ob > 0 and opening_balance_source != "EXTRACTED_FROM_STATEMENT":
+            summary["opening_balance"] = []
+            opening_balance_source = "INFERRED_FROM_FIRST_TRANSACTION"
+            sum_ob = None
 
-        for i in range(1, len(ordered_txs)):
-            prev_b = ordered_txs[i - 1].get("balance")
-            cur_b = ordered_txs[i].get("balance")
-            if prev_b is None or cur_b is None:
-                continue
-            d = float(ordered_txs[i].get("debit") or 0.0)
-            c = float(ordered_txs[i].get("credit") or 0.0)
-            if d > 0 and c == 0 and abs((prev_b + d) - cur_b) <= 1.0 and abs((prev_b - d) - cur_b) > 1.0:
-                ordered_txs[i]["credit"], ordered_txs[i]["debit"] = d, 0.0
-            elif c > 0 and d == 0 and abs((prev_b - c) - cur_b) <= 1.0 and abs((prev_b + c) - cur_b) > 1.0:
-                ordered_txs[i]["debit"], ordered_txs[i]["credit"] = c, 0.0
+        def _can_reconcile_next(start_bal: float, nxt_tx: dict) -> bool:
+            n_bal = nxt_tx.get("balance")
+            if n_bal is None:
+                return False
+            n_abs = abs(float(n_bal))
+            n_amt = max(abs(float(nxt_tx.get("credit") or 0.0)), abs(float(nxt_tx.get("debit") or 0.0)))
+            return any(
+                abs((start_bal + sgn_a * n_amt) - (sgn_b * n_abs)) <= 1.0
+                for sgn_a in (1.0, -1.0)
+                for sgn_b in (1.0, -1.0)
+            )
+
+        if sum_ob is not None:
+            cur_bal = round(float(sum_ob), 2)
+            for i, t in enumerate(ordered_txs):
+                raw_b = t.get("balance")
+                if raw_b is None:
+                    continue
+                abs_b = round(abs(float(raw_b)), 2)
+                c_orig = round(float(t.get("credit") or 0.0), 2)
+                d_orig = round(float(t.get("debit") or 0.0), 2)
+                amt = round(max(abs(c_orig), abs(d_orig)), 2)
+
+                # Priority 1: keep original CR/DR direction and pick exact matching balance sign (+ or -)
+                exp_orig = round(cur_bal + c_orig - d_orig, 2)
+                err_pos = abs(exp_orig - abs_b)
+                err_neg = abs(exp_orig - (-abs_b))
+                if min(err_pos, err_neg) <= 1.0:
+                    chosen_b = abs_b if err_pos < err_neg else (-abs_b if err_neg < err_pos else 0.0)
+                    t["balance"] = chosen_b
+                    cur_bal = chosen_b
+                    continue
+
+                if amt > 0 and (c_orig == 0.0 or d_orig == 0.0):
+                    matches = []
+                    for is_cr, sgn_a in ((True, 1.0), (False, -1.0)):
+                        for sgn_b in (1.0, -1.0):
+                            cand_b = round(sgn_b * abs_b, 2)
+                            err = abs((cur_bal + sgn_a * amt) - cand_b)
+                            if err <= 1.0:
+                                matches.append((is_cr, cand_b, err))
+
+                    tight = [m for m in matches if m[2] <= 0.05]
+                    if tight:
+                        matches = tight
+
+                    if len(matches) == 1:
+                        is_cr, cand_b, _ = matches[0]
+                        t["credit"], t["debit"] = (amt, 0.0) if is_cr else (0.0, amt)
+                        t["balance"] = cand_b
+                        cur_bal = cand_b
+                        continue
+                    elif len(matches) > 1:
+                        chosen = matches[0]
+                        if i + 1 < len(ordered_txs):
+                            for cand in matches:
+                                if _can_reconcile_next(cand[1], ordered_txs[i + 1]):
+                                    chosen = cand
+                                    break
+                        elif sum_cb is not None:
+                            chosen = min(matches, key=lambda m: abs(m[1] - float(sum_cb)))
+                        is_cr, cand_b, _ = chosen
+                        t["credit"], t["debit"] = (amt, 0.0) if is_cr else (0.0, amt)
+                        t["balance"] = cand_b
+                        cur_bal = cand_b
+                        continue
+                if cur_bal < 0 and raw_b > 0:
+                    t["balance"] = -abs_b
+                cur_bal = float(t["balance"])
+
+        elif sum_cb is not None and sum_cb < 0:
+            ordered_txs[-1]["balance"] = -abs(float(ordered_txs[-1]["balance"]))
+            for i in range(len(ordered_txs) - 1, 0, -1):
+                cur_t = ordered_txs[i]
+                prev_t = ordered_txs[i - 1]
+                after_b = float(cur_t["balance"])
+                prev_raw = prev_t.get("balance")
+                if prev_raw is None:
+                    continue
+                prev_abs = round(abs(float(prev_raw)), 2)
+                c_orig = round(float(cur_t.get("credit") or 0.0), 2)
+                d_orig = round(float(cur_t.get("debit") or 0.0), 2)
+                amt = round(max(abs(c_orig), abs(d_orig)), 2)
+
+                exp_prev = round(after_b - (c_orig - d_orig), 2)
+                err_p = abs(exp_prev - prev_abs)
+                err_n = abs(exp_prev - (-prev_abs))
+                if min(err_p, err_n) <= 1.0:
+                    prev_t["balance"] = prev_abs if err_p < err_n else -prev_abs
+                    continue
+
+                if amt > 0 and (c_orig == 0.0 or d_orig == 0.0):
+                    matched_prev = False
+                    for is_cr, sgn_a in ((True, 1.0), (False, -1.0)):
+                        for sgn_b in (-1.0, 1.0):
+                            cand_prev = round(sgn_b * prev_abs, 2)
+                            if abs((cand_prev + sgn_a * amt) - after_b) <= 1.0:
+                                cur_t["credit"], cur_t["debit"] = (amt, 0.0) if is_cr else (0.0, amt)
+                                prev_t["balance"] = cand_prev
+                                matched_prev = True
+                                break
+                        if matched_prev:
+                            break
 
     # 8. OPENING BALANCE & RUNNING BALANCE RECONCILIATION
     r1 = ordered_txs[0]
@@ -1119,12 +1197,11 @@ def collect_and_merge_spans(doc):
                 if best_j is not None:
                     sp["text"] = t1 + raw_spans[best_j]["text"].strip()
                     skip_r.add(best_j)
-                    break
                         
             elif sp["cx"] >= 310 and re.match(
                 r"^[+-]?(?:\d{1,3}(?:,\d{2,3})+|\d{3,})\.?$", t1
             ):
-                for j_r in range(idx_r + 1, min(len(raw_spans), idx_r + 18)):
+                for j_r in range(idx_r + 1, min(len(raw_spans), idx_r + 30)):
                     if j_r in skip_r:
                         continue
 
