@@ -13,7 +13,15 @@ from openai import OpenAI
 from multiformated_reconciliation import analyze_document as verify_any_file
 from module_aggregator import build_module1_output
 from universal_doc_extractor import extract_universal_document
-from cross_document_verifier import verify_loan_dossier
+import importlib
+import cross_document_verifier
+if not hasattr(cross_document_verifier, "verify_loan_dossier"):
+    importlib.reload(cross_document_verifier)
+verify_loan_dossier = getattr(
+    cross_document_verifier,
+    "verify_loan_dossier",
+    cross_document_verifier.verify_corporate_msme_pack,
+)
 
 st.set_page_config(
     page_title="AI Loan Assistant | Module 1: Document Checker",
