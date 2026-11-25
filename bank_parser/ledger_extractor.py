@@ -689,8 +689,6 @@ def extract_transactions_with_blueprint(scan_data: Dict[str, Any], blueprint: Di
             tb["chronological_order"] = "REVERSE_CHRONOLOGICAL"
 
     # Post-Reversal Cross-Page & Boundary Delta Healing:
-    # If a transaction at a page boundary missed its Debit/Credit because the amount wrapped onto the adjacent page/line,
-    # check if that exact `abs_delta` exists in the PDF's spans on `tx["page"]` or `tx["page"] +/- 1`!
     for idx in range(1, len(transactions)):
         prev_b = transactions[idx - 1]["balance"]
         tx = transactions[idx]
