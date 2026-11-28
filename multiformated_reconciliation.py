@@ -4,15 +4,15 @@ import re
 import io
 import json
 import datetime
-import cv2
 import base64
+import cv2
 from collections import Counter
 
 import pymupdf
 import numpy as np
 from PIL import Image, ImageChops, ExifTags
 import docx
-from ocr_compat import _OCR_INSTANCE, get_ocr_engine, run_ocr_normalized
+from ocr_compat import _OCR_INSTANCE, run_ocr_normalized
 from corporate_kyc_engines import (
     classify_financial_document,
     verify_gst_certificate,
@@ -25,8 +25,34 @@ from recocile_spans import reconcile_spans
 from universal_doc_extractor import extract_universal_document
     
 from ocr_compat import run_ocr_normalized
-
 ocr_engine = run_ocr_normalized
+
+from forensics.pdf_forensics import (
+    normalize_base_font_family,
+    run_pdf_forensics,
+    run_docx_forensics
+)
+
+from forensics.image_forensics import (
+    run_image_forensics,
+    verify_kyc_portrait_is_human,
+    _score_face_candidate_zone,
+    _check_celebrity_watchlist_and_monochrome_spoof
+)
+
+from kyc.pan_aadhaar_verifier import (
+    PAN_ENTITY_MAP,
+    COMMON_INDIAN_NAME_PARTS,
+    ADDRESS_COMPOUND_WORDS,
+    preprocess_id_card_image_for_ocr,
+    _heal_and_extract_pan,
+    _split_concatenated_indian_name,
+    _clean_indian_address_ocr,
+    _verify_pan_card_document,
+    _extract_12_digit_uid,
+    _has_12_digit_uid_pattern,
+    _verify_aadhaar_document,
+)
 
 # 1. UNIVERSAL REGEXES & OCR-RESILIENT CURRENCY / DATE PARSERS
 DATE_RE = re.compile(
@@ -73,45 +99,6 @@ MONTH_MAP = {
     "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
 }
 
-PAN_ENTITY_MAP = {
-    "P": "Individual (P)",
-    "C": "Company (C)",
-    "H": "Hindu Undivided Family - HUF (H)",
-    "F": "Partnership Firm / LLP (F)",
-    "A": "Association of Persons - AOP (A)",
-    "T": "Trust (T)",
-    "B": "Body of Individuals - BOI (B)",
-    "L": "Local Authority (L)",
-    "J": "Artificial Juridical Person (J)",
-    "G": "Government Agency (G)",
-}
-
-COMMON_INDIAN_NAME_PARTS = (
-    "KUMAR", "KUMARI", "GUPTA", "SHARMA", "VERMA", "VARMA", "SINGH", "YADAV",
-    "PRASAD", "PRAKASH", "CHANDRA", "CHAND", "DAS", "DASS", "LAL", "DEVI",
-    "KAUR", "KHAN", "ALI", "AHMAD", "AHMED", "HUSSAIN", "HUSAIN", "ANSARI",
-    "MANDAL", "MISHRA", "MISRA", "TIWARI", "PANDEY", "DUBEY", "SHUKLA", "TRIPATHI",
-    "PATEL", "SHAH", "MEHTA", "JAIN", "AGARWAL", "AGGARWAL", "GOYAL", "GOEL",
-    "BANSAL", "BINDAL", "MITTAL", "JINDAL", "SINGHAL", "KANSAL", "TAYAL", "GARG",
-    "ARORA", "KHANNA", "KAPOOR", "MALHOTRA", "BHATIA", "CHOPRA", "SETHI", "ANEJA",
-    "TANEJA", "CHAWLA", "BAJAJ", "AHUJA", "DUA", "NAIR", "MENON", "PILLAI",
-    "REDDY", "RAO", "NAIDU", "CHOWDHURY", "CHOUDHARY", "CHAUDHARY", "BOSE",
-    "GHOSH", "SEN", "MUKHERJEE", "BANERJEE", "CHATTERJEE", "DASGUPTA", "SENGUPTA",
-    "ROY", "RAY", "SAHU", "SAHOO", "BEHERA", "NAYAK", "PATIL", "PAWAR", "JADHAV",
-    "SHINDE", "DESHMUKH", "KULKARNI", "JOSHI", "BHAT", "HEGDE", "SHETTY", "GOWDA",
-    "RAJ", "RAM", "NATH", "PAL", "MAURYA", "CHAUHAN", "RATHORE", "TOMAR", "SOLANKI",
-    "PARMAR", "ANKIT", "ASHOK", "ALOK", "RAHUL", "ROHIT", "AMIT", "SUMIT", "VIKAS",
-    "DEEPAK", "SANJAY", "VIJAY", "AJAY", "MANOJ", "SUNIL", "ANIL", "SANDEEP",
-)
-
-ADDRESS_COMPOUND_WORDS = (
-    "SOCIETY", "COLONY", "VILLA", "NAGAR", "VIHAR", "ENCLAVE", "APARTMENTS",
-    "APARTMENT", "BLOCK", "SECTOR", "PHASE", "FLOOR", "ROAD", "MARG", "STREET",
-    "LANE", "CHOWK", "PURAM", "BAGH", "PARK", "EXTENSION", "COMPLEX", "TOWER",
-    "PLAZA", "HOUSE", "FLAT", "PLOT", "VILLAGE", "TEHSIL", "DISTRICT", "BALLABGARH",
-    "FARIDABAD", "GURGAON", "GURUGRAM", "NOIDA", "GHAZIABAD", "DELHI", "HARYANA",
-)
-
 
 def normalize_font(font_name):
     if not font_name:
@@ -121,18 +108,6 @@ def normalize_font(font_name):
     if "+" in font_name:
         return font_name.split("+", 1)[1]
     return font_name
-
-
-def normalize_base_font_family(font_name: str) -> str:
-    if not font_name:
-        return "unknown"
-    f = font_name.strip()
-    if "+" in f:
-        f = f.split("+", 1)[1]
-    f = f.lower()
-    f = re.sub(r"[-,_]*(bolditalic|boldoblique|bold|italic|oblique|regular|roman|medium|light|mt|psmt|ps)$", "", f)
-    f = re.sub(r"[-,_]*(bold|italic|regular)$", "", f)
-    return f.strip() or "unknown"
 
 
 def normalize_ocr_amount_str(s: str) -> str:
@@ -538,89 +513,6 @@ def Stitch_Vertical_Wrapped_Numbers(page_spans, numeric_col_xs, x_tol=48.0, y_to
                         break
         stitched.append(s)
     return stitched
-
-# 4. BANK STATEMENT ARITHMETIC & INVARIANT RECONCILIATION
-def _normalize_unsigned_overdraft_ledger(ordered_txs: list[dict], summary: dict | None) -> None:
-    """
-    Normalizes Overdraft (CAA/OD/CC) ledgers like ICICI where Page Total prints negative
-    Opening/Closing balances (-9,37,957.00 / -15,21,962.22), while table rows omit '-'.
-    Must run BEFORE opening_balance and running_bal are initialized in run_math_checks().
-    """
-    if not ordered_txs:
-        return
-
-    def _first_float(val):
-        if isinstance(val, (list, tuple)):
-            return float(val[0]) if val and val[0] is not None else None
-        return float(val) if val is not None else None
-
-    sum_cb = _first_float((summary or {}).get("closing_balance"))
-    sum_ob = _first_float((summary or {}).get("opening_balance"))
-    last_bal = ordered_txs[-1].get("balance")
-    first_bal = ordered_txs[0].get("balance")
-
-    is_unsigned_od = False
-    if (
-        sum_cb is not None
-        and sum_cb < 0
-        and last_bal is not None
-        and last_bal > 0
-        and abs(abs(sum_cb) - abs(last_bal)) <= 1.5
-    ):
-        is_unsigned_od = True
-    elif (
-        sum_ob is not None
-        and sum_ob < 0
-        and first_bal is not None
-        and first_bal > 0
-    ):
-        d0 = float(ordered_txs[0].get("debit") or 0.0)
-        c0 = float(ordered_txs[0].get("credit") or 0.0)
-        if (
-            abs((sum_ob + d0) - (-abs(first_bal))) <= 1.5
-            or abs((sum_ob - c0) - (-abs(first_bal))) <= 1.5
-            or abs((sum_ob + c0 - d0) - (-abs(first_bal))) <= 1.5
-        ):
-            is_unsigned_od = True
-
-    if not is_unsigned_od:
-        return
-
-    for t in ordered_txs:
-        if t.get("balance") is not None and t["balance"] > 0:
-            t["balance"] = -abs(float(t["balance"]))
-
-    # Discard stale positive opening balance inferred before overdraft negation
-    if sum_ob is not None and sum_ob > 0:
-        if summary is not None:
-            summary["opening_balance"] = []
-        sum_ob = None
-
-    # 2. Re-align Row 0 Debit/Credit against stated negative opening balance
-    r0 = ordered_txs[0]
-    if sum_ob is not None and r0.get("balance") is not None:
-        d0 = float(r0.get("debit") or 0.0)
-        c0 = float(r0.get("credit") or 0.0)
-        b0 = float(r0["balance"])
-        if d0 > 0 and c0 == 0 and abs((sum_ob + d0) - b0) <= 1.0 and abs((sum_ob - d0) - b0) > 1.0:
-            r0["credit"], r0["debit"] = d0, 0.0
-        elif c0 > 0 and d0 == 0 and abs((sum_ob - c0) - b0) <= 1.0 and abs((sum_ob + c0) - b0) > 1.0:
-            r0["debit"], r0["credit"] = c0, 0.0
-
-    # 3. Re-align Rows 1..N Debit/Credit so prev_bal + credit - debit == cur_bal
-    for i in range(1, len(ordered_txs)):
-        prev_b = ordered_txs[i - 1].get("balance")
-        cur_b = ordered_txs[i].get("balance")
-        if prev_b is None or cur_b is None:
-            continue
-        d = float(ordered_txs[i].get("debit") or 0.0)
-        c = float(ordered_txs[i].get("credit") or 0.0)
-        if d > 0 and c == 0:
-            if abs((prev_b + d) - cur_b) <= 1.0 and abs((prev_b - d) - cur_b) > 1.0:
-                ordered_txs[i]["credit"], ordered_txs[i]["debit"] = d, 0.0
-        elif c > 0 and d == 0:
-            if abs((prev_b - c) - cur_b) <= 1.0 and abs((prev_b + c) - cur_b) > 1.0:
-                ordered_txs[i]["debit"], ordered_txs[i]["credit"] = c, 0.0
                 
 def run_math_checks(
     summary,
@@ -1304,283 +1196,6 @@ def collect_and_merge_spans(doc):
     return raw_pages, merged_pages
 
 
-def run_pdf_forensics(doc, pages_spans):
-    flags = []
-    meta = doc.metadata or {}
-    suspicious_tools = [
-        "photoshop", "canva", "illustrator", "gimp", "inkscape", "coreldraw", "nitro", "sejda", "ilovepdf", "smallpdf"
-    ]
-    for k in ("producer", "creator", "author"):
-        val = str(meta.get(k, "")).lower()
-        for tool in suspicious_tools:
-            if tool in val:
-                flags.append(f"Page 1 Metadata Anomaly: PDF {k} contains editing toolchain trace '{meta.get(k)}'.")
-    if len(doc) > 0:
-        p1_txt = doc[0].get_text("text") or ""
-        # Only flag truly unfilled standalone placeholders (not Standard Chartered's "<Real Value> (Company Name)" labels)
-        placeholder_hits = re.findall(
-            r"(?:^|\n)\s*[\(\[]\s*(?:Company\s*Name|Account\s*Name|Customer\s*Name|Holder\s*Name|Address|Branch\s*Name|Bank\s*Name)\s*[\)\]]\s*(?=\n|$)"
-            r"|\[\s*(?:Insert|Enter|Your)\s+[^\]]+\]"
-            r"|\b(?:Lorem\s+Ipsum|Sample\s+Company|Test\s+Account|Dummy\s+Bank)\b",
-            p1_txt,
-            re.IGNORECASE,
-        )
-        if placeholder_hits:
-            uniq_ph = ", ".join(dict.fromkeys(h.strip() for h in placeholder_hits))
-            flags.append(
-                f"Page 1 Template Placeholder Anomaly: Unfilled template placeholders ({uniq_ph}) detected in header."
-            )
-    for p_idx, page_spans in enumerate(pages_spans):
-        page_num = p_idx + 1
-        currency_spans = [s for s in page_spans if PURE_CURRENCY_RE.match(s["text"].strip())]
-
-        for i in range(len(currency_spans)):
-            for j in range(i + 1, len(currency_spans)):
-                s1, s2 = currency_spans[i], currency_spans[j]
-                b1, b2 = s1["bbox"], s2["bbox"]
-                ix0, iy0 = max(b1[0], b2[0]), max(b1[1], b2[1])
-                ix1, iy1 = min(b1[2], b2[2]), min(b1[3], b2[3])
-                if ix1 > ix0 + 2.0 and iy1 > iy0 + 2.0 and s1["text"].strip() != s2["text"].strip():
-                    flags.append(
-                        f"Page {page_num} Text Overlay Anomaly: Monetary span '{s1['text']}' overlaps with "
-                        f"'{s2['text']}' at [{b1[0]}, {b1[1]}, {b1[2]}, {b1[3]}]."
-                    )
-
-        if len(currency_spans) >= 4:
-            family_counts = {}
-            for s in currency_spans:
-                base_fam = normalize_base_font_family(s.get("font", ""))
-                family_counts[base_fam] = family_counts.get(base_fam, 0) + 1
-
-            dominant_family, dom_count = max(family_counts.items(), key=lambda x: x[1])
-            total_curr = len(currency_spans)
-
-            if dom_count / total_curr >= 0.80 and len(family_counts) > 1:
-                for s in currency_spans:
-                    base_fam = normalize_base_font_family(s.get("font", ""))
-                    if base_fam != dominant_family and (family_counts[base_fam] / total_curr) <= 0.15:
-                        b = s["bbox"]
-                        flags.append(
-                            f"Page {page_num} Font Anomaly: Monetary amount '{s['text']}' uses font family "
-                            f"'{s.get('font')}' ({base_fam}) while statement numeric font is '{dominant_family}' "
-                            f"at [{b[0]}, {b[1]}, {b[2]}, {b[3]}]."
-                        )
-    return flags
-
-
-def run_image_forensics(image_path, ocr_spans):
-    forensic_flags = []
-    pil_img = Image.open(image_path)
-
-    info_str = " ".join(f"{k}:{v}" for k, v in pil_img.info.items()).lower()
-    exif_data = pil_img.getexif()
-    if exif_data:
-        for tag_id, val in exif_data.items():
-            tag_name = ExifTags.TAGS.get(tag_id, str(tag_id))
-            info_str += f" {tag_name}:{val}".lower()
-
-    for tool in SUSPICIOUS_SOFTWARE:
-        if tool in info_str:
-            forensic_flags.append(f"Image Metadata Warning: Traces of editing software '{tool}' found in headers.")
-
-    rgb_img = pil_img.convert("RGB")
-    img_np = np.array(rgb_img, dtype=np.float32)
-    h_img, w_img, _ = img_np.shape
-
-    buffer = io.BytesIO()
-    rgb_img.save(buffer, "JPEG", quality=82)
-    buffer.seek(0)
-    resaved_img = Image.open(buffer)
-
-    ela_diff = ImageChops.difference(rgb_img, resaved_img)
-    ela_gray = np.mean(np.array(ela_diff, dtype=np.float32), axis=2)
-
-    numeric_scores = []
-    for s in ocr_spans:
-        if parse_amount(s["text"]) is None:
-            continue
-        x0 = max(0, int(s["bbox"][0]) - 8)
-        y0 = max(0, int(s["bbox"][1]) - 8)
-        x1 = min(w_img, int(s["bbox"][2]) + 8)
-        y1 = min(h_img, int(s["bbox"][3]) + 8)
-
-        ela_crop = ela_gray[y0:y1, x0:x1]
-        rgb_crop = img_np[y0:y1, x0:x1]
-        if ela_crop.size > 0:
-            ela_val = float(np.percentile(ela_crop, 92))
-            bg_mask = np.mean(rgb_crop, axis=2) > 220
-            bg_blue_diff = float(np.mean(rgb_crop[bg_mask][:, 2] - rgb_crop[bg_mask][:, 0])) if np.any(bg_mask) else 0.0
-            numeric_scores.append((s, ela_val, bg_blue_diff))
-
-    if len(numeric_scores) >= 4:
-        ela_vals = [item[1] for item in numeric_scores]
-        med_ela = float(np.median(ela_vals))
-        std_ela = float(np.std(ela_vals)) + 1e-5
-
-        for s, ela_val, bg_diff in numeric_scores:
-            z_ela = abs(ela_val - med_ela) / std_ela
-            if z_ela > 1.8 and abs(ela_val - med_ela) > 1.5:
-                forensic_flags.append(
-                    f"Pixel Tampering (ELA Anomaly): Number '{s['text']}' at {s['bbox']} shows "
-                    f"compression mismatch (ELA {ela_val:.2f} vs baseline {med_ela:.2f})."
-                )
-
-    return forensic_flags
-
-
-def reconcile_salary_slip_spans(page_spans, y_tolerance=14.0):
-    issues = []
-    earnings_items = []
-    deductions_items = []
-    gross_earnings = None
-    total_deductions = None
-    net_pay = None
-
-    mid_x = 500.0
-    for s in page_spans:
-        if "deduction" in s["text"].lower() and s["cx"] > 200:
-            mid_x = s["bbox"][0] - 20
-            break
-
-    net_anchor = None
-    for s in page_spans:
-        txt = s["text"].lower()
-        if any(k in txt for k in ["net pay", "take home", "net salary"]):
-            net_anchor = s
-            break
-
-    used_net_span_ids = set()
-    if net_anchor:
-        used_net_span_ids.add(id(net_anchor))
-        net_candidates = []
-        for s in page_spans:
-            val = parse_amount(s["text"])
-            if val is not None:
-                dy = s["cy"] - net_anchor["cy"]
-                if -20.0 <= dy <= 60.0 and s["cx"] > net_anchor["bbox"][0]:
-                    dist = ((s["cx"] - net_anchor["cx"]) ** 2 + dy ** 2) ** 0.5
-                    net_candidates.append((dist, val, id(s)))
-        if net_candidates:
-            net_candidates.sort(key=lambda x: x[0])
-            net_pay = net_candidates[0][1]
-            used_net_span_ids.add(net_candidates[0][2])
-            page_spans.sort(key=lambda s: (s["cy_points"], s["cx_points"]))
-            skip_sp = set()
-            stitched_spans = []
-            for idx_s, sp in enumerate(page_spans):
-                if idx_s in skip_sp:
-                    continue
-                t1 = sp["text"].strip()
-                if sp["cx_norm"] <= 0.35 and re.match(r"^\d{1,2}[/\-][A-Za-z]{3}[/\-]20?$", t1, re.I):
-                    for j_s in range(idx_s + 1, min(len(page_spans), idx_s + 14)):
-                        if j_s in skip_sp:
-                            continue
-                        sp2 = page_spans[j_s]
-                        if 0 < (sp2["cy_points"] - sp["cy_points"]) <= 18.0 and abs(sp2["cx_points"] - sp["cx_points"]) <= 26.0:
-                            t2 = sp2["text"].strip()
-                            if re.match(r"^\d{2,3}$", t2) and len(t1.split("/")[-1]) + len(t2) == 4:
-                                sp["text"] = t1 + t2
-                                skip_sp.add(j_s)
-                                break
-                elif sp["cx_norm"] >= 0.55 and re.match(r"^[+-]?(?:\d{1,3}(?:,\d{2,3})+|\d{3,})\.?$", t1):
-                    for j_s in range(idx_s + 1, min(len(page_spans), idx_s + 14)):
-                        if j_s in skip_sp:
-                            continue
-                        sp2 = page_spans[j_s]
-                        if 0 < (sp2["cy_points"] - sp["cy_points"]) <= 18.0 and abs(sp2["cx_points"] - sp["cx_points"]) <= 30.0:
-                            t2 = sp2["text"].strip()
-                            if (t1.endswith(".") and re.match(r"^\d{2}$", t2)) or ("," in t1 and re.match(r"^\.\d{2}$", t2)):
-                                sp["text"] = t1.rstrip(".") + "." + t2.lstrip(".")
-                                skip_sp.add(j_s)
-                                break
-                stitched_spans.append(sp)
-            page_spans = stitched_spans
-    rows = group_into_rows(page_spans, y_tolerance=y_tolerance)
-    for row in rows:
-        row_text = " ".join(s["text"].lower() for s in row)
-        if "earnings" in row_text and "deductions" in row_text and "gross" not in row_text:
-            continue
-        if any(k in row_text for k in ["net pay", "take home", "net salary"]):
-            continue
-
-        if "gross" in row_text or "total deduction" in row_text:
-            for s in row:
-                val = parse_amount(s["text"])
-                if val is not None:
-                    if s["cx"] < mid_x:
-                        gross_earnings = val
-                    else:
-                        total_deductions = val
-            continue
-
-        left_spans = [s for s in row if s["cx"] < mid_x and id(s) not in used_net_span_ids]
-        right_spans = [s for s in row if s["cx"] >= mid_x and id(s) not in used_net_span_ids]
-
-        left_vals = [parse_amount(s["text"]) for s in left_spans if parse_amount(s["text"]) is not None]
-        left_labels = [s["text"] for s in left_spans if parse_amount(s["text"]) is None]
-        if left_vals and left_labels:
-            earnings_items.append({"name": " ".join(left_labels), "amount": left_vals[-1]})
-
-        right_vals = [parse_amount(s["text"]) for s in right_spans if parse_amount(s["text"]) is not None]
-        right_labels = [s["text"] for s in right_spans if parse_amount(s["text"]) is None]
-        if right_vals and right_labels:
-            deductions_items.append({"name": " ".join(right_labels), "amount": right_vals[-1]})
-
-    if net_pay is None:
-        max_y = max(s["cy"] for s in page_spans) if page_spans else 0
-        bottom_spans = [s for s in page_spans if s["cy"] > max_y - 120 and parse_amount(s["text"]) is not None]
-        if bottom_spans:
-            net_pay = parse_amount(bottom_spans[-1]["text"])
-
-    audit_coverage = {
-        "earnings_extracted": len(earnings_items) > 0,
-        "deductions_extracted": len(deductions_items) > 0,
-        "gross_and_net_extracted": (gross_earnings is not None and total_deductions is not None and net_pay is not None),
-        "net_pay_equation_verified": False,
-    }
-
-    if not audit_coverage["gross_and_net_extracted"]:
-        issues.append(
-            f"Extraction Warning: Missing salary summary totals "
-            f"(Gross: {gross_earnings}, Deductions: {total_deductions}, Net Pay: {net_pay})."
-        )
-    else:
-        calc_earn = round(sum(i["amount"] for i in earnings_items), 2)
-        calc_ded = round(sum(i["amount"] for i in deductions_items), 2)
-
-        if earnings_items and abs(calc_earn - gross_earnings) > 0.5:
-            issues.append(f"Earnings Breakdown Mismatch: Sum of earnings ({calc_earn}) != Gross Earnings ({gross_earnings}).")
-
-        if deductions_items and abs(calc_ded - total_deductions) > 0.5:
-            issues.append(f"Deductions Breakdown Mismatch: Sum of deductions ({calc_ded}) != Total Deductions ({total_deductions}).")
-
-        expected_net = round(gross_earnings - total_deductions, 2)
-        if abs(expected_net - net_pay) > 0.5:
-            issues.append(
-                f"Salary Slip Math Mismatch: Gross ({gross_earnings}) - Deductions ({total_deductions}) "
-                f"= {expected_net}, but Net Pay shows {net_pay}."
-            )
-        else:
-            audit_coverage["net_pay_equation_verified"] = True
-
-    status = (
-        "REVIEW_REQUIRED"
-        if issues
-        else ("NO_MISMATCH_FOUND" if all(audit_coverage.values()) else "PARTIAL_CHECK_CLEAN")
-    )
-
-    return {
-        "document_type": "SALARY_SLIP",
-        "status": status,
-        "audit_coverage": audit_coverage,
-        "gross_earnings": gross_earnings,
-        "total_deductions": total_deductions,
-        "net_pay": net_pay,
-        "earnings_breakdown": earnings_items,
-        "deductions_breakdown": deductions_items,
-        "issues": issues,
-    }
-
 
 def compute_empirical_schema_confidence_from_fallback(hybrid_check, legacy_check):
     sc = dict((hybrid_check or {}).get("schema_confidence") or {})
@@ -1603,7 +1218,6 @@ def compute_empirical_schema_confidence_from_fallback(hybrid_check, legacy_check
     if (hybrid_check or {}).get("llm_processing_time") is not None:
         sc["llm_processing_time"] = hybrid_check.get("llm_processing_time")
     return sc
-
 
 def _select_best_bank_reconciliation(hybrid_check, legacy_check, hybrid_error=None):
     legacy_check = legacy_check or {}
@@ -1764,947 +1378,9 @@ def _heal_and_extract_pan(text: str) -> str | None:
     return None
 
 
-def _split_concatenated_indian_name(raw_str: str) -> str:
-    """
-    Preserves camelCase boundaries first ('AnkitBindal' -> 'Ankit Bindal'), then runs
-    a bounded 2-pass dictionary split for uppercase OCR concatenations ('ANKITBINDAL' -> 'Ankit Bindal').
-    """
-    if not raw_str:
-        return ""
-    s_camel = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(raw_str))
-    s = re.sub(r"[^A-Za-z\s\.]", " ", s_camel).upper()
-    s = re.sub(r"\s+", " ", s).strip(" .")
-    if not s:
-        return ""
-
-    sorted_parts = sorted(COMMON_INDIAN_NAME_PARTS, key=len, reverse=True)
-    out_words = []
-    for word in s.split():
-        sub_tokens = [word]
-        for _ in range(2):
-            next_tokens = []
-            for tok in sub_tokens:
-                if len(tok) < 7:
-                    next_tokens.append(tok)
-                    continue
-                matched = False
-                for part in sorted_parts:
-                    idx = tok.find(part)
-                    # Match suffix (e.g. 'ANKITBINDAL' -> 'ANKIT' + 'BINDAL')
-                    if idx >= 3 and idx + len(part) == len(tok):
-                        next_tokens.extend([tok[:idx], part])
-                        matched = True
-                        break
-                    # Match prefix (e.g. 'ANKITBINDAL' -> 'ANKIT' + 'BINDAL')
-                    elif idx == 0 and len(tok) - len(part) >= 3:
-                        next_tokens.extend([part, tok[len(part) :]])
-                        matched = True
-                        break
-                    # Match middle (e.g. 'ASHOKKUMARBINDAL' -> 'ASHOK' + 'KUMAR' + 'BINDAL')
-                    elif idx >= 3 and idx + len(part) <= len(tok) - 3:
-                        next_tokens.extend([tok[:idx], part, tok[idx + len(part) :]])
-                        matched = True
-                        break
-                if not matched:
-                    next_tokens.append(tok)
-            sub_tokens = next_tokens
-        out_words.extend(sub_tokens)
-    return " ".join(out_words).title()
-
-def _clean_indian_address_ocr(raw_addr: str) -> str:
-    """
-    Cleans OCR-concatenated Indian addresses:
-      - Strips leading S/O, D/O, W/O, C/O relation clause (already shown in Father/C/O field)
-      - Splits concatenated tokens like 'JAINVILLASOCIETY' -> 'Jain Villa Society' & 'MUKESHCOLONY' -> 'Mukesh Colony'
-      - Normalizes comma spacing and removes consecutive duplicate city/district segments
-    """
-    if not raw_addr:
-        return ""
-    s = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(raw_addr))
-    s = re.sub(r"^(?:Address|पता)\s*[:\-]?\s*", "", s, flags=re.I).strip()
-
-    # Strip leading S/O, D/O, W/O, C/O clause up to the first comma
-    s = re.sub(
-        r"^(?:S\s*/?\s*O|D\s*/?\s*O|W\s*/?\s*O|C\s*/?\s*O|Care\s+Of)\s*[:\-\.]?\s*[A-Za-z\s\.]{3,38}?,\s*",
-        "",
-        s,
-        flags=re.I,
-    )
-
-    # Ensure space after commas and around PIN code hyphens
-    s = re.sub(r",\s*", ", ", s)
-    s = re.sub(r"\s*-\s*(\d{6})\b", r" - \1", s)
-
-    # Split concatenated address compound words (e.g., JAINVILLASOCIETY -> JAIN VILLA SOCIETY)
-    segments = [seg.strip() for seg in s.split(",") if seg.strip()]
-    cleaned_segments = []
-
-    for seg in segments:
-        words = seg.split()
-        expanded_words = []
-        for w in words:
-            w_up = w.upper()
-            if len(w_up) >= 8 and w_up.isalpha():
-                temp_tokens = [w_up]
-                for _ in range(2):
-                    nxt = []
-                    for t in temp_tokens:
-                        if len(t) < 7:
-                            nxt.append(t)
-                            continue
-                        split_ok = False
-                        for kw in sorted(ADDRESS_COMPOUND_WORDS, key=len, reverse=True):
-                            idx = t.find(kw)
-                            if idx >= 3 and idx + len(kw) == len(t):
-                                nxt.extend([t[:idx], kw])
-                                split_ok = True
-                                break
-                            elif idx >= 3 and idx + len(kw) <= len(t) - 3:
-                                nxt.extend([t[:idx], kw, t[idx + len(kw) :]])
-                                split_ok = True
-                                break
-                        if not split_ok:
-                            nxt.append(t)
-                    temp_tokens = nxt
-                expanded_words.extend(temp_tokens)
-            else:
-                expanded_words.append(w)
-
-        formatted_seg = " ".join(expanded_words)
-        # Preserve short uppercase block/flat codes like 'SF-2', 'GF-1', 'B-12'
-        formatted_seg = " ".join(
-            tok.upper() if re.match(r"^[A-Za-z]{1,3}\-\d+[A-Za-z]?$", tok) else tok.title()
-            for tok in formatted_seg.split()
-        )
-        cleaned_segments.append(formatted_seg)
-
-    # Deduplicate case-insensitive segments (e.g. 'Ballabgarh, Faridabad, Ballabgarh, Faridabad')
-    deduped = []
-    seen_low = set()
-    for seg in cleaned_segments:
-        key_l = re.sub(r"\s+", " ", seg.lower()).strip()
-        if key_l not in seen_low:
-            seen_low.add(key_l)
-            deduped.append(seg)
-
-    return ", ".join(deduped)
-
-def _locate_id_card_rect_in_photo(rgb_np: np.ndarray) -> np.ndarray:
-    """
-    Finds the physical ID card inside either a portrait (vertical) OR landscape (horizontal) phone photo.
-    """
-    h, w = rgb_np.shape[:2]
-    r = rgb_np[:, :, 0].astype(np.int16)
-    g = rgb_np[:, :, 1].astype(np.int16)
-    b = rgb_np[:, :, 2].astype(np.int16)
-
-    blue_card_px = (b - r >= 14) & (b >= 120) & (g >= 110)
-    warm_card_px = (r - b >= 16) & (r >= 115) & (g >= 95)
-
-    for mask in (blue_card_px, warm_card_px):
-        row_frac = np.mean(mask, axis=1)
-        valid_rows = np.where(row_frac >= 0.16)[0]
-        if int(h * 0.18) <= len(valid_rows) <= int(h * 0.90):
-            ry0 = int(np.percentile(valid_rows, 2))
-            ry1 = int(np.percentile(valid_rows, 98))
-            col_frac = np.mean(mask[ry0:ry1, :], axis=0)
-            valid_cols = np.where(col_frac >= 0.16)[0]
-            if int(w * 0.25) <= len(valid_cols) <= int(w * 0.94):
-                rx0 = int(np.percentile(valid_cols, 2))
-                rx1 = int(np.percentile(valid_cols, 98))
-                cw, ch = rx1 - rx0, ry1 - ry0
-                if cw > ch * 1.10 and cw >= 90 and ch >= 55:
-                    return rgb_np[ry0:ry1, rx0:rx1]
-    return rgb_np
-
-def _extract_embedded_portrait_from_pdf(file_path: str) -> np.ndarray | None:
-    """
-    Extracts the genuine embedded portrait image from an e-PAN or e-Aadhaar PDF,
-    automatically skipping black-and-white QR codes, barcodes, and wide banners.
-    """
-    try:
-        with pymupdf.open(file_path) as doc:
-            if len(doc) == 0:
-                return None
-            candidates = []
-            for img_info in doc[0].get_images(full=True):
-                xref = img_info[0]
-                base_img = doc.extract_image(xref)
-                if not base_img or "image" not in base_img:
-                    continue
-                pil_i = Image.open(io.BytesIO(base_img["image"])).convert("RGB")
-                w, h = pil_i.size
-                aspect = float(w) / max(1.0, float(h))
-                # Portrait photos are roughly square/vertical (35px to 550px)
-                if 35 <= w <= 550 and 35 <= h <= 550 and 0.60 <= aspect <= 1.35:
-                    arr = np.array(pil_i)
-                    r = arr[:, :, 0].astype(np.float32)
-                    g = arr[:, :, 1].astype(np.float32)
-                    b = arr[:, :, 2].astype(np.float32)
-                    # QR codes are monochrome (chroma ~ 0); real portraits have color chroma > 12
-                    mean_chroma = float(np.mean(np.maximum(np.maximum(r, g), b) - np.minimum(np.minimum(r, g), b)))
-                    if mean_chroma >= 12.0:
-                        candidates.append((mean_chroma, arr))
-            if candidates:
-                candidates.sort(key=lambda x: x[0], reverse=True)
-                return candidates[0][1]
-    except Exception:
-        pass
-    return None
-
-_FACE_MODELS_CACHE = {"loaded": False, "detector": None, "recognizer": None}
-_WATCHLIST_EMBEDDING_CACHE = {}
-
-
-def _get_opencv_face_models():
-    if _FACE_MODELS_CACHE["loaded"]:
-        return _FACE_MODELS_CACHE["detector"], _FACE_MODELS_CACHE["recognizer"]
-
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    yunet_path = os.path.join(base_dir, "models", "face_detection_yunet_2023mar.onnx")
-    sface_path = os.path.join(base_dir, "models", "face_recognition_sface_2021dec.onnx")
-
-    if os.path.isfile(yunet_path) and os.path.isfile(sface_path):
-        try:
-            detector = cv2.FaceDetectorYN.create(
-                yunet_path, "", (320, 320), score_threshold=0.55, nms_threshold=0.3, top_k=5000
-            )
-            recognizer = cv2.FaceRecognizerSF.create(sface_path, "")
-            _FACE_MODELS_CACHE["detector"] = detector
-            _FACE_MODELS_CACHE["recognizer"] = recognizer
-        except Exception as exc:
-            print(f"[KYC FACE MODEL WARNING] Could not load YuNet/SFace: {exc}")
-
-    _FACE_MODELS_CACHE["loaded"] = True
-    return _FACE_MODELS_CACHE["detector"], _FACE_MODELS_CACHE["recognizer"]
-
-
-def _extract_sface_embedding(rgb_img: np.ndarray, detector, recognizer):
-    if rgb_img is None or rgb_img.size == 0:
-        return None
-    bgr = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
-    h, w = bgr.shape[:2]
-
-    # Upscale tiny ID portrait crops so YuNet can reliably find landmarks
-    if min(h, w) < 120:
-        scale = 160.0 / float(max(1, min(h, w)))
-        bgr = cv2.resize(bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
-        h, w = bgr.shape[:2]
-
-    # Add small border padding so tight crops don't clip chin/forehead landmarks
-    pad = int(min(h, w) * 0.15)
-    bgr_padded = cv2.copyMakeBorder(bgr, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
-    ph, pw = bgr_padded.shape[:2]
-
-    detector.setInputSize((pw, ph))
-    _, faces = detector.detect(bgr_padded)
-    if faces is None or len(faces) == 0:
-        return None
-
-    # Pick highest-confidence detected face
-    best_face = faces[int(np.argmax(faces[:, -1]))]
-    aligned = recognizer.alignCrop(bgr_padded, best_face)
-    # .copy() is required because OpenCV reuses the internal Mat buffer across calls
-    return recognizer.feature(aligned).copy()
-
-
-def _check_celebrity_watchlist_and_monochrome_spoof(
-    best_crop: np.ndarray,
-    holder_name_hint: str = "",
-    watchlist_dir: str = "kyc_spoof_watchlist",
-    cosine_threshold: float = 0.46,
-) -> tuple[bool, list[str]]:
-    reasons = []
-    if best_crop is None or best_crop.size == 0:
-        return False, reasons
-
-    # 1. Existing monochrome / grayscale / archival cutout check
-    cr = best_crop[:, :, 0].astype(np.float32)
-    cg = best_crop[:, :, 1].astype(np.float32)
-    cb = best_crop[:, :, 2].astype(np.float32)
-
-    ch_b, cw_b = best_crop.shape[:2]
-    iy0, iy1 = int(ch_b * 0.15), max(int(ch_b * 0.15) + 4, int(ch_b * 0.85))
-    ix0, ix1 = int(cw_b * 0.18), max(int(cw_b * 0.18) + 4, int(cw_b * 0.82))
-
-    icr, icg, icb = cr[iy0:iy1, ix0:ix1], cg[iy0:iy1, ix0:ix1], cb[iy0:iy1, ix0:ix1]
-    chroma = np.maximum(np.maximum(icr, icg), icb) - np.minimum(np.minimum(icr, icg), icb)
-    rg_diff = float(np.mean(np.abs(icr - icg)))
-    gb_diff = float(np.mean(np.abs(icg - icb)))
-    p90_chroma = float(np.percentile(chroma, 90))
-
-    warm_skin_mask = (icr > 85.0) & (icg > 35.0) & (icb > 20.0) & ((icr - icg) >= 8.0) & ((icr - icb) >= 10.0)
-    warm_skin_ratio = float(np.mean(warm_skin_mask))
-
-    darker_face_px = (icr < 165.0) & (icg < 165.0) & (icb < 175.0)
-    if np.any(darker_face_px):
-        face_rg_diff = float(np.mean(np.abs(icr[darker_face_px] - icg[darker_face_px])))
-        face_rb_diff = float(np.mean(np.abs(icr[darker_face_px] - icb[darker_face_px])))
-    else:
-        face_rg_diff, face_rb_diff = rg_diff, gb_diff
-
-    overall_flat = p90_chroma < 14.0 or (rg_diff < 5.5 and gb_diff < 5.5)
-    face_flat = warm_skin_ratio < 0.015 and face_rg_diff < 6.0 and face_rb_diff < 11.0
-    if overall_flat and face_flat:
-        reasons.append(
-            "monochrome / grayscale / archival portrait "
-            "(e.g. Mahatma Gandhi B&W cutout) detected instead of a live color KYC photograph"
-        )
-
-    # 2. Celebrity / Public-Figure Watchlist Verification
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    wl_path = os.path.join(base_dir, watchlist_dir)
-    if not os.path.isdir(wl_path):
-        return (len(reasons) > 0), reasons
-
-    detector, recognizer = _get_opencv_face_models()
-    if detector is not None and recognizer is not None:
-        query_feat = _extract_sface_embedding(best_crop, detector, recognizer)
-        if query_feat is not None:
-            best_score = -1.0
-            best_label = None
-            for fname in os.listdir(wl_path):
-                if not fname.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
-                    continue
-                fpath = os.path.join(wl_path, fname)
-                try:
-                    mtime = os.path.getmtime(fpath)
-                    cache_entry = _WATCHLIST_EMBEDDING_CACHE.get(fpath)
-                    if cache_entry and cache_entry[0] == mtime:
-                        ref_feat = cache_entry[1]
-                    else:
-                        ref_rgb = np.array(Image.open(fpath).convert("RGB"))
-                        ref_feat = _extract_sface_embedding(ref_rgb, detector, recognizer)
-                        _WATCHLIST_EMBEDDING_CACHE[fpath] = (mtime, ref_feat)
-
-                    if ref_feat is None:
-                        continue
-
-                    cos_sim = float(recognizer.match(query_feat, ref_feat, cv2.FaceRecognizerSF_FR_COSINE))
-                    if cos_sim > best_score:
-                        best_score = cos_sim
-                        best_label = os.path.splitext(fname)[0].replace("_", " ").replace("-", " ").title()
-                except Exception:
-                    continue
-
-            if best_label and best_score >= cosine_threshold:
-                reasons.append(
-                    f"public-figure / celebrity spoof match detected against watchlist identity '{best_label}' "
-                    f"(SFace cosine={best_score:.2f})"
-                )
-        return (len(reasons) > 0), reasons
-
-    # 3. Hardened Fallback (only if ONNX files are missing)
-    crop_pil = Image.fromarray(best_crop)
-    crop_gray = crop_pil.convert("L")
-    dhash_arr = np.array(crop_gray.resize((9, 8), Image.Resampling.BILINEAR), dtype=np.int16)
-    crop_dhash = (dhash_arr[:, 1:] > dhash_arr[:, :-1]).flatten()
-
-    patch_32 = np.array(crop_gray.resize((32, 32), Image.Resampling.BILINEAR), dtype=np.float32)
-    patch_32 = (patch_32 - np.mean(patch_32)) / (np.std(patch_32) + 1e-5)
-
-    rgb_32 = np.array(crop_pil.resize((32, 32), Image.Resampling.BILINEAR), dtype=np.float32)
-    rgb_32 = (rgb_32 - np.mean(rgb_32)) / (np.std(rgb_32) + 1e-5)
-
-    for fname in os.listdir(wl_path):
-        if not fname.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
-            continue
-        fpath = os.path.join(wl_path, fname)
-        try:
-            ref_pil = Image.open(fpath).convert("RGB")
-            ref_gray = ref_pil.convert("L")
-            ref_dhash_arr = np.array(ref_gray.resize((9, 8), Image.Resampling.BILINEAR), dtype=np.int16)
-            ref_dhash = (ref_dhash_arr[:, 1:] > ref_dhash_arr[:, :-1]).flatten()
-            hamming_dist = int(np.sum(crop_dhash != ref_dhash))
-
-            ref_32 = np.array(ref_gray.resize((32, 32), Image.Resampling.BILINEAR), dtype=np.float32)
-            ref_32 = (ref_32 - np.mean(ref_32)) / (np.std(ref_32) + 1e-5)
-            ncc_score = float(np.mean(patch_32 * ref_32))
-
-            ref_rgb_32 = np.array(ref_pil.resize((32, 32), Image.Resampling.BILINEAR), dtype=np.float32)
-            ref_rgb_32 = (ref_rgb_32 - np.mean(ref_rgb_32)) / (np.std(ref_rgb_32) + 1e-5)
-            rgb_ncc = float(np.mean(rgb_32 * ref_rgb_32))
-
-            if hamming_dist <= 8 and ncc_score >= 0.84 and rgb_ncc >= 0.80:
-                celeb_label = os.path.splitext(fname)[0].replace("_", " ").replace("-", " ").title()
-                reasons.append(
-                    f"public-figure / celebrity spoof match detected against watchlist identity '{celeb_label}' "
-                    f"(similarity={ncc_score:.2f})"
-                )
-                break
-        except Exception:
-            continue
-
-    return (len(reasons) > 0), reasons
-
-def _score_face_candidate_zone(zone_rgb: np.ndarray) -> tuple[float, np.ndarray | None]:
-    """
-    Scores a candidate zone for a human portrait (warm skin cluster + dark hair/eyes),
-    rejecting monochrome QR codes.
-    """
-    if zone_rgb is None or zone_rgb.size == 0 or zone_rgb.shape[0] < 24 or zone_rgb.shape[1] < 24:
-        return 0.0, None
-
-    zr = zone_rgb[:, :, 0].astype(np.float32)
-    zg = zone_rgb[:, :, 1].astype(np.float32)
-    zb = zone_rgb[:, :, 2].astype(np.float32)
-
-    skin_px = (zr > 90.0) & (zg > 38.0) & (zb > 20.0) & ((zr - zg) >= 8.0) & ((zr - zb) >= 10.0)
-    skin_pts = np.argwhere(skin_px)
-    skin_frac = float(np.mean(skin_px))
-
-    if len(skin_pts) < 35 or skin_frac < 0.03:
-        return 0.0, None
-
-    sy0, sx0 = np.percentile(skin_pts, 4, axis=0).astype(int)
-    sy1, sx1 = np.percentile(skin_pts, 96, axis=0).astype(int)
-    sw, sh = max(16, sx1 - sx0), max(16, sy1 - sy0)
-
-    cy0 = max(0, sy0 - int(sh * 0.55))
-    cy1 = min(zone_rgb.shape[0], sy1 + int(sh * 0.40))
-    cx0 = max(0, sx0 - int(sw * 0.42))
-    cx1 = min(zone_rgb.shape[1], sx1 + int(sw * 0.42))
-
-    crop = zone_rgb[cy0:cy1, cx0:cx1]
-    if crop.shape[0] < 20 or crop.shape[1] < 20:
-        return 0.0, None
-
-    crop_lum = 0.299 * crop[:, :, 0] + 0.587 * crop[:, :, 1] + 0.114 * crop[:, :, 2]
-    upper_dark_frac = float(np.mean(crop_lum[: int(crop.shape[0] * 0.65), :] < 85.0))
-    crop_skin_frac = float(np.mean(skin_px[cy0:cy1, cx0:cx1]))
-
-    if upper_dark_frac < 0.03:
-        return 0.0, None
-
-    return (crop_skin_frac * 2.0 + min(0.4, upper_dark_frac)), crop
-
-
-def verify_kyc_portrait_is_human(file_path: str, doc_type: str = "PAN_CARD") -> dict:
-    """
-    Pure NumPy + PIL portrait extractor and spoof verifier.
-    Zero false positives on real PAN/Aadhaar cards with white backgrounds or QR codes.
-    """
-    result = {
-        "portrait_found": False,
-        "is_human_photo": True,
-        "portrait_status": "PASSED",
-        "portrait_verdict": "Genuine Human Photograph Verified",
-        "anomaly_flag": None,
-        "kyc_logic_flag": None,
-        "forensic_pixel_flag": None,
-        "portrait_base64": None,
-        "image_blur_warning": None,
-    }
-    if not file_path or not os.path.exists(file_path):
-        return result
-
-    try:
-        ext = os.path.splitext(file_path)[1].lower()
-        pil_img = None
-        embedded_pdf_portrait = None
-
-        if ext == ".pdf":
-            embedded_pdf_portrait = _extract_embedded_portrait_from_pdf(file_path)
-            with pymupdf.open(file_path) as doc:
-                if len(doc) > 0:
-                    pix = doc[0].get_pixmap(dpi=120)
-                    pil_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        elif ext in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
-            pil_img = Image.open(file_path).convert("RGB")
-
-        if pil_img is None and embedded_pdf_portrait is None:
-            return result
-
-        best_crop = None
-        is_full_a4_pdf = False
-
-        if pil_img is not None:
-            pil_img.thumbnail((640, 640))
-            full_rgb = np.array(pil_img)
-            fh_full, fw_full = full_rgb.shape[:2]
-            is_full_a4_pdf = (ext == ".pdf" and fh_full > fw_full * 1.15)
-
-        if embedded_pdf_portrait is not None:
-            best_crop = embedded_pdf_portrait
-        elif is_full_a4_pdf and doc_type == "AADHAAR_CARD":
-            best_crop = full_rgb[
-                int(fh_full * 0.76) : int(fh_full * 0.91),
-                int(fw_full * 0.02) : int(fw_full * 0.16),
-            ]
-        elif is_full_a4_pdf and doc_type == "PAN_CARD":
-            best_crop = full_rgb[
-                int(fh_full * 0.10) : int(fh_full * 0.28),
-                int(fw_full * 0.04) : int(fw_full * 0.22),
-            ]
-        else:
-            card_rgb = _locate_id_card_rect_in_photo(full_rgb)
-            ch, cw = card_rgb.shape[:2]
-            if ch < 40 or cw < 40:
-                card_rgb = full_rgb
-                ch, cw = card_rgb.shape[:2]
-
-            if doc_type == "AADHAAR_CARD":
-                if cw > ch * 2.1:
-                    best_crop = card_rgb[int(ch * 0.24) : int(ch * 0.78), int(cw * 0.055) : int(cw * 0.17)]
-                else:
-                    left_z = card_rgb[int(ch * 0.18) : int(ch * 0.85), int(cw * 0.04) : int(cw * 0.38)]
-                    _, face_c = _score_face_candidate_zone(left_z)
-                    best_crop = face_c if face_c is not None else left_z
-            else:
-                # Score BOTH New PAN (left photo) and Old PAN (bottom-right photo) for skin + hair
-                left_pan_zone = card_rgb[int(ch * 0.20) : int(ch * 0.68), int(cw * 0.03) : int(cw * 0.32)]
-                br_pan_zone = card_rgb[int(ch * 0.44) : int(ch * 0.95), int(cw * 0.54) : int(cw * 0.94)]
-
-                score_left, crop_left = _score_face_candidate_zone(left_pan_zone)
-                score_br, crop_br = _score_face_candidate_zone(br_pan_zone)
-
-                if score_left >= score_br and crop_left is not None:
-                    best_crop = crop_left
-                elif crop_br is not None:
-                    best_crop = crop_br
-                else:
-                    full_mid_right = full_rgb[int(fh_full * 0.44) : int(fh_full * 0.68), int(fw_full * 0.52) : int(fw_full * 0.88)]
-                    _, crop_fmr = _score_face_candidate_zone(full_mid_right)
-                    best_crop = crop_fmr if crop_fmr is not None else left_pan_zone
-
-        if best_crop is None or best_crop.size == 0:
-            return result
-
-        result["portrait_found"] = True
-
-        crop_pil = Image.fromarray(best_crop)
-        crop_pil.thumbnail((140, 170))
-        buf = io.BytesIO()
-        crop_pil.save(buf, format="PNG")
-        result["portrait_base64"] = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-        cr_f = best_crop[:, :, 0].astype(np.float32)
-        cg_f = best_crop[:, :, 1].astype(np.float32)
-        cb_f = best_crop[:, :, 2].astype(np.float32)
-        crop_gray = 0.299 * cr_f + 0.587 * cg_f + 0.114 * cb_f
-        crop_chroma = np.maximum(np.maximum(cr_f, cg_f), cb_f) - np.minimum(np.minimum(cr_f, cg_f), cb_f)
-
-        small_pil = Image.fromarray(best_crop).resize((48, 48))
-        small_rgb = np.array(small_pil)
-        unique_colors = len(np.unique((small_rgb // 16).reshape(-1, 3), axis=0))
-
-        ch_c, cw_c = best_crop.shape[:2]
-        l_strip_chroma = float(np.mean(crop_chroma[:, : max(2, int(cw_c * 0.22))]))
-        r_strip_chroma = float(np.mean(crop_chroma[:, max(0, int(cw_c * 0.78)) :]))
-        has_colored_studio_backdrop = (0.5 * (l_strip_chroma + r_strip_chroma)) >= 28.0
-
-        bright_white_mask = (crop_gray >= 205.0) & (crop_chroma <= 32.0)
-        pure_white_ratio = float(np.mean(bright_white_mask))
-        l_margin_white = float(np.mean(bright_white_mask[:, : max(2, int(cw_c * 0.22))]))
-        r_margin_white = float(np.mean(bright_white_mask[:, max(0, int(cw_c * 0.78)) :]))
-        side_margin_white = 0.5 * (l_margin_white + r_margin_white)
-
-        skin_mask = (cr_f > 90.0) & (cg_f > 38.0) & (cb_f > 20.0) & ((cr_f - cg_f) >= 8.0) & ((cr_f - cb_f) >= 10.0)
-        skin_ratio = float(np.mean(skin_mask))
-        bot_idx = int(ch_c * 0.75)
-        bot_skin_or_white = float(np.mean(skin_mask[bot_idx:, :] | bright_white_mask[bot_idx:, :]))
-        bot_skin_only = float(np.mean(skin_mask[bot_idx:, :]))
-        bot_dark_clothing = float(np.mean(crop_gray[bot_idx:, :] < 115.0))
-
-        gx = np.abs(np.diff(crop_gray, axis=1, append=crop_gray[:, -1:]))
-        gy = np.abs(np.diff(crop_gray, axis=0, append=crop_gray[-1:, :]))
-        grad_mag = np.hypot(gx, gy)
-        flat_pixel_ratio = float(np.mean(grad_mag < 2.8))
-        high_sat_ratio = float(np.mean(crop_chroma > 140.0))
-
-        is_invalid_portrait = False
-        reasons = []
-        if (
-            doc_type == "PAN_CARD"
-            and not is_full_a4_pdf
-            and not has_colored_studio_backdrop
-            and side_margin_white >= 0.42
-            and pure_white_ratio >= 0.28
-            and bot_skin_or_white >= 0.85
-            and bot_skin_only >= 0.22
-            and bot_dark_clothing < 0.05
-        ):
-            is_invalid_portrait = True
-            reasons.append("pasted white-cutout sticker / bare-shoulder infant spoof portrait detected")
-
-        if unique_colors < 11 and flat_pixel_ratio > 0.74:
-            is_invalid_portrait = True
-            reasons.append(f"synthetic flat-fill cartoon texture detected ({unique_colors} color clusters)")
-
-        if high_sat_ratio > 0.45 and skin_ratio < 0.04:
-            is_invalid_portrait = True
-            reasons.append("synthetic cartoon color saturation with no natural human skin tone")
-
-        is_celeb_or_mono, celeb_reasons = _check_celebrity_watchlist_and_monochrome_spoof(best_crop)
-        if is_celeb_or_mono:
-            is_invalid_portrait = True
-            reasons.extend(celeb_reasons)
-
-        if is_invalid_portrait:
-            result["is_human_photo"] = False
-            result["portrait_status"] = "FAILED"
-            reason_str = "; ".join(reasons)
-            result["portrait_verdict"] = f"Spoof / Non-Genuine Portrait Detected ({reason_str})"
-            result["anomaly_flag"] = (
-                f"Page 1 KYC Portrait Anomaly: Uploaded ID contains a spoof, monochrome cutout, or cartoon image "
-                f"instead of a valid live KYC photograph ({reason_str})."
-            )
-            result["kyc_logic_flag"] = (
-                f"Page 1 Duplicate / Spoof Biometric Identity Gate Failure: Portrait region failed live human photograph "
-                f"verification ({reason_str})."
-            )
-            result["forensic_pixel_flag"] = (
-                f"Page 1 Pixel Tampering (ELA Anomaly): Portrait region exhibits pasted sticker/cutout boundary "
-                f"compression mismatch ({reason_str})."
-            )
-    except Exception as exc:
-        print(f"[KYC PORTRAIT ERROR] {exc}")
-
-    return result
-
-def _verify_pan_card_document(full_text: str, filename: str = "", file_path: str = "") -> dict:
-    txt = full_text or ""
-    pan_no = _heal_and_extract_pan(txt)
-    holder_name = None
-    father_name = None
-    dob_str = None
-
-    m_dob = re.search(r"\b(0?[1-9]|[12]\d|3[01])[-/\.](0?[1-9]|1[0-2])[-/\.](\d{4})\b", txt)
-    if m_dob:
-        dob_str = m_dob.group(0)
-
-    raw_lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
-    header_anchor_idx = -1
-    for idx, ln in enumerate(raw_lines):
-        low_l = ln.lower()
-        if any(
-            h_k in low_l
-            for h_k in ("income tax", "incometax", "govt. of india", "govt of india", "government of india", "department")
-        ):
-            header_anchor_idx = idx
-
-    candidate_lines = raw_lines[header_anchor_idx + 1 :] if header_anchor_idx >= 0 else raw_lines
-    bad_pan_phrases = (
-        "income tax", "incometax", "department", "govt", "government", "india",
-        "permanent account", "account number", "number card", "signature",
-        "date of birth", "month", "year", "जन्म", "आयकर", "विभाग", "भारत", "सरकार",
-        "स्थायी", "लेखा", "संख्या", "हस्ताक्षर",
-    )
-
-    def _clean_pan_person_line(s: str) -> str | None:
-        cleaned_s = _split_concatenated_indian_name(s)
-        if len(cleaned_s) < 5 or len(cleaned_s) > 45:
-            return None
-        low = cleaned_s.lower()
-        if any(b in low for b in bad_pan_phrases):
-            return None
-        if low in ("name", "fathers name", "father name", "holder name", "card", "male", "female", "hlle", "sign", "signature"):
-            return None
-        if _heal_and_extract_pan(cleaned_s):
-            return None
-        words = cleaned_s.split()
-        if len(words) == 1 and len(words[0]) <= 5:
-            vowels = sum(1 for ch in words[0].lower() if ch in "aeiou")
-            if vowels <= 1 or re.search(r"(.)\1", words[0].lower()):
-                return None
-        return cleaned_s
-
-    for idx, ln in enumerate(candidate_lines):
-        low_l = ln.lower()
-        if ("father" in low_l or "पिता" in low_l) and idx + 1 < len(candidate_lines):
-            for k in range(idx + 1, min(len(candidate_lines), idx + 3)):
-                cand_f = _clean_pan_person_line(candidate_lines[k])
-                if cand_f:
-                    father_name = cand_f
-                    break
-        elif (re.search(r"\bname\b", low_l) or "नाम" in low_l) and "father" not in low_l and "पिता" not in low_l:
-            if ":" in ln:
-                after_col = _clean_pan_person_line(ln.split(":", 1)[1])
-                if after_col and not holder_name:
-                    holder_name = after_col
-            if not holder_name and idx + 1 < len(candidate_lines):
-                for k in range(idx + 1, min(len(candidate_lines), idx + 3)):
-                    cand_h = _clean_pan_person_line(candidate_lines[k])
-                    if cand_h:
-                        holder_name = cand_h
-                        break
-
-    if not holder_name:
-        person_candidates = []
-        for ln in candidate_lines:
-            low_l = ln.lower()
-            if (dob_str and dob_str in ln) or "permanent account" in low_l or (pan_no and pan_no in ln.upper()):
-                break
-            if any(k in low_l for k in ("father", "पिता", "name", "नाम", "dob", "birth")):
-                continue
-            cand = _clean_pan_person_line(ln)
-            if cand and cand not in person_candidates:
-                person_candidates.append(cand)
-
-        if len(person_candidates) >= 2:
-            holder_name = person_candidates[0]
-            father_name = person_candidates[1]
-        elif len(person_candidates) == 1:
-            holder_name = person_candidates[0]
-
-    if not holder_name and filename:
-        stem = os.path.splitext(os.path.basename(filename))[0]
-        m_fn = re.search(r"(?:pan\s*card\s*(?:of|for|\-|\_)?\s*)([A-Za-z][A-Za-z\s]{2,30})", stem, re.I)
-        if m_fn:
-            holder_name = m_fn.group(1).strip().title()
-
-    pan_ok = bool(pan_no and len(pan_no) == 10)
-    entity_char = pan_no[3] if pan_ok else None
-    entity_ok = bool(entity_char and entity_char in PAN_ENTITY_MAP)
-    entity_label = PAN_ENTITY_MAP.get(entity_char or "", "Unknown Entity")
-
-    portrait_res = verify_kyc_portrait_is_human(file_path, doc_type="PAN_CARD")
-
-    issues = []
-    detailed_issues = []
-
-    if not pan_ok:
-        msg = "PAN Card Warning: Valid 10-character PAN number (AAAAA9999A) could not be clearly read from the document."
-        issues.append(msg)
-        detailed_issues.append({"page": 1, "bbox": None, "text": msg})
-    elif not entity_ok:
-        msg = f"PAN Entity Warning: 4th character '{entity_char}' is not a valid Indian PAN entity status code."
-        issues.append(msg)
-        detailed_issues.append({"page": 1, "bbox": None, "text": msg})
-
-    if portrait_res.get("kyc_logic_flag"):
-        issues.append(portrait_res["kyc_logic_flag"])
-        detailed_issues.append({"page": 1, "bbox": None, "text": portrait_res["kyc_logic_flag"]})
-
-    return {
-        "document_type": "PAN_CARD",
-        "status": "REVIEW_REQUIRED" if issues else "NO_MISMATCH_FOUND",
-        "pan_number": pan_no,
-        "legal_name": holder_name or "Unknown Holder",
-        "father_name": father_name,
-        "date_of_birth": dob_str,
-        "entity_category": entity_label,
-        "portrait_verification": portrait_res.get("portrait_verdict", "Genuine Human Photograph Verified"),
-        "portrait_anomaly_flag": portrait_res.get("anomaly_flag"),
-        "forensic_pixel_flag": portrait_res.get("forensic_pixel_flag"),
-        "portrait_base64": portrait_res.get("portrait_base64"),
-        "image_blur_warning": portrait_res.get("image_blur_warning"),
-        "audit_coverage": {
-            "pan_number_extracted": "PASSED" if pan_ok else "FAILED",
-            "individual_entity_code_verified": ("PASSED" if entity_ok else "FAILED") if pan_ok else "NOT_RUN",
-            "human_portrait_verified": portrait_res.get("portrait_status", "PASSED"),
-        },
-        "issues": issues,
-        "detailed_issues": detailed_issues,
-    }
-
-
-def _extract_12_digit_uid(text: str) -> str | None:
-    if not text:
-        return None
-    digit_fix = str.maketrans({
-        "O": "0", "Q": "0", "D": "0", "I": "1",
-        "L": "1", "S": "5", "B": "8", "Z": "2",
-    })
-    for ln in text.splitlines():
-        # Skip 16-digit VID and Enrolment lines
-        if re.search(r"\b(?:vid|enrolment|enrollment)\b", ln, re.I):
-            continue
-        for m in re.finditer(
-            r"(?<![0-9A-Za-z/])([0-9OQDILSBZ]{4})[ \t\-]?([0-9OQDILSBZ]{4})[ \t\-]?([0-9OQDILSBZ]{4})(?![0-9A-Za-z/])",
-            ln.upper(),
-        ):
-            g1 = m.group(1).translate(digit_fix)
-            g2 = m.group(2).translate(digit_fix)
-            g3 = m.group(3).translate(digit_fix)
-            if g1.isdigit() and g2.isdigit() and g3.isdigit() and g1[0] not in ("0", "1"):
-                return f"{g1} {g2} {g3}"
-    return None
-
-
 def _has_12_digit_uid_pattern(text: str) -> bool:
     return _extract_12_digit_uid(text) is not None
 
-
-def _verify_aadhaar_document(full_text: str, filename: str = "", file_path: str = "") -> dict:
-    txt = full_text or ""
-    raw_lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
-
-    uid_extracted = _extract_12_digit_uid(txt)
-    uid_masked = f"XXXX XXXX {uid_extracted[-4:]}" if uid_extracted else "[Aadhaar Redacted]"
-
-    has_uid_pattern = bool(uid_extracted) or bool(
-        re.search(
-            r"\b(?:uidai|unique\s+identification|aadhaar|aadhar|proof\s+of\s+identity|not\s+of\s+citizenship|offline\s+xml|mera\s+aadhaar|enrolment|enrollment|vid)\b",
-            txt,
-            re.I,
-        )
-    )
-
-    issue_date = None
-    m_iss = re.search(r"issued\s*[:\-]?\s*(\d{2}[\/\-]\d{2}[\/\-]\d{4})", txt, re.I)
-    if m_iss:
-        issue_date = m_iss.group(1).strip()
-
-    dob_str = None
-    dob_line_idx = None
-    for idx_l, ln in enumerate(raw_lines):
-        if "issued" in ln.lower() or "download" in ln.lower() or "issue date" in ln.lower():
-            continue
-        m_d = re.search(r"(?:DOB|Date\s+of\s+Birth|Birth|YOB)\s*[:\/\-]?\s*(\d{2}[\/\-]\d{2}[\/\-]\d{4}|\d{4})", ln, re.I)
-        if m_d:
-            dob_str = m_d.group(1).strip()
-            dob_line_idx = idx_l
-            break
-    if not dob_str:
-        for idx_l, ln in enumerate(raw_lines):
-            if "issued" in ln.lower() or "download" in ln.lower() or "issue date" in ln.lower():
-                continue
-            m_dt = re.search(r"\b(0?[1-9]|[12]\d|3[01])[\/\-](0?[1-9]|1[0-2])[\/\-](19\d{2}|20\d{2})\b", ln)
-            if m_dt:
-                dob_str = m_dt.group(0)
-                dob_line_idx = idx_l
-                break
-
-    gender_str = None
-    m_gen = re.search(r"\b(MALE|FEMALE|TRANSGENDER|पुरुष|महिला)\b", txt, re.I)
-    if m_gen:
-        g_raw = m_gen.group(1).upper()
-        gender_str = "Male" if g_raw in ("MALE", "पुरुष") else ("Female" if g_raw in ("FEMALE", "महिला") else "Transgender")
-
-    father_name = None
-    address_str = None
-    addr_start_idx = None
-
-    for idx_l, ln in enumerate(raw_lines):
-        m_co = re.search(r"\b(?:S\s*/?\s*O|D\s*/?\s*O|W\s*/?\s*O|C\s*/?\s*O|Care\s+Of)\s*[:\-\.]?\s*([A-Za-z][A-Za-z\s\.]{2,35})", ln, re.I)
-        if m_co and not father_name:
-            cand_f = m_co.group(1).split(",")[0].strip()
-            father_name = _split_concatenated_indian_name(cand_f)
-            if addr_start_idx is None:
-                addr_start_idx = idx_l
-        if re.search(r"\b(?:Address|पता)\b\s*[:\-]?", ln, re.I) and addr_start_idx is None:
-            addr_start_idx = idx_l
-
-    if addr_start_idx is not None:
-        addr_parts = []
-        for ln in raw_lines[addr_start_idx : min(len(raw_lines), addr_start_idx + 8)]:
-            clean_a = re.sub(r"^(?:Address|पता)\s*[:\-]?\s*", "", ln, flags=re.I)
-            clean_a = re.sub(r"[^\x00-\x7F]+", " ", clean_a).strip(" :-,.")
-            if clean_a and not any(
-                b in clean_a.lower()
-                for b in ("unique identification", "uidai", "help@", "www.", "1947", "government of india", "dob", "male", "female", "vid")
-            ):
-                addr_parts.append(clean_a)
-            if re.search(r"\b\d{6}\b", clean_a):
-                break
-        if addr_parts:
-            address_str = _clean_indian_address_ocr(", ".join(addr_parts))
-    else:
-        for idx_l, ln in enumerate(raw_lines):
-            if re.search(r"\b\d{6}\b", ln) and not _has_12_digit_uid_pattern(ln):
-                addr_slice = raw_lines[max(0, idx_l - 3) : idx_l + 1]
-                cleaned_slice = [
-                    re.sub(r"[^\x00-\x7F]+", " ", s).strip()
-                    for s in addr_slice
-                    if not re.search(
-                        r"\b(?:unique\s+identification|government\s+of\s+india|proof\s+of\s+identity|dob|male|female)\b",
-                        s,
-                        re.I,
-                    )
-                ]
-                if cleaned_slice:
-                    address_str = _clean_indian_address_ocr(", ".join(c for c in cleaned_slice if c))
-                break
-
-    holder_name = None
-    bad_aadhaar_phrases = (
-        "government", "govt", "india", "unique", "identification", "authority", "aadhaar", "aadhar",
-        "dob", "date of birth", "year of birth", "male", "female", "transgender", "address",
-        "father", "husband", "wife", "son of", "daughter of", "care of", "s/o", "d/o", "w/o", "c/o",
-        "enrollment", "enrolment", "vid", "virtual", "help", "www", "1947", "mera", "pehechan",
-        "pahchan", "issued", "issue date", "download date", "proof", "identity", "citizenship",
-        "verification", "online", "authentication", "scanning", "qr code", "offline", "xml",
-        "should", "used", "download", "signature", "valid", "digitally", "signed", "information",
-        "block", "society", "colony", "ballabgarh", "faridabad", "haryana",
-    )
-
-    def _clean_aadhaar_name_line(s: str) -> str | None:
-        cleaned = _split_concatenated_indian_name(s)
-        if len(cleaned) < 4 or len(cleaned) > 42:
-            return None
-        low = cleaned.lower()
-        if any(b in low for b in bad_aadhaar_phrases):
-            return None
-        words = cleaned.split()
-        if len(words) == 1 and len(words[0]) <= 4:
-            return None
-        return cleaned
-
-    if dob_line_idx is not None and dob_line_idx > 0:
-        for k in range(dob_line_idx - 1, max(-1, dob_line_idx - 5), -1):
-            cand = _clean_aadhaar_name_line(raw_lines[k])
-            if cand and cand != father_name:
-                holder_name = cand
-                break
-
-    if not holder_name:
-        for idx_l, ln in enumerate(raw_lines):
-            if ln.strip().lower() == "to" and idx_l + 1 < len(raw_lines):
-                for k in range(idx_l + 1, min(len(raw_lines), idx_l + 4)):
-                    cand = _clean_aadhaar_name_line(raw_lines[k])
-                    if cand and cand != father_name:
-                        holder_name = cand
-                        break
-            if holder_name:
-                break
-
-    if not holder_name:
-        for ln in raw_lines:
-            cand = _clean_aadhaar_name_line(ln)
-            if cand and cand != father_name:
-                holder_name = cand
-                break
-
-    portrait_res = verify_kyc_portrait_is_human(file_path, doc_type="AADHAAR_CARD")
-
-    issues = []
-    detailed_issues = []
-
-    if not has_uid_pattern:
-        msg = "Aadhaar KYC Warning: Standard UIDAI / Aadhaar structure could not be clearly verified from scan."
-        issues.append(msg)
-        detailed_issues.append({"page": 1, "bbox": None, "text": msg})
-
-    if portrait_res.get("kyc_logic_flag"):
-        issues.append(portrait_res["kyc_logic_flag"])
-        detailed_issues.append({"page": 1, "bbox": None, "text": portrait_res["kyc_logic_flag"]})
-
-    return {
-        "document_type": "AADHAAR_CARD",
-        "status": "REVIEW_REQUIRED" if issues else "NO_MISMATCH_FOUND",
-        "uid_masked": uid_masked,
-        "aadhaar_number_display": uid_extracted or "Not Found",
-        "legal_name": holder_name or "Verified Holder",
-        "father_name": father_name,
-        "date_of_birth": dob_str,
-        "gender": gender_str,
-        "issue_date": issue_date,
-        "address": address_str,
-        "portrait_verification": portrait_res.get("portrait_verdict", "Genuine Human Photograph Verified"),
-        "portrait_anomaly_flag": portrait_res.get("anomaly_flag"),
-        "forensic_pixel_flag": portrait_res.get("forensic_pixel_flag"),
-        "portrait_base64": portrait_res.get("portrait_base64"),
-        "image_blur_warning": portrait_res.get("image_blur_warning"),
-        "audit_coverage": {
-            "uid_structure_verified": "PASSED" if has_uid_pattern else "FAILED",
-            "privacy_redaction_enforced": "PASSED",
-            "holder_name_extracted": "PASSED" if holder_name else "FAILED",
-            "human_portrait_verified": portrait_res.get("portrait_status", "PASSED"),
-        },
-        "issues": issues,
-        "detailed_issues": detailed_issues,
-    }
 
 def _is_unmistakably_bank_statement(full_text: str, filename: str = "") -> bool:
     fn_low = (filename or "").lower()
@@ -2763,6 +1439,158 @@ def _enrich_specialized_with_llm_and_telemetry(spec_res: dict, full_text: str, p
     }
     return spec_res
 
+def reconcile_salary_slip_spans(page_spans, y_tolerance=14.0):
+    issues = []
+    earnings_items = []
+    deductions_items = []
+    gross_earnings = None
+    total_deductions = None
+    net_pay = None
+
+    mid_x = 500.0
+    for s in page_spans:
+        if "deduction" in s["text"].lower() and s["cx"] > 200:
+            mid_x = s["bbox"][0] - 20
+            break
+
+    net_anchor = None
+    for s in page_spans:
+        txt = s["text"].lower()
+        if any(k in txt for k in ["net pay", "take home", "net salary"]):
+            net_anchor = s
+            break
+
+    used_net_span_ids = set()
+    if net_anchor:
+        used_net_span_ids.add(id(net_anchor))
+        net_candidates = []
+        for s in page_spans:
+            val = parse_amount(s["text"])
+            if val is not None:
+                dy = s["cy"] - net_anchor["cy"]
+                if -20.0 <= dy <= 60.0 and s["cx"] > net_anchor["bbox"][0]:
+                    dist = ((s["cx"] - net_anchor["cx"]) ** 2 + dy ** 2) ** 0.5
+                    net_candidates.append((dist, val, id(s)))
+        if net_candidates:
+            net_candidates.sort(key=lambda x: x[0])
+            net_pay = net_candidates[0][1]
+            used_net_span_ids.add(net_candidates[0][2])
+            page_spans.sort(key=lambda s: (s["cy_points"], s["cx_points"]))
+            skip_sp = set()
+            stitched_spans = []
+            for idx_s, sp in enumerate(page_spans):
+                if idx_s in skip_sp:
+                    continue
+                t1 = sp["text"].strip()
+                if sp["cx_norm"] <= 0.35 and re.match(r"^\d{1,2}[/\-][A-Za-z]{3}[/\-]20?$", t1, re.I):
+                    for j_s in range(idx_s + 1, min(len(page_spans), idx_s + 14)):
+                        if j_s in skip_sp:
+                            continue
+                        sp2 = page_spans[j_s]
+                        if 0 < (sp2["cy_points"] - sp["cy_points"]) <= 18.0 and abs(sp2["cx_points"] - sp["cx_points"]) <= 26.0:
+                            t2 = sp2["text"].strip()
+                            if re.match(r"^\d{2,3}$", t2) and len(t1.split("/")[-1]) + len(t2) == 4:
+                                sp["text"] = t1 + t2
+                                skip_sp.add(j_s)
+                                break
+                elif sp["cx_norm"] >= 0.55 and re.match(r"^[+-]?(?:\d{1,3}(?:,\d{2,3})+|\d{3,})\.?$", t1):
+                    for j_s in range(idx_s + 1, min(len(page_spans), idx_s + 14)):
+                        if j_s in skip_sp:
+                            continue
+                        sp2 = page_spans[j_s]
+                        if 0 < (sp2["cy_points"] - sp["cy_points"]) <= 18.0 and abs(sp2["cx_points"] - sp["cx_points"]) <= 30.0:
+                            t2 = sp2["text"].strip()
+                            if (t1.endswith(".") and re.match(r"^\d{2}$", t2)) or ("," in t1 and re.match(r"^\.\d{2}$", t2)):
+                                sp["text"] = t1.rstrip(".") + "." + t2.lstrip(".")
+                                skip_sp.add(j_s)
+                                break
+                stitched_spans.append(sp)
+            page_spans = stitched_spans
+    rows = group_into_rows(page_spans, y_tolerance=y_tolerance)
+    for row in rows:
+        row_text = " ".join(s["text"].lower() for s in row)
+        if "earnings" in row_text and "deductions" in row_text and "gross" not in row_text:
+            continue
+        if any(k in row_text for k in ["net pay", "take home", "net salary"]):
+            continue
+
+        if "gross" in row_text or "total deduction" in row_text:
+            for s in row:
+                val = parse_amount(s["text"])
+                if val is not None:
+                    if s["cx"] < mid_x:
+                        gross_earnings = val
+                    else:
+                        total_deductions = val
+            continue
+
+        left_spans = [s for s in row if s["cx"] < mid_x and id(s) not in used_net_span_ids]
+        right_spans = [s for s in row if s["cx"] >= mid_x and id(s) not in used_net_span_ids]
+
+        left_vals = [parse_amount(s["text"]) for s in left_spans if parse_amount(s["text"]) is not None]
+        left_labels = [s["text"] for s in left_spans if parse_amount(s["text"]) is None]
+        if left_vals and left_labels:
+            earnings_items.append({"name": " ".join(left_labels), "amount": left_vals[-1]})
+
+        right_vals = [parse_amount(s["text"]) for s in right_spans if parse_amount(s["text"]) is not None]
+        right_labels = [s["text"] for s in right_spans if parse_amount(s["text"]) is None]
+        if right_vals and right_labels:
+            deductions_items.append({"name": " ".join(right_labels), "amount": right_vals[-1]})
+
+    if net_pay is None:
+        max_y = max(s["cy"] for s in page_spans) if page_spans else 0
+        bottom_spans = [s for s in page_spans if s["cy"] > max_y - 120 and parse_amount(s["text"]) is not None]
+        if bottom_spans:
+            net_pay = parse_amount(bottom_spans[-1]["text"])
+
+    audit_coverage = {
+        "earnings_extracted": len(earnings_items) > 0,
+        "deductions_extracted": len(deductions_items) > 0,
+        "gross_and_net_extracted": (gross_earnings is not None and total_deductions is not None and net_pay is not None),
+        "net_pay_equation_verified": False,
+    }
+
+    if not audit_coverage["gross_and_net_extracted"]:
+        issues.append(
+            f"Extraction Warning: Missing salary summary totals "
+            f"(Gross: {gross_earnings}, Deductions: {total_deductions}, Net Pay: {net_pay})."
+        )
+    else:
+        calc_earn = round(sum(i["amount"] for i in earnings_items), 2)
+        calc_ded = round(sum(i["amount"] for i in deductions_items), 2)
+
+        if earnings_items and abs(calc_earn - gross_earnings) > 0.5:
+            issues.append(f"Earnings Breakdown Mismatch: Sum of earnings ({calc_earn}) != Gross Earnings ({gross_earnings}).")
+
+        if deductions_items and abs(calc_ded - total_deductions) > 0.5:
+            issues.append(f"Deductions Breakdown Mismatch: Sum of deductions ({calc_ded}) != Total Deductions ({total_deductions}).")
+
+        expected_net = round(gross_earnings - total_deductions, 2)
+        if abs(expected_net - net_pay) > 0.5:
+            issues.append(
+                f"Salary Slip Math Mismatch: Gross ({gross_earnings}) - Deductions ({total_deductions}) "
+                f"= {expected_net}, but Net Pay shows {net_pay}."
+            )
+        else:
+            audit_coverage["net_pay_equation_verified"] = True
+
+    status = (
+        "REVIEW_REQUIRED"
+        if issues
+        else ("NO_MISMATCH_FOUND" if all(audit_coverage.values()) else "PARTIAL_CHECK_CLEAN")
+    )
+
+    return {
+        "document_type": "SALARY_SLIP",
+        "status": status,
+        "audit_coverage": audit_coverage,
+        "gross_earnings": gross_earnings,
+        "total_deductions": total_deductions,
+        "net_pay": net_pay,
+        "earnings_breakdown": earnings_items,
+        "deductions_breakdown": deductions_items,
+        "issues": issues,
+    }
 
 def route_specialized_document(full_text, page_spans, y_tol=12.0, filename="", file_path=""):
     if _is_unmistakably_bank_statement(full_text, filename=filename):
@@ -2864,7 +1692,6 @@ def route_specialized_document(full_text, page_spans, y_tol=12.0, filename="", f
         return _enrich_specialized_with_llm_and_telemetry(res, full_text, page_spans)
     return None
 
-# 7. MAIN ENTRYPOINTS: IMAGE, DOCX, AND PDF ANALYZERS
 def analyze_image(image_path, original_filename=None):
     page_spans = []
     text_parts = []
@@ -3018,12 +1845,29 @@ def analyze_docx(docx_path):
         "financial_reconciliation": financial_check,
     }
 
-
 def analyze_document(file_path, original_filename=None, use_llm=True):
     if not os.path.exists(file_path):
         return {"error": f"File not found: {file_path}"}
 
     ext = os.path.splitext(file_path)[1].lower()
+    eff_name = original_filename or os.path.basename(file_path)
+
+    # Stage 0: Password-protection gate (lazy import avoids circular import with core/doc_extractor.py)
+    from core.doc_extractor import check_password_protection
+
+    lock_info = check_password_protection(file_path)
+    if lock_info["is_protected"]:
+        return {
+            "status": "PASSWORD_PROTECTED",
+            "is_password_protected": True,
+            "error_code": "PASSWORD_PROTECTED_FILE",
+            "message": lock_info["reason"],
+            "filename": eff_name,
+            "file_format": "ENCRYPTED_PDF" if ext == ".pdf" else "ENCRYPTED_FILE",
+            "financial_reconciliation": {"document_type": "PASSWORD_PROTECTED", "issues": []},
+            "forensic_flags": [],
+        }
+
     if ext == ".docx":
         return analyze_docx(file_path)
     if ext in (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"):
@@ -3037,12 +1881,24 @@ def analyze_document(file_path, original_filename=None, use_llm=True):
         digital_pages_count = 0
 
         with pymupdf.open(file_path) as doc:
+            if doc.needs_pass or (doc.is_encrypted and not doc.authenticate("")):
+                return {
+                    "status": "PASSWORD_PROTECTED",
+                    "is_password_protected": True,
+                    "error_code": "PASSWORD_PROTECTED_FILE",
+                    "message": "This PDF is password-protected and cannot be read without unlocking it first.",
+                    "filename": eff_name,
+                    "file_format": "ENCRYPTED_PDF",
+                    "financial_reconciliation": {"document_type": "PASSWORD_PROTECTED", "issues": []},
+                    "forensic_flags": [],
+                }
+
             num_pages = len(doc)
             raw_pages, merged_native_pages = collect_and_merge_spans(doc)
             if any(len(p) > 0 for p in merged_native_pages):
                 forensic_flags.extend(run_pdf_forensics(doc, merged_native_pages))
 
-            for p_idx, page in enumerate (doc.pages()):
+            for p_idx, page in enumerate(doc.pages()):
                 page_num = p_idx + 1
                 page_txt = page.get_text("text").strip()
 
@@ -3102,7 +1958,6 @@ def analyze_document(file_path, original_filename=None, use_llm=True):
             pdf_fmt = "DIGITAL_PDF"
 
         y_tol = 9.0 if scanned_pages_count > 0 else 6.0
-        eff_name = original_filename or os.path.basename(file_path)
 
         specialized_check = route_specialized_document(
             total_text, flat_spans, y_tol, filename=eff_name, file_path=file_path
@@ -3150,7 +2005,6 @@ def analyze_document(file_path, original_filename=None, use_llm=True):
         }
 
     return {"error": f"Unsupported file format: {ext}"}
-
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:

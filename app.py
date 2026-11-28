@@ -13,6 +13,7 @@ from openai import OpenAI
 from multiformated_reconciliation import analyze_document as verify_any_file
 from module_aggregator import build_module1_output
 from universal_doc_extractor import extract_universal_document
+from core.doc_extractor import check_password_protection
 import importlib
 import cross_document_verifier
 if not hasattr(cross_document_verifier, "verify_loan_dossier"):
@@ -901,6 +902,15 @@ if st.session_state.get("active_page") == "Document Extractor":
                 tmp_path = tmp.name
             try:
                 with st.spinner("Extracting uploaded document & running financial/KYC engine..."):
+                    lock_info = check_password_protection(tmp_path)
+                    if lock_info["is_protected"]:
+                        st.warning(
+                            f"🔒 **Password-Protected File Detected (`{ai_file.name}`)**\n\n"
+                            f"{lock_info['reason']} "
+                            "Please upload an unlocked copy of the document. "
+                            "*(Password unlock support will be added in an upcoming update.)*"
+                        )
+                        st.stop()
                     ext_res = extract_universal_document(tmp_path, use_glm_ocr=use_glm_ocr)
                     fin_rec, id_card, doc_code = {}, {}, "UNKNOWN_DOCUMENT"
                     if suffix in (".pdf", ".png", ".jpg", ".jpeg", ".docx"):
@@ -1055,6 +1065,14 @@ if inspection_mode == "Single Document Audit":
         try:
             with st.spinner("Running 5-Stage Verification Pipeline..."):
                 report = verify_any_file(temp_path, original_filename=uploaded_file.name)
+                if report.get("is_password_protected") or report.get("status") == "PASSWORD_PROTECTED":
+                    st.warning(
+                        f"🔒 **Password-Protected File Detected (`{uploaded_file.name}`)**\n\n"
+                        f"{report.get('message', 'This file is locked with a password.')} "
+                        "Please upload an unlocked copy of the document. "
+                        "*(Password unlock support will be added in an upcoming update.)*"
+                    )
+                    st.stop()
                 report["original_filename"] = uploaded_file.name
                 m1_out = build_module1_output(temp_path, report, tenant_id=tenant_choice)
 
@@ -1664,6 +1682,14 @@ else:
                         temp_paths.append(tmp_path)
 
                     rep = verify_any_file(tmp_path, original_filename=uf.name, use_llm=use_llm_pack)
+                    if rep.get("is_password_protected") or rep.get("status") == "PASSWORD_PROTECTED":
+                        progress.empty()
+                        st.warning(
+                            f"🔒 **Password-Protected File Detected (`{uf.name}`)**\n\n"
+                            f"{rep.get('message', 'This file is locked with a password.')} "
+                            "Please remove or replace this file with an unlocked copy to run Family D verification."
+                        )
+                        st.stop()
                     rep["original_filename"] = uf.name
                     m1 = build_module1_output(tmp_path, rep, tenant_id=tenant_choice)
                     m1["filename"] = uf.name

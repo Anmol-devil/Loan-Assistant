@@ -11,6 +11,18 @@ ocr_engine = run_ocr_normalized
 from corporate_kyc_engines import classify_financial_document
 from recocile_spans import reconcile_spans
 
+from core.bank_metadata import (
+    UNIVERSAL_IFSC_BANK_MAP,
+    clean_ocr_person_name,
+    extract_branch_name,
+    extract_raw_text_from_file,
+    _extract_holder_strictly_from_header,
+    _extract_page1_text,
+    _is_address_or_noise_line,
+    _format_entity_name_clean,
+    _slice_page1_pre_table,
+    _extract_bank_strictly_from_header,
+)
 
 ALLOWED_CHECK_STATUSES = {"PASSED", "FAILED", "NOT_RUN", "NOT_APPLICABLE"}
 ALLOWED_TRIAGE_BANDS = {"low_risk", "needs_review", "high_risk"}
@@ -57,24 +69,6 @@ TENANT_CONFIGS = {
         "family_weights": {"A": 0.50, "B": 0.20, "C": 0.20, "D": 0.10}
     }
 }
-
-UNIVERSAL_IFSC_BANK_MAP = {
-    "SBIN": "State Bank of India", "HDFC": "HDFC Bank", "ICIC": "ICICI Bank",
-    "UTIB": "Axis Bank", "KKBK": "Kotak Mahindra Bank", "YESB": "Yes Bank",
-    "PUNB": "Punjab National Bank", "BARB": "Bank of Baroda", "CNRB": "Canara Bank",
-    "UBIN": "Union Bank of India", "IDIB": "Indian Bank", "BKID": "Bank of India",
-    "CBIN": "Central Bank of India", "IOBA": "Indian Overseas Bank", "UCBA": "UCO Bank",
-    "MAHB": "Bank of Maharashtra", "PSIB": "Punjab & Sind Bank", "IDFB": "IDFC First Bank",
-    "INDB": "IndusInd Bank", "FDRL": "Federal Bank", "BDBL": "Bandhan Bank",
-    "IBKL": "IDBI Bank", "RATN": "RBL Bank", "KARB": "Karnataka Bank",
-    "KVBL": "Karur Vysya Bank", "SIBL": "South Indian Bank", "TMBL": "Tamilnad Mercantile Bank",
-    "CIUB": "City Union Bank", "JSBL": "Jana Small Finance Bank", "AUBL": "AU Small Finance Bank",
-    "ESFB": "Equitas Small Finance Bank", "UJVN": "Ujjivan Small Finance Bank",
-    "SCBL": "Standard Chartered Bank", "CITI": "Citibank", "HSBC": "HSBC Bank",
-    "DBSS": "DBS Bank", "DEUT": "Deutsche Bank", "AIRP": "Airtel Payments Bank",
-    "PYTM": "Paytm Payments Bank", "SURY": "Suryoday Small Finance Bank"
-}
-
 
 # 1. HONEST RISK SCORING & OPTIONAL EMPIRICAL CALIBRATOR
 class RiskScoreCalibrator:
@@ -129,21 +123,6 @@ class RiskScoreCalibrator:
 
 
 SCORER = RiskScoreCalibrator()
-
-
-# 2. UNIVERSAL PAGE-1 PRE-TABLE ENTITY & BANK EXTRACTOR
-def clean_ocr_person_name(raw_name: str) -> tuple[str, float]:
-    if not raw_name:
-        return "Unknown Holder", 0.0
-    orig = raw_name.strip()
-    cleaned = re.sub(r"^(?:Mr\.?|Mrs\.?|Ms\.?|Shri|Smt\.?)\s+", "", orig, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s+[Il1\|]+$", "", cleaned).strip()
-    cleaned = re.sub(r"[^A-Za-z0-9\s\.\&/\-\(\)]", "", cleaned).strip(" :-|.,")
-    cleaned = re.sub(r"\s{2,}", " ", cleaned).title()
-    if not cleaned or len(cleaned) < 3:
-        return "Unknown Holder", 0.0
-    confidence = 0.92 if cleaned.lower() != orig.lower() else 0.98
-    return cleaned, confidence
 
 
 def extract_raw_text_from_file(file_path: str) -> str:
@@ -396,136 +375,6 @@ def _slice_page1_pre_table(page1_text: str) -> str:
 
     return "\n".join(pre_lines)
 
-def _extract_bank_strictly_from_header(
-    pre_table_text: str,
-    full_text: str,
-    file_path: str = "",
-    original_filename: str = "",
-) -> str:
-    top_chunk = (full_text or "")[:1200]
-    ifsc_m = re.search(r"\bIFSC(?:\s+Code)?\s*[:\-]?\s*([A-Z]{4})0[A-Z0-9]{6}\b", top_chunk, re.I)
-    if ifsc_m:
-        ifsc_map = {
-            "ICIC": "ICICI Bank",
-            "HDFC": "HDFC Bank",
-            "SBIN": "State Bank of India",
-            "UTIB": "Axis Bank",
-            "KKBK": "Kotak Mahindra Bank",
-            "PUNB": "Punjab National Bank",
-            "BARB": "Bank of Baroda",
-            "CNRB": "Canara Bank",
-            "UBIN": "Union Bank of India",
-            "IDFB": "IDFC FIRST Bank",
-            "INDB": "IndusInd Bank",
-            "YESB": "Yes Bank",
-            "BKID": "Bank of India",
-        }
-        matched_bank = ifsc_map.get(ifsc_m.group(1).upper())
-        if matched_bank:
-            return matched_bank
-    pre_up = (pre_table_text or "").upper()
-    pre_nospace = re.sub(r"[ \t]+", "", pre_up)
-
-    for target_txt in (pre_up, pre_nospace):
-        m_lbl_ifsc = re.search(r"IFSC(?:CODE)?[\s:\|\-]*([A-Z]{4})[0O]([A-Z0-9]{6})", target_txt)
-        if m_lbl_ifsc and m_lbl_ifsc.group(1) in UNIVERSAL_IFSC_BANK_MAP:
-            return UNIVERSAL_IFSC_BANK_MAP[m_lbl_ifsc.group(1)]
-
-    for m_ifsc in re.finditer(r"\b([A-Z]{4})[0O]([A-Z0-9]{6})\b", pre_up):
-        pref = m_ifsc.group(1)
-        if pref in UNIVERSAL_IFSC_BANK_MAP:
-            return UNIVERSAL_IFSC_BANK_MAP[pref]
-
-    bank_re = re.compile(
-        r"\b(Bank\s+of\s+Baroda|bob\s+World|bob\s+Internet|Bank\s+of\s+Maharashtra|mahabank|"
-        r"RBL\s*Bank|Jammu\s*(?:&|and)\s*Kashmir\s*Bank|J\s*&\s*K\s*Bank|ICICI\s*Bank|HDFC\s*Bank|"
-        r"Yes\s*Bank|Kotak\s+Mahindra\s+Bank|Axis\s*Bank|IndusInd\s*Bank|State\s+Bank\s+of\s+India|"
-        r"Standard\s+Chartered\s+Bank|Punjab\s+National\s+Bank|Canara\s+Bank|Union\s+Bank\s+of\s+India|"
-        r"IDFC\s+First\s+Bank|Federal\s+Bank|Bandhan\s+Bank|IDBI\s+Bank|Indian\s+Bank|Bank\s+of\s+India|"
-        r"Central\s+Bank\s+of\s+India|UCO\s+Bank|Karur\s+Vysya\s+Bank|Karnataka\s+Bank|South\s+Indian\s+Bank|"
-        r"AU\s+Small\s+Finance\s+Bank|Ujjivan\s+Small\s+Finance\s+Bank|Equitas\s+Small\s+Finance\s+Bank)\b",
-        re.IGNORECASE,
-    )
-
-    def _map_matched_bank(raw_str: str) -> str:
-        low_b = re.sub(r"\s+", " ", raw_str).strip().lower()
-        if "baroda" in low_b or low_b.startswith("bob"):
-            return "Bank of Baroda"
-        if "maharashtra" in low_b or "mahabank" in low_b:
-            return "Bank of Maharashtra"
-        if "rbl" in low_b:
-            return "RBL Bank"
-        if "jammu" in low_b or "j&k" in low_b or "j & k" in low_b:
-            return "Jammu & Kashmir Bank"
-        if "icici" in low_b:
-            return "ICICI Bank"
-        if "hdfc" in low_b:
-            return "HDFC Bank"
-        if "yes" in low_b:
-            return "Yes Bank"
-        if "kotak" in low_b:
-            return "Kotak Mahindra Bank"
-        if "axis" in low_b:
-            return "Axis Bank"
-        if "indusind" in low_b:
-            return "IndusInd Bank"
-        if "state bank" in low_b:
-            return "State Bank of India"
-        if "punjab national" in low_b:
-            return "Punjab National Bank"
-        if "canara" in low_b:
-            return "Canara Bank"
-        if "union bank" in low_b:
-            return "Union Bank of India"
-        if "idfc" in low_b:
-            return "IDFC First Bank"
-        if "idbi" in low_b:
-            return "IDBI Bank"
-        if "federal" in low_b:
-            return "Federal Bank"
-        if "bandhan" in low_b:
-            return "Bandhan Bank"
-        if "au small" in low_b:
-            return "AU Small Finance Bank"
-        if "ujjivan" in low_b:
-            return "Ujjivan Small Finance Bank"
-        return raw_str.title()
-
-    found = [(m.start(), m.group(1)) for m in bank_re.finditer(pre_table_text or "")]
-    if found:
-        found.sort(key=lambda x: x[0])
-        return _map_matched_bank(found[0][1])
-
-    if "बड़ौदा" in (pre_table_text or ""):
-        return "Bank of Baroda"
-    if "महाराष्ट्र" in (pre_table_text or ""):
-        return "Bank of Maharashtra"
-
-    fn_cand = (original_filename or os.path.basename(file_path or "")).lower()
-    if not re.match(r"^tmp[a-z0-9_]+\.", fn_cand):
-        if re.search(r"\bbob\b|baroda", fn_cand):
-            return "Bank of Baroda"
-        if re.search(r"\bbom\b|maharashtra", fn_cand):
-            return "Bank of Maharashtra"
-        if re.search(r"\bsbi\b", fn_cand):
-            return "State Bank of India"
-        if re.search(r"\bpnb\b", fn_cand):
-            return "Punjab National Bank"
-        m_fn = bank_re.search(fn_cand)
-        if m_fn:
-            return _map_matched_bank(m_fn.group(1))
-
-    m_rtgs = re.search(r"\bRTGS[/\-]([A-Z]{4})[HR5]\d{6,}", (full_text or "")[:2500].upper())
-    if m_rtgs and m_rtgs.group(1) in UNIVERSAL_IFSC_BANK_MAP:
-        return UNIVERSAL_IFSC_BANK_MAP[m_rtgs.group(1)]
-
-    footer_slice = (full_text or "")[-600:]
-    m_ftr = bank_re.search(footer_slice)
-    if m_ftr:
-        return _map_matched_bank(m_ftr.group(1))
-
-    return "UNKNOWN"
-
 
 def identify_document_and_entity(file_path: str, raw_report: dict = None) -> dict:
     fin_r = (raw_report or {}).get("financial_reconciliation") or {}
@@ -573,33 +422,7 @@ def identify_document_and_entity(file_path: str, raw_report: dict = None) -> dic
     account_number = None
 
     if doc_code == "BANK_STATEMENT":
-        BAD_BRANCH_WORDS = {
-            "details", "detail", "info", "information", "summary", "name",
-            "code", "address", "ifsc", "micr", "phone", "email", "contact",
-            "manager", "office", "number", "no", "id", "n/a", "na", "none",
-        }
-        m_br = re.search(
-            r"\b(?:Branch\s*Name|Home\s*Branch|Account\s*Branch|Base\s*Branch)\b[\s:\|\-]+([A-Za-z][A-Za-z0-9 \t,\.\-&/]{2,50})",
-            pre_table_header,  # use `strict_pre_hdr` in bank_schema.py
-            re.IGNORECASE,
-        )
-        if not m_br:
-            m_br = re.search(
-                r"\bBranch\b\s*[:\|\-]+[\s:\|\-]*([A-Za-z][A-Za-z0-9 \t,\.\-&/]{2,50})",
-                pre_table_header,  # use `strict_pre_hdr` in bank_schema.py
-                re.IGNORECASE,
-            )
-        if m_br:
-            cand_br = re.sub(r"[ \t]+", " ", m_br.group(1).splitlines()[0].split("|")[0]).strip(" :-|.,")
-            if (
-                cand_br
-                and cand_br.lower() not in BAD_BRANCH_WORDS
-                and not any(
-                    k in cand_br.lower()
-                    for k in ("account type", "account no", "account number", "currency", "statement date", "ifsc", "micr")
-                )
-            ):
-                branch_name = cand_br.upper()
+        branch_name = extract_branch_name(pre_table_header)
 
         m_ifsc = re.search(r"IFSC(?:\s*Code)?[\s:\|\-]*([A-Z]{4})[0O]([A-Z0-9]{6})\b", pre_table_header.upper())
         if m_ifsc:
@@ -1039,12 +862,15 @@ def build_module1_output(file_path, raw_report, tenant_id="default_lender", doc_
     weights = dict(tenant_cfg["family_weights"])
     file_fmt = str(raw_report.get("file_format") or "UNKNOWN").upper()
     identity_info = identify_document_and_entity(file_path, raw_report)
-    print(
-        "[BANK IDENTITY DEBUG] "
-        f"Header detection: {identity_info.get('issuing_bank')} | "
-        f"Blueprint detection: "
-        f"{raw_report.get('financial_reconciliation', {}).get('blueprint_metadata', {}).get('issuing_bank')}"
-    )
+
+    if identity_info.get("doc_code") == "BANK_STATEMENT":
+        print(
+            "[BANK IDENTITY DEBUG] "
+            f"Header detection: {identity_info.get('issuing_bank')} | "
+            f"Blueprint detection: "
+            f"{raw_report.get('financial_reconciliation', {}).get('blueprint_metadata', {}).get('issuing_bank')}"
+        )
+
     # Override GST header card with exact subtype (REG-06 / GSTR-1 / GSTR-3B / GSTR-2B), Trade Name & Embedded PAN
     _gst_fin = (raw_report or {}).get("financial_reconciliation") or {}
     if _gst_fin.get("document_type") == "GST_CERTIFICATE":

@@ -12,42 +12,14 @@ load_dotenv(_THIS_DIR.parent / ".env")
 load_dotenv(_THIS_DIR / ".env")
 load_dotenv()
 
-UNIVERSAL_IFSC_MAP = {
-    "SBIN": "State Bank of India",
-    "HDFC": "HDFC Bank",
-    "ICIC": "ICICI Bank",
-    "UTIB": "Axis Bank",
-    "KKBK": "Kotak Mahindra Bank",
-    "YESB": "Yes Bank",
-    "PUNB": "Punjab National Bank",
-    "BARB": "Bank of Baroda",
-    "CNRB": "Canara Bank",
-    "UBIN": "Union Bank of India",
-    "IDIB": "Indian Bank",
-    "BKID": "Bank of India",
-    "CBIN": "Central Bank of India",
-    "IOBA": "Indian Overseas Bank",
-    "UCBA": "UCO Bank",
-    "MAHB": "Bank of Maharashtra",
-    "PSIB": "Punjab & Sind Bank",
-    "IDFB": "IDFC First Bank",
-    "INDB": "IndusInd Bank",
-    "FDRL": "Federal Bank",
-    "BDBL": "Bandhan Bank",
-    "IBKL": "IDBI Bank",
-    "RATN": "RBL Bank",
-    "KARB": "Karnataka Bank",
-    "KVBL": "Karur Vysya Bank",
-    "SIBL": "South Indian Bank",
-    "JAKA": "Jammu & Kashmir Bank",
-    "AUBL": "AU Small Finance Bank",
-    "ESFB": "Equitas Small Finance Bank",
-    "UJVN": "Ujjivan Small Finance Bank",
-    "SCBL": "Standard Chartered Bank",
-    "CITI": "Citibank",
-    "HSBC": "HSBC Bank",
-    "DBSS": "DBS Bank",
-}
+from core.bank_metadata import (
+    BANK_NAME_RE,
+    UNIVERSAL_IFSC_MAP,
+    extract_branch_name,
+    _is_address_or_branch_line,
+    _normalize_issuing_bank_name,
+    _format_entity_title,
+)
 
 HEADER_LINE_CHECK_RE = re.compile(
     r"(?:date|transactio|txn|tran|narration|particulars?|description|remarks?|details|instrument|chq|cheque|cho\.no|ref|inst|"
@@ -104,123 +76,6 @@ Rules:
 3. For `stated_summary`, set fields to null unless an EXPLICIT summary label ('Opening Balance', 'Total Withdrawals', 'Total Deposits', 'Closing Balance') is printed in the statement. NEVER copy a transaction row's debit, credit, or running balance into `stated_summary`!
 4. Return ONLY raw JSON without markdown code fences.
 """
-
-
-def _is_address_or_branch_line(text: str) -> bool:
-    if not text:
-        return True
-    low = text.lower().strip(" :-|.,")
-    exact_labels = {
-        "address", "address 1", "address 2", "address 3", "name", "account", "account name",
-        "account number", "branch", "details", "summary", "holder", "joint holder", "jt. holder",
-        "jt holder", "nominee", "phone", "mobile", "email", "status", "type", "currency", "inr",
-        "date", "period", "to", "from", "page", "customer id", "cust id", "account no", "a/c no",
-        "ifsc", "micr", "eerut", "meerut", "regular", "registered", "india", "city", "zip code",
-        "b", "rblbank", "rbl bank",
-    }
-    if low in exact_labels:
-        return True
-    bad_tokens = [
-        "address", "bank", "road", "street", "marg", "lane", "gali", "nagar", "colony", "sector", "phase",
-        "floor", "plot", "flat", "shop", "house", "building", "complex", "tower", "chowk", "plaza", "khasra",
-        "village", "mumbai", "delhi", "meerut", "eerut", "ghaziabad", "muzaffarnagar", "srinagar", "jammu",
-        "bangalore", "chennai", "kolkata", "hyderabad", "pune", "ahmedabad", "uttar pradesh", "maharashtra",
-        "kashmir", "rajasthan", "gujarat", "haryana", "punjab", "bihar", "west bengal", "karnataka", "tamil nadu",
-        "branch", "ifsc", "micr", "statement", "account", "currency", "inr", "cust", "phone", "email", "zip code",
-        "nominee", "nomination", "period", "date", "page", "pin", "understand your world", "ckyc",
-        "neft", "rtgs", "imps", "upi/", "by clg", "to clg", "transfer", "chq", "cheque", "joint holder",
-        "opening balance", "closing balance", "drawing power", "sanction", "limit", "interest", "over draft",
-        "sheel palace", "fatehullapur", "fatehpur",
-    ]
-    if any(b in low for b in bad_tokens):
-        return True
-    if re.search(r"\b\d{6}\b|\-\s*0?\d{2,4}$", low):
-        return True
-    return False
-
-
-def _normalize_issuing_bank_name(raw_val: Optional[str], fallback_bank: Optional[str] = None) -> Optional[str]:
-    if not raw_val:
-        return fallback_bank
-    s = str(raw_val).strip()
-    if len(s) < 3:
-        return fallback_bank
-
-    if re.match(r"^tmp[a-z0-9_]+\.[a-z0-9]+$", s.lower()) or s.lower().endswith((".pdf", ".docx", ".png", ".jpg", ".jpeg")):
-        s_clean = re.sub(r"\.(?:pdf|docx|png|jpg|jpeg)$", "", s, flags=re.I)
-    else:
-        s_clean = s
-
-    m_ifsc = re.search(r"\b([A-Za-z]{4})[0O][A-Za-z0-9]{6}\b", s_clean)
-    if m_ifsc and m_ifsc.group(1).upper() in UNIVERSAL_IFSC_MAP:
-        return UNIVERSAL_IFSC_MAP[m_ifsc.group(1).upper()]
-    if len(s_clean) >= 4 and s_clean[:4].upper() in UNIVERSAL_IFSC_MAP and any(ch.isdigit() for ch in s_clean):
-        return UNIVERSAL_IFSC_MAP[s_clean[:4].upper()]
-
-    low = s_clean.lower()
-    if "rbl" in low or "ratnakar" in low:
-        return "RBL Bank"
-    if "hdfc" in low:
-        return "HDFC Bank"
-    if "icici" in low:
-        return "ICICI Bank"
-    if "yes" in low:
-        return "Yes Bank"
-    if "axis" in low:
-        return "Axis Bank"
-    if "kotak" in low:
-        return "Kotak Mahindra Bank"
-    if "indusind" in low:
-        return "IndusInd Bank"
-    if "jammu" in low or "j&k" in low or "j & k" in low:
-        return "Jammu & Kashmir Bank"
-    if "state bank" in low or re.search(r"\bsbi\b", low):
-        return "State Bank of India"
-    if "punjab national" in low or re.search(r"\bpnb\b", low):
-        return "Punjab National Bank"
-    if "baroda" in low or re.search(r"\bbob\b", low):
-        return "Bank of Baroda"
-    if "canara" in low:
-        return "Canara Bank"
-    if "union bank" in low:
-        return "Union Bank of India"
-    if "idfc" in low:
-        return "IDFC First Bank"
-    if "idbi" in low:
-        return "IDBI Bank"
-    if "federal" in low:
-        return "Federal Bank"
-    if "bandhan" in low:
-        return "Bandhan Bank"
-    if "au small" in low:
-        return "AU Small Finance Bank"
-    if "ujjivan" in low:
-        return "Ujjivan Small Finance Bank"
-    if "indian bank" in low:
-        return "Indian Bank"
-    if "bank of india" in low:
-        return "Bank of India"
-    if "central bank" in low:
-        return "Central Bank of India"
-    if "uco" in low:
-        return "UCO Bank"
-    if "karur" in low:
-        return "Karur Vysya Bank"
-    if "karnataka" in low:
-        return "Karnataka Bank"
-    if "south indian" in low:
-        return "South Indian Bank"
-    if "standard chartered" in low:
-        return "Standard Chartered Bank"
-    if (
-        "bank" in low
-        and not low.startswith("tmp")
-        and "detected" not in low
-        and not any(w in low for w in ("statement", "fy_", "fy-", "acct_stmt", "passbook", "transaction"))
-        and "_" not in s_clean
-    ):
-        return s_clean.title()
-    return fallback_bank
 
 
 def _parse_float_safe(val_str: Any) -> Optional[float]:
@@ -345,30 +200,6 @@ def _strictly_truncate_pre_table_lines(raw_pre_hdr: str) -> List[str]:
     return out
 
 
-def _format_entity_title(raw_name: str) -> str:
-    if not raw_name:
-        return "Unknown Holder"
-    cleaned = re.sub(r"[ \t]+", " ", str(raw_name)).strip(" :-|.,")
-    cleaned = re.sub(
-        r"^([A-Za-z])\s+([A-Za-z])(?=\s+(?:ENTERPRISES|TRADERS|SERVICES|INDUSTRIES|CORPORATION|ASSOCIATES|COMPANY|AGENCIES|SONS)\b)",
-        r"\1\2",
-        cleaned,
-        flags=re.I,
-    )
-    keep_upper = {
-        "SM", "K2", "LLP", "PVT", "PVT.", "LTD", "LTD.", "HUF", "PROP",
-        "M/S", "M/S.", "SRK", "JSH", "VS", "MS", "RK", "JK", "DR", "AR", "PK"
-    }
-    words = []
-    for w in cleaned.split():
-        w_up = w.upper()
-        if w_up in keep_upper or (len(w) == 2 and w.isalpha() and w.isupper()):
-            words.append(w_up)
-        else:
-            words.append(w.title())
-    return " ".join(words)
-
-
 def _deterministic_blueprint_discovery(
     scan_data: Dict[str, Any],
     smart_sample: Dict[str, Any],
@@ -389,33 +220,7 @@ def _deterministic_blueprint_discovery(
     account_number = None
     customer_id = None
 
-    BAD_BRANCH_WORDS = {
-            "details", "detail", "info", "information", "summary", "name",
-            "code", "address", "ifsc", "micr", "phone", "email", "contact",
-            "manager", "office", "number", "no", "id", "n/a", "na", "none",
-        }
-    m_br = re.search(
-        r"\b(?:Branch\s*Name|Home\s*Branch|Account\s*Branch|Base\s*Branch)\b[\s:\|\-]+([A-Za-z][A-Za-z0-9 \t,\.\-&/]{2,50})",
-        strict_pre_hdr,  # use `strict_pre_hdr` in bank_schema.py
-        re.IGNORECASE,
-    )
-    if not m_br:
-        m_br = re.search(
-            r"\bBranch\b\s*[:\|\-]+[\s:\|\-]*([A-Za-z][A-Za-z0-9 \t,\.\-&/]{2,50})",
-            strict_pre_hdr,  # use `strict_pre_hdr` in bank_schema.py
-            re.IGNORECASE,
-        )
-    if m_br:
-        cand_br = re.sub(r"[ \t]+", " ", m_br.group(1).splitlines()[0].split("|")[0]).strip(" :-|.,")
-        if (
-            cand_br
-            and cand_br.lower() not in BAD_BRANCH_WORDS
-            and not any(
-                k in cand_br.lower()
-                for k in ("account type", "account no", "account number", "currency", "statement date", "ifsc", "micr")
-            )
-        ):
-            branch_name = cand_br.upper()
+    branch_name = extract_branch_name(strict_pre_hdr)
 
     m_ac = re.search(r"(?:Account\s*(?:No\.?|Number)|A/C\s*No\.?)[\s:\|\-]+([A-Z0-9X\*]{6,22})", strict_pre_hdr, re.I)
     if m_ac and sum(1 for ch in m_ac.group(1) if ch.isdigit() or ch in "X*") >= 3:
@@ -443,27 +248,12 @@ def _deterministic_blueprint_discovery(
                 issuing_bank = UNIVERSAL_IFSC_MAP[pref]
                 break
 
-    bank_re = re.compile(
-        r"\b("
-        r"Standard\s+Chartered(?:\s+Bank)?"
-        r"|Bank\s+of\s+Baroda|bob\s+World|bob\s+Internet"
-        r"|Bank\s+of\s+Maharashtra|RBL\s*BANK"
-        r"|Jammu\s*(?:&|and)\s*Kashmir\s*Bank|J\s*&\s*K\s*Bank"
-        r"|HDFC\s*Bank|ICICI\s*Bank|Axis\s*Bank|Yes\s*Bank"
-        r"|Kotak\s+Mahindra\s+Bank|IndusInd\s*Bank|State\s+Bank\s+of\s+India"
-        r"|Ujjivan\s+Small\s+Finance\s+Bank|AU\s+Small\s+Finance\s+Bank"
-        r"|Punjab\s+National\s+Bank|Canara\s+Bank|Union\s+Bank\s+of\s+India"
-        r"|IDFC\s+First\s+Bank|Federal\s+Bank|Bandhan\s+Bank|IDBI\s+Bank"
-        r"|Indian\s+Bank|Bank\s+of\s+India|Central\s+Bank\s+of\s+India"
-        r")\b",
-        re.I,
-    )
     if not issuing_bank:
         header_flat = re.sub(r"\s+", " ", header_blob)
         if re.search(r"\bbob\b", strict_pre_hdr, re.I) or "बड़ौदा" in strict_pre_hdr:
             issuing_bank = "Bank of Baroda"
         else:
-            m_b = bank_re.search(header_flat)
+            m_b = BANK_NAME_RE.search(header_flat)
             if m_b:
                 issuing_bank = _normalize_issuing_bank_name(m_b.group(1))
 
